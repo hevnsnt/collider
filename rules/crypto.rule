@@ -1,0 +1,144 @@
+# crypto.rule - Cryptocurrency brain wallet specific rules
+# Optimized for Bitcoin/crypto passphrase patterns
+
+# Passthrough
+:
+
+# Basic transformations
+l
+u
+c
+t
+r
+
+# Bitcoin genesis year and milestones
+$2$0$0$9
+$2$0$1$0
+$2$0$1$1
+$2$0$1$3
+$2$0$1$7
+$2$0$2$1
+$2$0$2$4
+
+# Capitalize + years
+c$2$0$0$9
+c$2$0$1$3
+c$2$0$1$7
+c$2$0$2$1
+
+# Lowercase + years
+l$2$0$0$9
+l$2$0$1$3
+l$2$0$1$7
+
+# Bitcoin/crypto keywords
+$b$t$c
+$B$T$C
+$e$t$h
+$E$T$H
+$c$o$i$n
+$C$O$I$N
+$c$r$y$p$t$o
+
+# Keyword combinations
+c$b$t$c
+c$B$T$C
+l$b$t$c
+u$B$T$C
+c$c$o$i$n
+c$c$r$y$p$t$o
+
+# Satoshi references
+$s$a$t$o$s$h$i
+$S$a$t$o$s$h$i
+$S$A$T$O$S$H$I
+c$s$a$t$o$s$h$i
+
+# HODL meme (common in crypto community)
+$h$o$d$l
+$H$O$D$L
+c$H$O$D$L
+$h$o$d$l$!
+
+# Moon references
+$m$o$o$n
+$M$O$O$N
+$t$o$t$h$e$m$o$o$n
+
+# Numbers significant in crypto
+$4$2
+$6$9
+$1$2$3$4$5$6
+$2$1$0$0$0$0$0$0
+$2$1$m$i$l$l$i$o$n
+
+# Hash-like patterns
+$0$x
+^0^x
+
+# Wallet-related
+$w$a$l$l$e$t
+$k$e$y
+$s$e$e$d
+$p$r$i$v$a$t$e
+
+# Symbol substitutions (crypto style)
+sB8
+so0
+sO0
+sa4
+sA4
+se3
+sE3
+si1
+sI1
+ss$
+sS$
+
+# Combined leet for crypto
+so0sa4se3
+sB8so0
+
+# Common endings
+$!
+$!$!
+$!$!$!
+$@$#$!
+$$$
+
+# Prepends
+^!
+^$
+^#
+
+# Complex crypto patterns
+c$b$t$c$!
+c$2$0$0$9$!
+l$h$o$d$l$!
+c$m$o$o$n$!
+
+# Block number patterns (early blocks)
+$1
+$2
+$3
+$1$0
+$1$0$0
+$1$0$0$0
+
+# Duplication patterns
+d
+d$1
+d$!
+
+# Reverse (uncommon but possible)
+r
+r$1
+r$b$t$c
+
+# Genesis block reference
+$g$e$n$e$s$i$s
+
+# Whitepaper quotes (first words)
+$p$2$p
+$p$e$e$r
+$c$a$s$h

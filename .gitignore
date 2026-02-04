@@ -1,0 +1,66 @@
+# Build directories
+build/
+Release/
+Debug/
+x64/
+
+# Object files
+*.o
+*.obj
+*.so
+*.a
+*.lib
+*.dll
+*.dylib
+
+# Executables
+collider
+collider.exe
+generate_license
+generate_license.exe
+
+# CUDA compilation files
+*.fatbin
+*.cubin
+*.ptx
+
+# IDE files
+.vscode/
+.vs/
+*.vcxproj.user
+*.sln.docstates
+
+# CMake files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+
+# License keys and security files
+# IMPORTANT: Never commit these files!
+license_private_key.bin
+license_public_key.bin
+*.key
+license_*.key
+
+# Test and runtime files
+*.log
+checkpoints/
+logs/
+temp/
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+
+# Backup files
+*~
+*.bak
+*.swp
+*.tmp
+
+# vcpkg (auto-downloaded on Windows)
+vcpkg/

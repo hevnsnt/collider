@@ -1,0 +1,366 @@
+beatles
+rolling stones
+led zeppelin
+pink floyd
+queen
+ac dc
+metallica
+nirvana
+guns n roses
+aerosmith
+van halen
+def leppard
+bon jovi
+journey
+foreigner
+boston
+styx
+kansas
+rush
+yes
+genesis
+phil collins
+peter gabriel
+elton john
+billy joel
+bruce springsteen
+bob dylan
+neil young
+tom petty
+eagles
+fleetwood mac
+stevie nicks
+heart
+pat benatar
+joan jett
+blondie
+talking heads
+the police
+sting
+u2
+rem
+red hot chili peppers
+pearl jam
+soundgarden
+alice in chains
+stone temple pilots
+foo fighters
+dave grohl
+green day
+blink 182
+sum 41
+good charlotte
+my chemical romance
+fall out boy
+panic at the disco
+paramore
+linkin park
+evanescence
+three days grace
+breaking benjamin
+shinedown
+disturbed
+godsmack
+five finger death punch
+slipknot
+korn
+limp bizkit
+system of a down
+rage against the machine
+tool
+nine inch nails
+marilyn manson
+rob zombie
+rammstein
+nightwish
+within temptation
+epica
+lacuna coil
+enya
+clannad
+celtic woman
+loreena mckennitt
+sarah mclachlan
+alanis morissette
+sheryl crow
+melissa etheridge
+tracy chapman
+jewel
+natalie imbruglia
+nelly furtado
+avril lavigne
+kelly clarkson
+carrie underwood
+taylor swift
+katy perry
+lady gaga
+beyonce
+rihanna
+adele
+sia
+lorde
+billie eilish
+olivia rodrigo
+dua lipa
+ariana grande
+selena gomez
+demi lovato
+miley cyrus
+justin bieber
+shawn mendes
+charlie puth
+ed sheeran
+sam smith
+harry styles
+zayn malik
+one direction
+backstreet boys
+nsync
+new kids on the block
+boyz ii men
+new edition
+bell biv devoe
+bobby brown
+janet jackson
+michael jackson
+prince
+whitney houston
+mariah carey
+celine dion
+barbra streisand
+diana ross
+supremes
+temptations
+four tops
+smokey robinson
+miracles
+stevie wonder
+jackson 5
+earth wind fire
+kool and the gang
+commodores
+lionel richie
+luther vandross
+barry white
+al green
+marvin gaye
+aretha franklin
+otis redding
+sam cooke
+ray charles
+james brown
+sly stone
+parliament funkadelic
+george clinton
+bootsy collins
+rick james
+cameo
+gap band
+zapp
+roger troutman
+teddy pendergrass
+isley brothers
+ohio players
+con funk shun
+lakeside
+midnight star
+bar kays
+dazz band
+switch
+atlantic starr
+ready for the world
+new jack swing
+bobby brown
+guy
+bell biv devoe
+today
+tony toni tone
+johnny gill
+keith sweat
+jodeci
+boyz ii men
+shai
+silk
+az yet
+dru hill
+112
+jagged edge
+next
+total
+swv
+tlc
+destiny child
+en vogue
+xscape
+jade
+eternal
+brownstone
+allure
+702
+blaque
+3lw
+danity kane
+pussycat dolls
+sugababes
+girls aloud
+little mix
+fifth harmony
+blackpink
+twice
+red velvet
+bts
+exo
+bigbang
+2ne1
+snsd
+wonder girls
+f x
+miss a
+sistar
+apink
+mamamoo
+gfriend
+oh my girl
+lovelyz
+dreamcatcher
+itzy
+aespa
+ive
+le sserafim
+new jeans
+stray kids
+ateez
+txt
+enhypen
+seventeen
+nct
+wayv
+superm
+shinee
+tvxq
+super junior
+boa
+rain
+psy
+jay park
+dean
+crush
+zion t
+gray
+simon dominic
+jay park
+aomg
+h1ghr music
+illionaire
+smtm
+show me the money
+hip hop
+rap
+trap
+drill
+grime
+uk garage
+dubstep
+drum and bass
+jungle
+house
+techno
+trance
+edm
+electronic
+dance
+pop
+rock
+metal
+punk
+indie
+alternative
+grunge
+emo
+screamo
+hardcore
+post hardcore
+metalcore
+deathcore
+death metal
+black metal
+thrash metal
+power metal
+progressive metal
+progressive rock
+art rock
+psychedelic rock
+classic rock
+hard rock
+soft rock
+folk rock
+country rock
+southern rock
+blues rock
+jazz rock
+fusion
+smooth jazz
+acid jazz
+contemporary jazz
+bebop
+swing
+big band
+dixieland
+ragtime
+blues
+rhythm and blues
+soul
+funk
+disco
+new wave
+synth pop
+electropop
+dream pop
+shoegaze
+post punk
+gothic rock
+industrial
+ebm
+darkwave
+synthwave
+retrowave
+vaporwave
+chillwave
+lo fi
+ambient
+new age
+world music
+latin
+reggaeton
+salsa
+bachata
+merengue
+cumbia
+reggae
+dancehall
+ska
+dub
+afrobeat
+afropop
+highlife
+soukous
+kwaito
+gqom
+amapiano
+bollywood
+bhangra
+qawwali
+ghazal
+classical indian
+carnatic
+hindustani
+gamelan
+jpop
+jrock
+visual kei
+anime
+vocaloid
+kpop
+cpop
+mandopop
+cantopop

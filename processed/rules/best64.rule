@@ -1,0 +1,110 @@
+# best64.rule - Most effective 64 hashcat rules
+# Based on empirical testing from password cracking competitions
+
+# Pass through
+:
+
+# Capitalize first letter
+c
+
+# All lowercase
+l
+
+# All uppercase
+u
+
+# Toggle case
+t
+
+# Reverse
+r
+
+# Duplicate word
+d
+
+# Reflect (append reverse)
+f
+
+# Append common suffixes
+$1
+$2
+$!
+$@
+$#
+$$
+$%
+$^
+$&
+$*
+$0
+$1$2$3
+$1$2$3$4
+$1$2$3$4$5
+$!$!
+$@$#
+$1$!
+
+# Prepend common prefixes
+^1
+^!
+^@
+
+# Common leet substitutions
+sa@
+se3
+si1
+so0
+ss$
+sa4
+se3so0si1
+sA@sE3sI1sO0
+
+# Toggle specific positions
+T0
+T1
+T2
+T3
+T4
+
+# Capitalize and append
+c$1
+c$!
+c$1$2$3
+c$2$0$2$4
+c$2$0$2$3
+
+# Delete characters
+D0
+D1
+]
+[
+
+# Overwrite characters
+o0a
+o0A
+o01
+
+# Insert characters
+i0!
+i0@
+i01
+
+# Append years
+$2$0$2$4
+$2$0$2$3
+$2$0$2$2
+$2$0$2$1
+$2$0$2$0
+$2$0$1$9
+$2$0$1$8
+
+# Common mutations
+c$1$2$3$!
+u$1
+l$1
+r$1
+
+# Combination rules
+cd
+cf
+cD0

@@ -1,0 +1,241 @@
+apple
+microsoft
+google
+amazon
+facebook
+meta
+netflix
+spotify
+twitter
+instagram
+tiktok
+snapchat
+whatsapp
+telegram
+discord
+slack
+zoom
+teams
+skype
+linkedin
+pinterest
+reddit
+tumblr
+youtube
+twitch
+vimeo
+dailymotion
+hulu
+disney
+paramount
+warner
+universal
+sony
+nintendo
+playstation
+xbox
+steam
+epic games
+riot games
+blizzard
+activision
+ea sports
+ubisoft
+rockstar
+bethesda
+valve
+capcom
+konami
+sega
+bandai namco
+square enix
+atlus
+fromsoftware
+cd projekt
+techland
+obsidian
+insomniac
+naughty dog
+bungie
+respawn
+infinity ward
+treyarch
+sledgehammer
+dice
+bioware
+criterion
+codemasters
+playground
+turn 10
+polyphony
+santa monica
+guerrilla
+sucker punch
+bend studio
+bluepoint
+housemarque
+firesprite
+haven
+jade raymond
+kojima productions
+platinum games
+grasshopper
+suda51
+devolver
+annapurna
+focus
+thq nordic
+embracer
+tencent
+netease
+mihoyo
+hypergryph
+yostar
+cygames
+craft egg
+kakao
+nexon
+ncsoft
+smilegate
+pearl abyss
+krafton
+pubg
+garena
+moonton
+supercell
+king
+zynga
+rovio
+gameloft
+jam city
+scopely
+playtika
+aristocrat
+igt
+scientific games
+wms
+bally
+konami gaming
+ainsworth
+everi
+light wonder
+novomatic
+merkur
+casino
+pokerstars
+draftkings
+fanduel
+betmgm
+caesars
+penn
+barstool
+espn bet
+bet365
+william hill
+paddy power
+betfair
+unibet
+888
+bwin
+coral
+ladbrokes
+sky bet
+betway
+22bet
+stake
+rollbit
+polymarket
+kalshi
+robinhood
+webull
+public
+sofi
+chime
+current
+varo
+aspiration
+acorns
+stash
+betterment
+wealthfront
+ellevest
+m1 finance
+titan
+masterworks
+yieldstreet
+fundrise
+arrived
+crowdstreet
+realtyshares
+peerstreet
+groundfloor
+coinbase
+kraken
+gemini
+binance
+ftx
+celsius
+blockfi
+voyager
+nexo
+ledn
+unchained
+swan
+river
+strike
+cash app
+venmo
+paypal
+zelle
+wise
+remitly
+worldremit
+xoom
+ria
+moneygram
+western union
+visa
+mastercard
+amex
+discover
+diners
+jcb
+unionpay
+rupay
+elo
+hipercard
+mir
+troy
+verve
+interac
+cartes bancaires
+girocard
+bancontact
+ideal
+sofort
+giropay
+przelewy24
+blik
+trustly
+klarna
+affirm
+afterpay
+zip
+sezzle
+splitit
+bread
+uplift
+katapult
+acima
+progressive leasing
+rent a center
+aarons
+flexshopper
+perpay
+zebit
+fingerhut
+stoneberry
+ginny
+seventh avenue
+montgomery ward
+blair

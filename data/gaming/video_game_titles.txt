@@ -1,0 +1,175 @@
+# Popular Video Game Titles
+minecraft
+fortnite
+league of legends
+valorant
+counter strike
+csgo
+cs2
+dota 2
+world of warcraft
+call of duty
+warzone
+apex legends
+overwatch
+rainbow six siege
+rocket league
+gta
+grand theft auto
+red dead redemption
+skyrim
+elder scrolls
+fallout
+cyberpunk
+witcher
+elden ring
+dark souls
+bloodborne
+sekiro
+demons souls
+god of war
+horizon zero dawn
+spider man
+ghost of tsushima
+last of us
+uncharted
+final fantasy
+kingdom hearts
+persona
+zelda
+breath of the wild
+tears of the kingdom
+ocarina of time
+majoras mask
+twilight princess
+wind waker
+link to the past
+mario
+super mario
+mario kart
+mario party
+smash bros
+super smash brothers
+melee
+ultimate
+brawl
+pokemon
+pikachu
+charizard
+mewtwo
+gengar
+eevee
+snorlax
+dragonite
+gyarados
+lucario
+greninja
+gardevoir
+blaziken
+infernape
+garchomp
+rayquaza
+groudon
+kyogre
+dialga
+palkia
+giratina
+arceus
+zekrom
+reshiram
+kyurem
+xerneas
+yveltal
+zygarde
+solgaleo
+lunala
+necrozma
+zacian
+zamazenta
+eternatus
+koraidon
+miraidon
+animal crossing
+stardew valley
+terraria
+roblox
+among us
+fall guys
+dead by daylight
+phasmophobia
+lethal company
+content warning
+halo
+destiny
+borderlands
+bioshock
+mass effect
+dragon age
+diablo
+path of exile
+lost ark
+black desert
+genshin impact
+honkai star rail
+tower of fantasy
+blue archive
+arknights
+azur lane
+fate grand order
+monster hunter
+resident evil
+silent hill
+metal gear solid
+devil may cry
+bayonetta
+nier automata
+tekken
+street fighter
+mortal kombat
+guilty gear
+blazblue
+king of fighters
+dragon ball fighterz
+smite
+paladins
+warframe
+destiny
+division
+anthem
+outriders
+remnant
+deep rock galactic
+helldivers
+starcraft
+age of empires
+civilization
+total war
+crusader kings
+europa universalis
+hearts of iron
+stellaris
+rimworld
+factorio
+satisfactory
+dyson sphere program
+subnautica
+no mans sky
+elite dangerous
+star citizen
+eve online
+runescape
+osrs
+old school runescape
+maple story
+lost ark
+new world
+guild wars
+final fantasy xiv
+ff14
+ffxiv
+wow classic
+wrath of the lich king
+burning crusade
+shadowlands
+dragonflight
+the war within
