@@ -1,0 +1,175 @@
+name: Build Collider
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  BUILD_TYPE: Release
+  CUDA_ARCHITECTURES: "86;89;100"
+
+jobs:
+  build-linux:
+    name: Linux x86_64 (CUDA)
+    runs-on: ubuntu-22.04
+    container:
+      image: nvidia/cuda:12.6.0-devel-ubuntu22.04
+    steps:
+      - name: Install dependencies
+        run: |
+          apt-get update
+          apt-get install -y cmake git build-essential libssl-dev pkg-config
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Configure
+        run: |
+          mkdir build && cd build
+          cmake .. \
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+            -DCMAKE_CUDA_ARCHITECTURES="${{ env.CUDA_ARCHITECTURES }}" \
+            -DCOLLIDER_BUILD_TESTS=OFF \
+            -DCOLLIDER_BUILD_BENCHMARKS=OFF
+
+      - name: Build
+        run: |
+          cd build
+          make -j$(nproc) collider
+          strip collider
+          ls -lh collider
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: collider-linux-x86_64
+          path: build/collider
+          retention-days: 30
+
+  build-windows:
+    name: Windows x64 (CUDA)
+    runs-on: windows-2022
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.19
+        id: cuda-toolkit
+        with:
+          cuda: '12.6.0'
+          method: 'network'
+          sub-packages: '["nvcc", "cudart", "visual_studio_integration"]'
+
+      - name: Configure
+        run: |
+          mkdir build
+          cd build
+          cmake .. `
+            -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} `
+            -DCMAKE_CUDA_ARCHITECTURES="${{ env.CUDA_ARCHITECTURES }}" `
+            -DCOLLIDER_BUILD_TESTS=OFF `
+            -DCOLLIDER_BUILD_BENCHMARKS=OFF
+
+      - name: Build
+        run: |
+          cd build
+          cmake --build . --config ${{ env.BUILD_TYPE }} --target collider
+          dir ${{ env.BUILD_TYPE }}\collider.exe
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: collider-windows-x64
+          path: build/${{ env.BUILD_TYPE }}/collider.exe
+          retention-days: 30
+
+  build-macos:
+    name: macOS arm64 (Metal)
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          brew install cmake openssl@3
+          echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" >> $GITHUB_ENV
+
+      - name: Configure
+        run: |
+          mkdir build && cd build
+          cmake .. \
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+            -DCOLLIDER_USE_CUDA=OFF \
+            -DCOLLIDER_USE_METAL=ON \
+            -DCOLLIDER_BUILD_TESTS=OFF \
+            -DCOLLIDER_BUILD_BENCHMARKS=OFF \
+            -DOPENSSL_ROOT_DIR=${{ env.OPENSSL_ROOT_DIR }}
+
+      - name: Build
+        run: |
+          cd build
+          make -j$(sysctl -n hw.ncpu) collider
+          ls -lh collider
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: collider-macos-arm64
+          path: build/collider
+          retention-days: 30
+
+  release:
+    name: Create Release
+    needs: [build-linux, build-windows, build-macos]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release files
+        run: |
+          mkdir -p release
+          cp artifacts/collider-linux-x86_64/collider release/collider-linux-x86_64
+          cp artifacts/collider-windows-x64/collider.exe release/collider-windows-x64.exe
+          cp artifacts/collider-macos-arm64/collider release/collider-macos-arm64
+          chmod +x release/collider-linux-x86_64 release/collider-macos-arm64
+          ls -lh release/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          body: |
+            ## collider ${{ github.ref_name }}
+            
+            Free, open-source GPU Bitcoin Puzzle solver.
+            
+            ### Downloads
+            - **Linux:** `collider-linux-x86_64` (CUDA, SM 86/89/100)
+            - **Windows:** `collider-windows-x64.exe` (CUDA, SM 86/89/100)
+            - **macOS:** `collider-macos-arm64` (Apple Silicon, Metal)
+            
+            ### Quick Start
+            ```bash
+            ./collider --pool collisionprotocol.com:17403 --worker YourBTCAddress
+            ```
+            
+            For more features (solo solving, brain wallet, bloom filters), check out [collider pro](https://collisionprotocol.com/pro).
