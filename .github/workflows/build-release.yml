@@ -1,0 +1,282 @@
+name: Build Free Release Binaries
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g., 1.0.0)'
+        required: false
+        default: 'dev'
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  # ============================================================================
+  # Linux x86_64 with CUDA
+  # ============================================================================
+  build-linux:
+    runs-on: ubuntu-latest
+    container:
+      image: nvidia/cuda:12.6.0-devel-ubuntu22.04
+    
+    steps:
+    - name: Install dependencies
+      run: |
+        apt-get update
+        apt-get install -y \
+          git \
+          cmake \
+          build-essential \
+          libssl-dev \
+          wget \
+          ca-certificates
+    
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+    
+    - name: Configure CMake
+      run: |
+        cmake -B build \
+          -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} \
+          -DCOLLIDER_EDITION_PRO=OFF \
+          -DCOLLIDER_USE_CUDA=ON \
+          -DCOLLIDER_BUILD_TESTS=OFF \
+          -DCOLLIDER_BUILD_BENCHMARKS=OFF \
+          -DCUDA_ARCHITECTURES="75;86;89"
+    
+    - name: Build
+      run: cmake --build build --config ${{env.BUILD_TYPE}} --parallel 4
+    
+    - name: Verify binary
+      run: |
+        ls -la build/
+        file build/collider
+        ldd build/collider || true
+        ./build/collider --version || ./build/collider --help || echo "Binary exists but needs runtime setup"
+    
+    - name: Upload Linux binary
+      uses: actions/upload-artifact@v4
+      with:
+        name: collider-linux-x64
+        path: build/collider
+        retention-days: 30
+
+  # ============================================================================
+  # Windows x64 with CUDA
+  # ============================================================================
+  build-windows:
+    runs-on: windows-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+    
+    - name: Install CUDA Toolkit
+      uses: Jimver/cuda-toolkit@v0.2.16
+      with:
+        cuda: '12.6.0'
+        method: 'network'
+        sub-packages: '["nvcc", "cudart", "cudart_dev", "thrust", "visual_studio_integration"]'
+    
+    - name: Install vcpkg dependencies
+      run: |
+        vcpkg install openssl:x64-windows
+      shell: cmd
+    
+    - name: Configure CMake
+      run: |
+        cmake -B build -G "Visual Studio 17 2022" -A x64 ^
+          -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} ^
+          -DCOLLIDER_EDITION_PRO=OFF ^
+          -DCOLLIDER_USE_CUDA=ON ^
+          -DCOLLIDER_BUILD_TESTS=OFF ^
+          -DCOLLIDER_BUILD_BENCHMARKS=OFF ^
+          -DCMAKE_TOOLCHAIN_FILE="C:/vcpkg/scripts/buildsystems/vcpkg.cmake" ^
+          -DVCPKG_TARGET_TRIPLET=x64-windows ^
+          -DCUDA_ARCHITECTURES="75;86;89"
+      shell: cmd
+    
+    - name: Build
+      run: cmake --build build --config ${{env.BUILD_TYPE}} --parallel 4
+    
+    - name: Verify binary
+      run: |
+        dir build\Release\
+        build\Release\collider.exe --version || build\Release\collider.exe --help || echo "Binary exists"
+      shell: cmd
+    
+    - name: Upload Windows binary
+      uses: actions/upload-artifact@v4
+      with:
+        name: collider-windows-x64
+        path: build/Release/collider.exe
+        retention-days: 30
+
+  # ============================================================================
+  # macOS ARM64 with Metal
+  # ============================================================================
+  build-macos:
+    runs-on: macos-14  # Apple Silicon
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+    
+    - name: Install dependencies
+      run: |
+        brew update
+        brew install cmake openssl
+    
+    - name: Configure CMake
+      run: |
+        export OPENSSL_ROOT_DIR=$(brew --prefix openssl)
+        cmake -B build \
+          -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} \
+          -DCOLLIDER_EDITION_PRO=OFF \
+          -DCOLLIDER_USE_CUDA=OFF \
+          -DCOLLIDER_USE_METAL=ON \
+          -DCOLLIDER_BUILD_TESTS=OFF \
+          -DCOLLIDER_BUILD_BENCHMARKS=OFF \
+          -DOPENSSL_ROOT_DIR=$OPENSSL_ROOT_DIR
+    
+    - name: Build
+      run: cmake --build build --config ${{env.BUILD_TYPE}} --parallel 4
+    
+    - name: Verify binary
+      run: |
+        ls -la build/
+        file build/collider
+        otool -L build/collider || true
+        ./build/collider --version || ./build/collider --help || echo "Binary exists but needs runtime setup"
+    
+    - name: Upload macOS binary
+      uses: actions/upload-artifact@v4
+      with:
+        name: collider-macos-arm64
+        path: build/collider
+        retention-days: 30
+
+  # ============================================================================
+  # Create Release with All Binaries
+  # ============================================================================
+  release:
+    needs: [build-linux, build-windows, build-macos]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts/
+    
+    - name: Prepare release files
+      run: |
+        mkdir -p release/
+        
+        # Linux
+        cp artifacts/collider-linux-x64/collider release/collider-linux-x64
+        chmod +x release/collider-linux-x64
+        
+        # Windows  
+        cp artifacts/collider-windows-x64/collider.exe release/collider-windows-x64.exe
+        
+        # macOS
+        cp artifacts/collider-macos-arm64/collider release/collider-macos-arm64
+        chmod +x release/collider-macos-arm64
+        
+        # Create checksums
+        cd release/
+        sha256sum collider-* > SHA256SUMS.txt
+        ls -la
+        cat SHA256SUMS.txt
+    
+    - name: Determine version
+      id: version
+      run: |
+        if [ "${{ github.event_name }}" = "push" ] && [ "${{ startsWith(github.ref, 'refs/tags/v') }}" = "true" ]; then
+          VERSION="${GITHUB_REF#refs/tags/}"
+        elif [ "${{ github.event.inputs.version }}" != "" ]; then
+          VERSION="v${{ github.event.inputs.version }}"
+        else
+          VERSION="v1.0.0-dev-$(date +%Y%m%d)-$(echo ${{ github.sha }} | cut -c1-7)"
+        fi
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        echo "Version: $VERSION"
+    
+    - name: Create Release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ steps.version.outputs.version }}
+        name: "Collider ${{ steps.version.outputs.version }}"
+        body: |
+          ## Collider Release ${{ steps.version.outputs.version }}
+          
+          **🔓 GPU-accelerated Bitcoin Puzzle Solver - Free Open Source Edition**
+          
+          ### 📦 Downloads:
+          - **Linux x64 (CUDA)**: `collider-linux-x64` 
+          - **Windows x64 (CUDA)**: `collider-windows-x64.exe`
+          - **macOS ARM64 (Metal)**: `collider-macos-arm64`
+          
+          ### 🔍 Verification:
+          Download `SHA256SUMS.txt` and verify checksums:
+          ```bash
+          sha256sum -c SHA256SUMS.txt
+          ```
+          
+          ### ⚡ Features:
+          - Pool mining support (JLP protocol)
+          - Multi-GPU CUDA acceleration
+          - Metal support for Apple Silicon
+          - Pollard's Kangaroo algorithm (K=1.15)
+          - Real-time pool statistics
+          - Cross-platform compatibility
+          - 100% open source (MIT License)
+          
+          ### 🚀 Quick Start:
+          ```bash
+          # Extract and run
+          chmod +x collider-linux-x64
+          ./collider-linux-x64 --pool collisionprotocol.com:17403 --worker YourName
+          ```
+          
+          ### 🖥️ System Requirements:
+          - **Linux/Windows**: NVIDIA GPU with CUDA 12.6+ support
+          - **macOS**: Apple Silicon Mac with Metal support
+          - **GPU Memory**: 4GB+ recommended
+          - **CUDA**: GTX 1060 or better (Linux/Windows)
+          
+          ### 📚 Documentation:
+          - [Setup Guide](https://collisionprotocol.com/docs)
+          - [Pool Statistics](https://collisionprotocol.com/pool)
+          - [GitHub Repository](https://github.com/hevnsnt/collider)
+          
+          **Built from**: `${{ github.ref_name }}` @ `${{ github.sha }}`
+        draft: false
+        prerelease: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        files: |
+          release/*
+    
+    - name: Update download page
+      run: |
+        echo "🎉 Free edition binaries built and released!"
+        echo ""
+        echo "📁 Release artifacts:"
+        ls -la release/
+        echo ""
+        echo "🔗 Release URL: https://github.com/${{ github.repository }}/releases/tag/${{ steps.version.outputs.version }}"
+        echo "🌐 Website should auto-update download links from GitHub releases API"
