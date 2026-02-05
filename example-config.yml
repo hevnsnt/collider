@@ -1,0 +1,119 @@
+# =============================================================================
+# collider configuration file
+# =============================================================================
+# Copy this file to config.yml and customize for your setup.
+# Command-line arguments override these settings.
+#
+# Config file search order:
+#   1. ./config.yml (current directory)
+#   2. ~/.collider/config.yml (home directory)
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Pool Mining Configuration
+# -----------------------------------------------------------------------------
+pool:
+  # Your Bitcoin address for receiving rewards
+  # This is your identity in the pool - use a valid BTC address you control
+  worker: "bc1qYourBitcoinAddressHere"
+  
+  # Pool server URL (default: collisionprotocol.com:17403)
+  # Note: Free edition always uses the default pool
+  url: "collisionprotocol.com:17403"
+  
+  # Optional: Pool password (if required by pool)
+  # password: ""
+  
+  # Optional: API key for authenticated pools
+  # api_key: ""
+
+# -----------------------------------------------------------------------------
+# Puzzle Configuration (Solo Mode)
+# -----------------------------------------------------------------------------
+puzzle:
+  # Target puzzle number (0 = use pool's current puzzle)
+  # Puzzle #135 is the current active puzzle with 13.5 BTC
+  number: 0
+  
+  # Auto-select optimal puzzle based on progress
+  smart_select: true
+  
+  # Puzzle bit range limits
+  min_bits: 0
+  max_bits: 160
+  
+  # Use Kangaroo algorithm (required for puzzles with known public keys)
+  kangaroo: true
+  
+  # Distinguished point bits (-1 = auto-calculate optimal value)
+  # Higher = fewer DPs stored, lower = more DPs but faster collision detection
+  dp_bits: -1
+  
+  # Randomize search starting points
+  random_search: true
+  
+  # Automatically move to next puzzle when solved
+  auto_next: false
+  
+  # Checkpoint file for resuming interrupted searches
+  # checkpoint: "./checkpoints/puzzle135.ckpt"
+
+# -----------------------------------------------------------------------------
+# GPU Configuration
+# -----------------------------------------------------------------------------
+gpu:
+  # GPU device IDs to use (empty = use all available GPUs)
+  # Example: [0] for first GPU only, [0, 1] for first two GPUs
+  devices: []
+  
+  # Batch size for GPU operations (0 = auto-tune)
+  # Larger values use more VRAM but may improve throughput
+  batch_size: 0
+  
+  # Force GPU calibration on startup
+  force_calibrate: false
+
+# -----------------------------------------------------------------------------
+# General Settings
+# -----------------------------------------------------------------------------
+settings:
+  # Enable verbose output
+  verbose: false
+  
+  # Enable debug output (very noisy)
+  debug: false
+  
+  # Benchmark duration in seconds
+  benchmark_seconds: 30
+
+# -----------------------------------------------------------------------------
+# Directory Paths
+# -----------------------------------------------------------------------------
+paths:
+  # Directory for processed wordlists and data files
+  data_dir: "./processed"
+  
+  # Directory for checkpoint files
+  checkpoint_dir: "./checkpoints"
+  
+  # Directory for log files
+  log_dir: "./logs"
+
+# =============================================================================
+# Pro-Only Features (requires collider pro - collisionprotocol.com/pro)
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Brain Wallet Scanner (Pro)
+# -----------------------------------------------------------------------------
+# brainwallet:
+#   enabled: true
+#   wordlist: "./wordlists/rockyou.txt"
+#   save_interval: 1000000
+#   resume: false
+
+# -----------------------------------------------------------------------------
+# Bloom Filter (Pro)
+# -----------------------------------------------------------------------------
+# bloom:
+#   file: "./funded_addresses.blf"
