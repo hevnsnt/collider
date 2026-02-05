@@ -1,93 +1,273 @@
 # collider
 
-**GPU-accelerated Bitcoin Puzzle solver using Pollard's Kangaroo algorithm.**
+A GPU-accelerated solver for the Bitcoin Puzzle Challenge, implementing Pollard's Kangaroo algorithm on secp256k1.
 
-> K=1.15 efficiency — 40-80% fewer operations than competitors.
+```
+$ ./collider --worker bc1qYourAddress
+[*] GPU: NVIDIA GeForce RTX 4090
+[*] Backend: CUDA 12.4
+[*] Connecting to pool: collisionprotocol.com:17403
 
-## What is this?
+Pool: 47.2% | Speed: 8.14 GKeys/s | DPs: 1.2M | Sent: 847K | ETA: ~2.3 years
+```
 
-`collider` is a free, open-source GPU solver for the [1000 BTC Bitcoin Puzzle Challenge](https://collisionprotocol.com). It uses Pollard's Kangaroo algorithm on the secp256k1 elliptic curve to hunt for private keys via Distinguished Points.
+## The Bitcoin Puzzle
 
-Join the **Collision Protocol pool** and contribute your GPU power. When a puzzle is solved, rewards are split proportionally based on your Distinguished Point contributions.
+In 2015, someone created 256 Bitcoin addresses with private keys of increasing difficulty. The first ~70 have been solved. Puzzle #135 holds **13.5 BTC** (~$1.3M at current prices) and requires finding a 135-bit private key.
+
+The math: 135-bit keyspace = 2^135 possibilities. Brute force at 10 billion keys/second would take longer than the age of the universe.
+
+**Pollard's Kangaroo** reduces this to O(√n) operations. Instead of 2^135 operations, we need ~2^67.5. Still astronomical for one GPU, but tractable for a distributed pool.
+
+That's where collider comes in.
+
+## How It Works
+
+The Kangaroo algorithm works by launching two types of "kangaroos" that jump around the keyspace:
+
+1. **Tame kangaroos** start from a known point and record their path
+2. **Wild kangaroos** start from the target public key
+
+When a wild kangaroo lands on a tame kangaroo's path, we can compute the private key from the collision. The trick is using "Distinguished Points" (DPs) — points with special properties that we actually store and compare.
+
+Our implementation achieves **K=1.15** efficiency, meaning we solve puzzles in approximately 1.15× the theoretical minimum operations. Most public implementations run at K=1.6 or worse.
 
 ## Features
 
-- 🚀 **CUDA GPU acceleration** — RTX 4090: ~8 GKeys/s, RTX 3090: ~4 GKeys/s
-- ⚡ **K=1.15 efficiency** — State-of-the-art Kangaroo implementation
-- 🖥️ **Multi-GPU support** — Linear scaling across GPUs
-- 🌐 **Pool mining** — Connect to any JLP-compatible pool
-- 📊 **Benchmark mode** — Test your GPU performance
-- 🍎 **Cross-platform** — Linux, Windows, macOS (CUDA + Metal)
-- 📝 **YAML config** — Flexible configuration
+- **CUDA acceleration** for NVIDIA GPUs (Compute 6.0+)
+- **Metal backend** for Apple Silicon
+- **Multi-GPU support** with linear scaling
+- **Pool mining** via the JLP protocol
+- **Solo mode** via command line flags
+- **Benchmark mode** to test your hardware
 
-## Quick Start
+## Building
+
+### Requirements
+
+| Component | Version |
+|-----------|---------|
+| CUDA Toolkit | 12.0+ |
+| CMake | 3.18+ |
+| C++ Compiler | C++17 support |
+| OpenSSL | 1.1+ (for TLS) |
+
+### Linux
 
 ```bash
-# Build
 git clone https://github.com/hevnsnt/collider.git
 cd collider
 mkdir build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
 make -j$(nproc)
+```
 
-# Join the pool
-./collider --pool collisionprotocol.com:17403 --worker YourBTCAddress
+### Windows
 
-# Benchmark
+Prerequisites:
+- Visual Studio 2022 with C++ workload
+- CUDA Toolkit 12.x
+- vcpkg for dependencies
+
+```powershell
+git clone https://github.com/hevnsnt/collider.git
+cd collider
+
+# Install dependencies via vcpkg
+vcpkg install openssl:x64-windows
+
+# Configure and build
+mkdir build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=[vcpkg-root]/scripts/buildsystems/vcpkg.cmake
+cmake --build . --config Release
+```
+
+Or use the provided batch file:
+```powershell
+.\build.bat
+```
+
+### macOS (Apple Silicon)
+
+```bash
+git clone https://github.com/hevnsnt/collider.git
+cd collider
+./build_macos.sh
+```
+
+The Metal backend is used automatically on Apple Silicon. Performance is roughly 1/10th of equivalent NVIDIA hardware due to Metal's less mature compute ecosystem, but it works.
+
+## Usage
+
+### Pool Mining (Recommended)
+
+Solo solving Puzzle #135 with a single RTX 4090 would take approximately 195 years. Pool mining distributes the work across many GPUs.
+
+```bash
+# Basic pool connection
+./collider --worker bc1qYourBitcoinAddress
+
+# Or with explicit pool URL
+./collider --pool collisionprotocol.com:17403 --worker bc1qYourBitcoinAddress
+```
+
+Your Bitcoin address is your identity and payout destination. When the puzzle is solved, rewards are distributed proportionally based on Distinguished Points contributed.
+
+**Pool fee:** 5% (covers infrastructure, development, and coordination)
+
+### Solo Mode
+
+If you want to mine directly without the pool:
+
+```bash
+# Target a specific puzzle
+./collider --puzzle 135
+
+# With Kangaroo algorithm (required for puzzles with known public keys)
+./collider --puzzle 135 --kangaroo
+```
+
+Note: Solo mode is technically possible but economically impractical for high-bit puzzles.
+
+### Benchmarking
+
+```bash
 ./collider --benchmark
 ```
 
-## Requirements
+Expected performance (Kangaroo mode):
 
-- **NVIDIA GPU** with CUDA 12.0+ (or Apple Silicon for Metal)
-- CMake 3.18+
-- C++17 compiler
-- CUDA Toolkit 12.0+
+| GPU | Keys/Second |
+|-----|-------------|
+| RTX 5090 | ~12 GKeys/s |
+| RTX 4090 | ~8 GKeys/s |
+| RTX 3090 | ~4 GKeys/s |
+| RTX 3060 | ~1.5 GKeys/s |
+| Apple M2 | ~400 MKeys/s |
 
-## Pool Mining
+### Configuration File
 
-Connect to the Collision Protocol pool:
-
-```bash
-./collider --pool collisionprotocol.com:17403 --worker <your-btc-address>
-```
-
-Your share of the reward = (Your DPs / Total DPs) × Prize BTC. Pool fee: 5%.
-
-## Configuration
-
-Create a `config.yaml`:
+Create `config.yml` for persistent settings:
 
 ```yaml
 pool:
-  url: collisionprotocol.com:17403
-  worker: YourBTCAddress
+  url: "collisionprotocol.com:17403"
+  worker: "bc1qYourBitcoinAddress"
 
 gpu:
-  device: 0          # GPU index (or "all")
-  grid_size: 0       # 0 = auto
-  block_size: 256
+  devices: []  # Empty = use all available GPUs
 ```
 
-Run with config: `./collider --config config.yaml`
+```bash
+./collider --config config.yml
+```
 
-## Pro Version
+## Command Reference
 
-Need solo puzzle solving, brain wallet cracking, bloom filters, PCFG, or rule engines?
+```
+Usage: collider [options]
 
-Check out [**collider pro**](https://collisionprotocol.com/pro) — $49.99 per major version.
+Pool Options:
+  --worker, -w <address>    Your Bitcoin address for rewards
+  --pool <host:port>        Pool server (default: collisionprotocol.com:17403)
 
-## Links
+Solo Options:
+  --puzzle, -P <number>     Target puzzle number
+  --kangaroo                Use Kangaroo algorithm
+  --dp-bits <n>             Distinguished point bits (default: auto)
 
-- 🌐 [collisionprotocol.com](https://collisionprotocol.com)
-- 📖 [Documentation](https://collisionprotocol.com/docs)
-- 📊 [Pool Stats](https://collisionprotocol.com/pool)
-- 🛒 [Get Pro](https://collisionprotocol.com/pro)
+GPU Options:
+  --gpus, -g <ids>          GPU device IDs (default: all)
 
-## License
+Other:
+  --benchmark               Run performance benchmark
+  --config, -c <file>       Load configuration file
+  --verbose, -v             Verbose output
+  --help, -h                Show help
+```
 
-MIT — see [LICENSE](LICENSE).
+## Security Considerations
+
+**This software is designed for legitimate puzzle solving and security research.**
+
+The Bitcoin Puzzle addresses have no legitimate owner claiming them — they were created specifically as a cryptographic challenge. The same cannot be said for other Bitcoin addresses.
+
+**Do not use this tool to:**
+- Attempt to crack wallets you don't own
+- Target addresses with known owners
+- Engage in any form of theft
+
+Using cryptographic tools against systems without authorization is illegal in most jurisdictions.
+
+**Operational security:**
+- The pool connection uses TLS encryption
+- Your private keys are never transmitted — only Distinguished Points
+- The pool cannot solve puzzles without contributors; it's a coordination mechanism, not a key escrow
+
+## Architecture
+
+```
+src/
+├── main.cpp              # Entry point and CLI handling
+├── core/                 # Core types, config, puzzle database
+├── gpu/                  # CUDA kernels and GPU management
+│   ├── kangaroo_*.cu     # Kangaroo algorithm implementation
+│   └── rckangaroo/       # RCKangaroo backend (K=1.15)
+├── pool/                 # Pool client (JLP protocol)
+├── platform/             # Platform abstraction (CUDA/Metal)
+└── ui/                   # Terminal UI and progress display
+```
+
+The hot path is the GPU kernel that performs elliptic curve point additions. We use projective coordinates and batch inversions to minimize expensive modular inversions.
+
+## Protocol
+
+collider implements the JLP (Jean-Luc Pons) protocol for pool communication:
+
+- Binary protocol over TCP with optional TLS
+- 8-byte header: `KANG` magic + type + flags + length
+- Message types: AUTH, WORK_REQ, WORK_ASN, DP_SUBMIT, DP_BATCH
+
+Full protocol specification: [collisionprotocol.com/protocol](https://collisionprotocol.com/protocol)
 
 ## Contributing
 
-PRs welcome! Please open an issue first for major changes.
+Issues and pull requests are welcome. For major changes, please open an issue first to discuss.
+
+Areas where contributions would be particularly valuable:
+- OpenCL backend for AMD GPUs
+- Performance optimizations for specific GPU architectures
+- Additional test coverage
+
+## Pro Version
+
+Need more features? [collider pro](https://collisionprotocol.com/pro) includes:
+
+- **Brain wallet scanner** — Check passphrases against funded addresses
+- **Bloom filter** — 50M+ funded address database
+- **PCFG generation** — Learn password patterns from wordlists
+- **Rule engine** — Transform candidates (leetspeak, case mutations, etc.)
+- **Custom pool support** — Connect to any JLP-compatible pool
+
+One-time purchase: $49.99 per major version.
+
+## Links
+
+- Website: [collisionprotocol.com](https://collisionprotocol.com)
+- Pool stats: [collisionprotocol.com/pool](https://collisionprotocol.com/pool)
+- Protocol spec: [collisionprotocol.com/protocol](https://collisionprotocol.com/protocol)
+- Pro version: [collisionprotocol.com/pro](https://collisionprotocol.com/pro)
+
+## Acknowledgments
+
+- [RetiredCoder](https://github.com/RetiredCoder) — RCKangaroo implementation
+- [Jean-Luc Pons](https://github.com/JeanLucPons) — Original Kangaroo GPU work
+- bitcoin-core/secp256k1 — Reference implementation
+
+## License
+
+MIT License. See [LICENSE](LICENSE) for details.
+
+---
+
+*"The puzzle is the prize."*
