@@ -63,4 +63,5 @@ Thumbs.db
 *.tmp
 
 # vcpkg (auto-downloaded on Windows)
-vcpkg/
+vcpkg/*.blf
+funded_addresses.blf

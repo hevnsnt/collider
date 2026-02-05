@@ -7,6 +7,8 @@
 #pragma once
 
 #include <cstdint>
+#include <cstring>
+#include <cmath>
 #include <string>
 #include <string_view>
 #include <vector>

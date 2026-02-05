@@ -1,7 +1,7 @@
 /**
  * Interactive Mode - User-Friendly Menu System
  *
- * Provides interactive prompts and menus for theCollider when launched
+ * Provides interactive prompts and menus for collider when launched
  * without command-line arguments.
  */
 

@@ -4,6 +4,7 @@
 #include <iostream>
 #include <sstream>
 #include <iomanip>
+#include <cstring>
 #include <regex>
 
 namespace collider {

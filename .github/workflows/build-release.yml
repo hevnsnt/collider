@@ -1,13 +1,12 @@
-name: Build Free Release Binaries
+name: Build Pro Release Binaries
 
 on:
   push:
-    branches: [ main ]
-    tags: [ 'v*' ]
+    branches: [ develop ]
   workflow_dispatch:
     inputs:
       version:
-        description: 'Release version (e.g., 1.0.0)'
+        description: 'Release version (e.g., 1.0.0-dev)'
         required: false
         default: 'dev'
 
@@ -29,11 +28,19 @@ jobs:
         apt-get update
         apt-get install -y \
           git \
-          cmake \
           build-essential \
           libssl-dev \
           wget \
-          ca-certificates
+          file \
+          ca-certificates \
+          software-properties-common \
+          gpg
+        # Install CMake 3.28+ (Ubuntu 22.04 ships 3.22 which doesn't support CUDA C++20)
+        wget -qO- https://apt.kitware.com/keys/kitware-archive-latest.asc | gpg --dearmor -o /usr/share/keyrings/kitware-archive-keyring.gpg
+        echo "deb [signed-by=/usr/share/keyrings/kitware-archive-keyring.gpg] https://apt.kitware.com/ubuntu/ jammy main" > /etc/apt/sources.list.d/kitware.list
+        apt-get update
+        apt-get install -y cmake
+        cmake --version
     
     - name: Checkout code
       uses: actions/checkout@v4
@@ -44,27 +51,27 @@ jobs:
       run: |
         cmake -B build \
           -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} \
-          -DCOLLIDER_EDITION_PRO=OFF \
+          -DCOLLIDER_EDITION_PRO=ON \
           -DCOLLIDER_USE_CUDA=ON \
           -DCOLLIDER_BUILD_TESTS=OFF \
           -DCOLLIDER_BUILD_BENCHMARKS=OFF \
-          -DCUDA_ARCHITECTURES="75;86;89"
+          -DCOLLIDER_BUILD_TOOLS=OFF \
+          -DCMAKE_CUDA_ARCHITECTURES="75;86;89"
     
     - name: Build
-      run: cmake --build build --config ${{env.BUILD_TYPE}} --parallel 4
+      run: cmake --build build --config ${{env.BUILD_TYPE}} --target collider_pro --parallel 4
     
-    - name: Verify binary
+    - name: Strip and verify
       run: |
-        ls -la build/
-        file build/collider
-        ldd build/collider || true
-        ./build/collider --version || ./build/collider --help || echo "Binary exists but needs runtime setup"
+        strip build/collider_pro
+        ls -lh build/collider_pro
+        file build/collider_pro
     
     - name: Upload Linux binary
       uses: actions/upload-artifact@v4
       with:
-        name: collider-linux-x64
-        path: build/collider
+        name: collider_pro-linux-x64
+        path: build/collider_pro
         retention-days: 30
 
   # ============================================================================
@@ -80,44 +87,44 @@ jobs:
         submodules: recursive
     
     - name: Install CUDA Toolkit
-      uses: Jimver/cuda-toolkit@v0.2.16
+      uses: Jimver/cuda-toolkit@v0.2.19
       with:
-        cuda: '12.6.0'
+        cuda: '12.6.2'
         method: 'network'
-        sub-packages: '["nvcc", "cudart", "cudart_dev", "thrust", "visual_studio_integration"]'
+        sub-packages: '["nvcc", "cudart", "visual_studio_integration"]'
     
     - name: Install vcpkg dependencies
       run: |
-        vcpkg install openssl:x64-windows
-      shell: cmd
+        vcpkg install --triplet x64-windows --no-print-usage
+      shell: pwsh
     
     - name: Configure CMake
       run: |
-        cmake -B build -G "Visual Studio 17 2022" -A x64 ^
-          -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} ^
-          -DCOLLIDER_EDITION_PRO=OFF ^
-          -DCOLLIDER_USE_CUDA=ON ^
-          -DCOLLIDER_BUILD_TESTS=OFF ^
-          -DCOLLIDER_BUILD_BENCHMARKS=OFF ^
-          -DCMAKE_TOOLCHAIN_FILE="C:/vcpkg/scripts/buildsystems/vcpkg.cmake" ^
-          -DVCPKG_TARGET_TRIPLET=x64-windows ^
+        cmake -B build -G "Visual Studio 17 2022" -A x64 `
+          -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} `
+          -DCOLLIDER_EDITION_PRO=ON `
+          -DCOLLIDER_USE_CUDA=ON `
+          -DCOLLIDER_BUILD_TESTS=OFF `
+          -DCOLLIDER_BUILD_BENCHMARKS=OFF `
+          -DCOLLIDER_BUILD_TOOLS=OFF `
+          -DCMAKE_TOOLCHAIN_FILE="C:/vcpkg/scripts/buildsystems/vcpkg.cmake" `
+          -DVCPKG_TARGET_TRIPLET=x64-windows `
           -DCUDA_ARCHITECTURES="75;86;89"
-      shell: cmd
+      shell: pwsh
     
     - name: Build
-      run: cmake --build build --config ${{env.BUILD_TYPE}} --parallel 4
+      run: cmake --build build --config ${{env.BUILD_TYPE}} --target collider_pro --parallel 4
     
     - name: Verify binary
       run: |
-        dir build\Release\
-        build\Release\collider.exe --version || build\Release\collider.exe --help || echo "Binary exists"
-      shell: cmd
+        Get-Item build\Release\collider_pro.exe | Format-List Name, Length
+      shell: pwsh
     
     - name: Upload Windows binary
       uses: actions/upload-artifact@v4
       with:
-        name: collider-windows-x64
-        path: build/Release/collider.exe
+        name: collider_pro-windows-x64
+        path: build/Release/collider_pro.exe
         retention-days: 30
 
   # ============================================================================
@@ -142,28 +149,28 @@ jobs:
         export OPENSSL_ROOT_DIR=$(brew --prefix openssl)
         cmake -B build \
           -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} \
-          -DCOLLIDER_EDITION_PRO=OFF \
+          -DCOLLIDER_EDITION_PRO=ON \
           -DCOLLIDER_USE_CUDA=OFF \
           -DCOLLIDER_USE_METAL=ON \
           -DCOLLIDER_BUILD_TESTS=OFF \
           -DCOLLIDER_BUILD_BENCHMARKS=OFF \
+          -DCOLLIDER_BUILD_TOOLS=OFF \
           -DOPENSSL_ROOT_DIR=$OPENSSL_ROOT_DIR
     
     - name: Build
-      run: cmake --build build --config ${{env.BUILD_TYPE}} --parallel 4
+      run: cmake --build build --config ${{env.BUILD_TYPE}} --target collider_pro --parallel 4
     
     - name: Verify binary
       run: |
-        ls -la build/
-        file build/collider
-        otool -L build/collider || true
-        ./build/collider --version || ./build/collider --help || echo "Binary exists but needs runtime setup"
+        ls -lh build/collider_pro
+        file build/collider_pro
+        otool -L build/collider_pro || true
     
     - name: Upload macOS binary
       uses: actions/upload-artifact@v4
       with:
-        name: collider-macos-arm64
-        path: build/collider
+        name: collider_pro-macos-arm64
+        path: build/collider_pro
         retention-days: 30
 
   # ============================================================================
@@ -172,7 +179,6 @@ jobs:
   release:
     needs: [build-linux, build-windows, build-macos]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     
     steps:
     - name: Checkout code
@@ -188,49 +194,47 @@ jobs:
         mkdir -p release/
         
         # Linux
-        cp artifacts/collider-linux-x64/collider release/collider-linux-x64
-        chmod +x release/collider-linux-x64
+        cp artifacts/collider_pro-linux-x64/collider_pro release/collider_pro-linux-x64
+        chmod +x release/collider_pro-linux-x64
         
         # Windows  
-        cp artifacts/collider-windows-x64/collider.exe release/collider-windows-x64.exe
+        cp artifacts/collider_pro-windows-x64/collider_pro.exe release/collider_pro-windows-x64.exe
         
         # macOS
-        cp artifacts/collider-macos-arm64/collider release/collider-macos-arm64
-        chmod +x release/collider-macos-arm64
+        cp artifacts/collider_pro-macos-arm64/collider_pro release/collider_pro-macos-arm64
+        chmod +x release/collider_pro-macos-arm64
         
         # Create checksums
         cd release/
-        sha256sum collider-* > SHA256SUMS.txt
+        sha256sum collider_pro-* > SHA256SUMS.txt
         ls -la
         cat SHA256SUMS.txt
     
     - name: Determine version
       id: version
       run: |
-        if [ "${{ github.event_name }}" = "push" ] && [ "${{ startsWith(github.ref, 'refs/tags/v') }}" = "true" ]; then
-          VERSION="${GITHUB_REF#refs/tags/}"
-        elif [ "${{ github.event.inputs.version }}" != "" ]; then
-          VERSION="v${{ github.event.inputs.version }}"
+        if [ "${{ github.event.inputs.version }}" != "" ]; then
+          VERSION="${{ github.event.inputs.version }}"
         else
-          VERSION="v1.0.0-dev-$(date +%Y%m%d)-$(echo ${{ github.sha }} | cut -c1-7)"
+          VERSION="dev-$(date +%Y%m%d)-$(echo ${{ github.sha }} | cut -c1-7)"
         fi
-        echo "version=$VERSION" >> $GITHUB_OUTPUT
-        echo "Version: $VERSION"
+        echo "version=v$VERSION" >> $GITHUB_OUTPUT
+        echo "Version: v$VERSION"
     
     - name: Create Release
       uses: softprops/action-gh-release@v2
       with:
         tag_name: ${{ steps.version.outputs.version }}
-        name: "Collider ${{ steps.version.outputs.version }}"
+        name: "Collider Pro ${{ steps.version.outputs.version }}"
         body: |
-          ## Collider Release ${{ steps.version.outputs.version }}
+          ## Collider Pro Release ${{ steps.version.outputs.version }}
           
-          **🔓 GPU-accelerated Bitcoin Puzzle Solver - Free Open Source Edition**
+          **🚀 GPU-accelerated Bitcoin Puzzle Solver - Pro Edition**
           
           ### 📦 Downloads:
-          - **Linux x64 (CUDA)**: `collider-linux-x64` 
-          - **Windows x64 (CUDA)**: `collider-windows-x64.exe`
-          - **macOS ARM64 (Metal)**: `collider-macos-arm64`
+          - **Linux x64 (CUDA)**: `collider_pro-linux-x64` 
+          - **Windows x64 (CUDA)**: `collider_pro-windows-x64.exe`
+          - **macOS ARM64 (Metal)**: `collider_pro-macos-arm64`
           
           ### 🔍 Verification:
           Download `SHA256SUMS.txt` and verify checksums:
@@ -239,20 +243,13 @@ jobs:
           ```
           
           ### ⚡ Features:
-          - Pool mining support (JLP protocol)
-          - Multi-GPU CUDA acceleration
-          - Metal support for Apple Silicon
-          - Pollard's Kangaroo algorithm (K=1.15)
-          - Real-time pool statistics
-          - Cross-platform compatibility
-          - 100% open source (MIT License)
-          
-          ### 🚀 Quick Start:
-          ```bash
-          # Extract and run
-          chmod +x collider-linux-x64
-          ./collider-linux-x64 --pool collisionprotocol.com:17403 --worker YourName
-          ```
+          - Solo puzzle solving (direct to wallet)
+          - Brain wallet / passphrase cracking
+          - Bloom filter integration
+          - PCFG & Markov chain generation
+          - Advanced rule engine
+          - Multi-GPU support
+          - Personalized licensing system
           
           ### 🖥️ System Requirements:
           - **Linux/Windows**: NVIDIA GPU with CUDA 12.6+ support
@@ -260,23 +257,18 @@ jobs:
           - **GPU Memory**: 4GB+ recommended
           - **CUDA**: GTX 1060 or better (Linux/Windows)
           
-          ### 📚 Documentation:
-          - [Setup Guide](https://collisionprotocol.com/docs)
-          - [Pool Statistics](https://collisionprotocol.com/pool)
-          - [GitHub Repository](https://github.com/hevnsnt/collider)
-          
           **Built from**: `${{ github.ref_name }}` @ `${{ github.sha }}`
         draft: false
-        prerelease: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        prerelease: true
         files: |
           release/*
     
-    - name: Update download page
+    - name: Copy binaries for website patching
       run: |
-        echo "🎉 Free edition binaries built and released!"
-        echo ""
-        echo "📁 Release artifacts:"
-        ls -la release/
+        echo "🏗️ Binaries built and released!"
+        echo "📁 For website integration, copy these to VPS:/opt/collider-binaries/"
+        echo "   - collider_pro-linux-x64"
+        echo "   - collider_pro-windows-x64.exe"  
+        echo "   - collider_pro-macos-arm64"
         echo ""
         echo "🔗 Release URL: https://github.com/${{ github.repository }}/releases/tag/${{ steps.version.outputs.version }}"
-        echo "🌐 Website should auto-update download links from GitHub releases API"

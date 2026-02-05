@@ -307,7 +307,7 @@ std::string HTTPPoolClient::make_request(const std::string& method,
     std::stringstream request;
     request << method << " " << config_.base_url << endpoint << " HTTP/1.1\r\n";
     request << "Host: " << host_ << "\r\n";
-    request << "User-Agent: theCollider/1.0\r\n";
+    request << "User-Agent: collider-pro/1.0\r\n";
     request << "Accept: application/json\r\n";
     request << "Connection: close\r\n";
 

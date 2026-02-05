@@ -1,5 +1,5 @@
 // pool_client.hpp - Abstract pool client interface for distributed Kangaroo solving
-// theCollider - GPU-accelerated Bitcoin puzzle solver
+// collider - GPU-accelerated Bitcoin puzzle solver
 
 #pragma once
 

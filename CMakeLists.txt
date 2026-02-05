@@ -51,13 +51,13 @@ endif()
 # Detect platform before project declaration
 if(APPLE)
     set(COLLIDER_PLATFORM_MACOS TRUE)
-    project(collider LANGUAGES CXX OBJCXX)
+    project(collider LANGUAGES C CXX OBJCXX)
 elseif(WIN32)
     set(COLLIDER_PLATFORM_WINDOWS TRUE)
-    project(collider LANGUAGES CXX CUDA)
+    project(collider LANGUAGES C CXX CUDA)
 else()
     set(COLLIDER_PLATFORM_LINUX TRUE)
-    project(collider LANGUAGES CXX CUDA)
+    project(collider LANGUAGES C CXX CUDA)
 endif()
 
 set(CMAKE_CXX_STANDARD 20)
@@ -72,7 +72,6 @@ option(COLLIDER_USE_CPU "Enable CPU fallback backend" ON)
 option(COLLIDER_BUILD_TESTS "Build tests" ON)
 option(COLLIDER_BUILD_BENCHMARKS "Build benchmarks" ON)
 option(COLLIDER_BUILD_TOOLS "Build CLI tools" ON)
-option(COLLIDER_EDITION_PRO "Build Pro edition" OFF)
 
 # ============================================================================
 # Backend Detection
@@ -151,16 +150,12 @@ if(COLLIDER_BACKEND STREQUAL "CPU")
     message(STATUS "Using CPU fallback backend")
 endif()
 
-message(STATUS "TheCollider backend: ${COLLIDER_BACKEND}")
+message(STATUS "Collider backend: ${COLLIDER_BACKEND}")
 
 # ============================================================================
 # Edition Configuration  
 # ============================================================================
-if(COLLIDER_EDITION_PRO)
-    message(STATUS "Building theCollider Pro edition")
-else()
-    message(STATUS "Building theCollider Free edition (pool-only)")
-endif()
+    message(STATUS "Building Collider Free edition (pool-only)")
 
 # ============================================================================
 # Optimization Flags
@@ -304,25 +299,12 @@ else()
 endif()
 
 # ============================================================================
-# License Module (Always build for pro sources)
-# ============================================================================
-set(LICENSE_SOURCES
-)
-
-add_library(collider_license STATIC ${LICENSE_SOURCES})
-target_include_directories(collider_license PRIVATE 
-)
-
-message(STATUS "License module built (linked only in Pro edition)")
-
-# ============================================================================
 # Core Library (CPU-side intelligence layer)
 # ============================================================================
 set(CORE_SOURCES
     src/core/rule_engine.cpp
     src/generators/passphrase_generator.cpp
     src/generators/priority_queue.cpp
-    src/gpu/brain_wallet_gpu.cpp
 )
 
 # Check if source files exist
@@ -340,10 +322,6 @@ if(CORE_SOURCES)
     )
     target_include_directories(collider_core PUBLIC ${XXHASH_INCLUDE_DIR})
     
-    # Link license module for Pro edition
-    if(COLLIDER_EDITION_PRO AND TARGET collider_license)
-        target_link_libraries(collider_core collider_license)
-    endif()
 else()
     # Create empty library if no sources exist yet
     add_library(collider_core INTERFACE)
@@ -353,10 +331,6 @@ else()
     )
     target_include_directories(collider_core INTERFACE ${XXHASH_INCLUDE_DIR})
     
-    # Link license module for Pro edition
-    if(COLLIDER_EDITION_PRO AND TARGET collider_license)
-        target_link_libraries(collider_core INTERFACE collider_license)
-    endif()
 endif()
 
 # ============================================================================
@@ -426,9 +400,6 @@ if(COLLIDER_BACKEND STREQUAL "CUDA")
         src/gpu/puzzle_gpu.cu
         src/gpu/puzzle_optimized.cu
         src/gpu/kangaroo_kernel.cu
-        src/gpu/gpu_rule_kernel.cu
-        src/gpu/gpu_rules.cu
-        src/gpu/gpu_rules.cpp
     )
 
     # Add RCKangaroo wrapper if enabled
@@ -516,12 +487,6 @@ if(COLLIDER_BUILD_TOOLS)
     endif()
 
     # License Generator (Pro Edition Only - Private Tool)
-        add_executable(generate_license
-        )
-        target_include_directories(generate_license PRIVATE
-        )
-        message(STATUS "License generator tool enabled (keep private)")
-    endif()
 endif()
 
 # ============================================================================
@@ -574,28 +539,7 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/src/main.cpp")
         )
     endif()
 
-    # ========================================================================
-    # Pro Edition Executable
-    # ========================================================================
-    
-    # Pro edition links all libs including license module
-    set(PRO_LIBS ${MAIN_LIBS})
-    if(TARGET collider_license)
-        list(APPEND PRO_LIBS collider_license)
-    endif()
-    
-    
-    if(COLLIDER_BACKEND STREQUAL "CUDA")
-            CUDA_SEPARABLE_COMPILATION ON
-            CUDA_RESOLVE_DEVICE_SYMBOLS ON
-            CUDA_RUNTIME_LIBRARY Shared
-        )
-    endif()
-    
-    message(STATUS "Free edition executable: collider")
-endif()
-
-# ============================================================================
+    # ============================================================================
 # Tests
 # ============================================================================
 if(COLLIDER_BUILD_TESTS)
@@ -667,37 +611,23 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/wordlists")
     install(DIRECTORY wordlists/ DESTINATION share/collider/wordlists)
 endif()
 
-# NOTE: generate_license tool is NOT installed (private tool)
 
 # ============================================================================
 # Summary
 # ============================================================================
 message(STATUS "")
-message(STATUS "TheCollider Configuration Summary:")
+message(STATUS "Collider Configuration Summary:")
 message(STATUS "  Platform:    ${CMAKE_SYSTEM_NAME}")
 message(STATUS "  Backend:     ${COLLIDER_BACKEND}")
 message(STATUS "  Build Type:  ${CMAKE_BUILD_TYPE}")
-if(COLLIDER_EDITION_PRO)
-    message(STATUS "  Edition:     Pro (all features)")
-else()
     message(STATUS "  Edition:     Free (pool-only)")
-endif()
 if(COLLIDER_BACKEND STREQUAL "CUDA")
     message(STATUS "  CUDA Archs:  ${CMAKE_CUDA_ARCHITECTURES}")
 endif()
 message(STATUS "  Tests:       ${COLLIDER_BUILD_TESTS}")
 message(STATUS "  Benchmarks:  ${COLLIDER_BUILD_BENCHMARKS}")
 message(STATUS "  Tools:       ${COLLIDER_BUILD_TOOLS}")
-if(COLLIDER_EDITION_PRO)
-    message(STATUS "")
-    message(STATUS "Executables built:")
-    message(STATUS "  collider     - Free edition (pool-only)")
-    if(TARGET generate_license)
-        message(STATUS "  generate_license - License generator (PRIVATE)")
-    endif()
-else()
     message(STATUS "")
     message(STATUS "Executable built:")
     message(STATUS "  collider     - Free edition (pool-only)")
-endif()
 message(STATUS "")

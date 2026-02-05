@@ -1,5 +1,5 @@
 /**
- * yaml_config.hpp - Simple YAML configuration loader for theCollider
+ * yaml_config.hpp - Simple YAML configuration loader for collider
  *
  * Parses a subset of YAML (key: value pairs with sections) without external dependencies.
  * Command-line arguments override config file settings.
@@ -199,55 +199,25 @@ struct AppConfig {
 private:
     void parse_value(const std::string& section, const std::string& key, const std::string& value) {
         if (section == "pool") {
-#if COLLIDER_HAS_CUSTOM_POOL
-            if (key == "url") pool_url = value;
-            else if (key == "password") pool_password = value;
-            else if (key == "api_key") pool_api_key = value;
-#endif
             // Worker is available in both editions
             if (key == "worker") pool_worker = value;
-#if !COLLIDER_HAS_CUSTOM_POOL
             // Free edition: override pool URL to hardcoded value
             else if (key == "url") {
                 std::cout << "[*] Config: Ignoring pool.url (Free edition uses hardcoded pool)\n";
                 pool_url = COLLIDER_FREE_POOL_URL;
             }
-#endif
         }
         else if (section == "puzzle") {
-#if COLLIDER_HAS_SOLO
-            if (key == "number") puzzle_number = std::stoi(value);
-            else if (key == "smart_select") smart_select = parse_bool(value);
-            else if (key == "min_bits") min_bits = std::stoi(value);
-            else if (key == "max_bits") max_bits = std::stoi(value);
-            else if (key == "kangaroo") kangaroo = parse_bool(value);
-            else if (key == "dp_bits") dp_bits = std::stoi(value);
-            else if (key == "random_search") random_search = parse_bool(value);
-            else if (key == "auto_next") auto_next = parse_bool(value);
-            else if (key == "checkpoint") checkpoint = value;
-#else
             // Free edition: ignore puzzle configuration
             std::cout << "[*] Solo puzzle solver requires collider pro — collisionprotocol.com/pro\n";
-#endif
         }
         else if (section == "brainwallet") {
-#if COLLIDER_HAS_BRAINWALLET
-            if (key == "enabled") brainwallet_enabled = parse_bool(value);
-            else if (key == "wordlist") wordlist = value;
-            else if (key == "save_interval") save_interval = std::stoull(value);
-            else if (key == "resume") resume = parse_bool(value);
-#else
             // Free edition: ignore brainwallet configuration  
             std::cout << "[*] Brain wallet requires collider pro — collisionprotocol.com/pro\n";
-#endif
         }
         else if (section == "bloom") {
-#if COLLIDER_HAS_BLOOM
-            if (key == "file") bloom_file = value;
-#else
             // Free edition: ignore bloom configuration
             std::cout << "[*] Bloom filters require collider pro — collisionprotocol.com/pro\n";
-#endif
         }
         else if (section == "gpu") {
             if (key == "devices") gpu_devices = parse_int_list(value);

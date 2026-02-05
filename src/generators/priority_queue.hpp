@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <cmath>
 #include "../core/types.hpp"
 #include <queue>
 #include <mutex>

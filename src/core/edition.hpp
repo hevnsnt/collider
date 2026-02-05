@@ -1,5 +1,5 @@
 /**
- * edition.hpp - theCollider Feature Edition Control
+ * edition.hpp - collider Feature Edition Control
  * 
  * Controls which features are available based on build configuration.
  * Free edition supports pool mining with any pool.
@@ -25,7 +25,9 @@
     #define COLLIDER_HAS_GENERATORS     0
     #define COLLIDER_HAS_RULES          0
     #define COLLIDER_HAS_SCRAPERS       0
+    #define COLLIDER_HAS_CUSTOM_POOL    0
     #define COLLIDER_EDITION_NAME       "collider"
+    #define COLLIDER_FREE_POOL_URL      "collisionprotocol.com:17403"
 
 // ============================================================================
 // Feature Check Macros
