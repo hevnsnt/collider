@@ -100,20 +100,88 @@ paths:
   log_dir: "./logs"
 
 # =============================================================================
-# Pro-Only Features (requires collider pro - collisionprotocol.com/pro)
+# PRO-ONLY FEATURES
+# The following sections require collider pro: collisionprotocol.com/pro
+# Uncomment and configure after purchasing.
 # =============================================================================
 
 # -----------------------------------------------------------------------------
 # Brain Wallet Scanner (Pro)
+# Scan passphrases against funded Bitcoin addresses
 # -----------------------------------------------------------------------------
 # brainwallet:
-#   enabled: true
+#   # Enable dedicated brainwallet cracking mode
+#   enabled: false
+#   
+#   # Primary wordlist file (rockyou.txt, passwords.txt, etc.)
 #   wordlist: "./wordlists/rockyou.txt"
+#   
+#   # Save progress every N candidates (for resume capability)
 #   save_interval: 1000000
+#   
+#   # Resume from last checkpoint
 #   resume: false
 
 # -----------------------------------------------------------------------------
 # Bloom Filter (Pro)
+# 50M+ funded Bitcoin addresses for opportunistic scanning
 # -----------------------------------------------------------------------------
 # bloom:
+#   # Path to bloom filter file (.blf format)
+#   # Pre-built filter included with Pro, or build your own from UTXO dump
 #   file: "./funded_addresses.blf"
+
+# -----------------------------------------------------------------------------
+# Passphrase Generation (Pro)
+# Advanced candidate generation for brainwallet cracking
+# -----------------------------------------------------------------------------
+# generator:
+#   # Directory containing hashcat-compatible rule files
+#   # Included: best64.rule, rockyou-30000.rule, d3ad0ne.rule, etc.
+#   rules_dir: "./rules"
+#   
+#   # PCFG (Probabilistic Context-Free Grammar) model
+#   # Learns password patterns from training data
+#   pcfg_model: "./models/rockyou.pcfg"
+#   
+#   # Markov chain order (2-4, higher = more accurate but slower)
+#   markov_order: 3
+#   
+#   # Markov chain model file
+#   markov_model: "./models/rockyou.markov"
+#   
+#   # Enable pattern learning from discoveries
+#   enable_feedback: true
+#   
+#   # Candidates per GPU batch (1M default for optimal throughput)
+#   batch_size: 1000000
+
+# -----------------------------------------------------------------------------
+# WarpWallet / Scrypt (Pro)
+# Crack WarpWallet-style brain wallets with email salt
+# -----------------------------------------------------------------------------
+# warpwallet:
+#   # Enable WarpWallet mode (uses scrypt, much slower than SHA256)
+#   enabled: false
+#   
+#   # Email addresses to use as salt (one per line)
+#   emails_file: "./emails.txt"
+#   
+#   # Or specify a single email
+#   email: "user@example.com"
+
+# -----------------------------------------------------------------------------
+# Rule Engine (Pro)
+# Hashcat-compatible password transformation rules
+# -----------------------------------------------------------------------------
+# rules:
+#   # Rule files to load (in order of priority)
+#   files:
+#     - "./rules/best64.rule"
+#     - "./rules/rockyou-30000.rule"
+#   
+#   # Enable GPU-accelerated rule application
+#   gpu_rules: true
+#   
+#   # Maximum rules to apply per base word
+#   max_rules_per_word: 1000
