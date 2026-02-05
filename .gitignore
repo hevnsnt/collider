@@ -65,3 +65,5 @@ Thumbs.db
 # vcpkg (auto-downloaded on Windows)
 vcpkg/*.blf
 funded_addresses.blf
+config.yml
+config.yaml
