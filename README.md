@@ -13,7 +13,7 @@ Pool: 47.2% | Speed: 8.14 GKeys/s | DPs: 1.2M | Sent: 847K | ETA: ~2.3 years
 
 ## The Bitcoin Puzzle
 
-In 2015, someone created 256 Bitcoin addresses with private keys of increasing difficulty. The first ~70 have been solved. Puzzle #135 holds **13.5 BTC** (~$1.3M at current prices) and requires finding a 135-bit private key.
+In 2015, someone created 256 Bitcoin addresses with private keys of increasing difficulty. The first 70 have been solved. Puzzle #135 holds **13.5 BTC** (~$1.3M at current prices) and requires finding a 135-bit private key.
 
 The math: 135-bit keyspace = 2^135 possibilities. Brute force at 10 billion keys/second would take longer than the age of the universe.
 
@@ -28,9 +28,9 @@ The Kangaroo algorithm works by launching two types of "kangaroos" that jump aro
 1. **Tame kangaroos** start from a known point and record their path
 2. **Wild kangaroos** start from the target public key
 
-When a wild kangaroo lands on a tame kangaroo's path, we can compute the private key from the collision. The trick is using "Distinguished Points" (DPs) — points with special properties that we actually store and compare.
+When a wild kangaroo lands on a tame kangaroo's path, we can compute the private key from the collision. The trick is using "Distinguished Points" (DPs), points with special properties that we actually store and compare.
 
-Our implementation achieves **K=1.15** efficiency, meaning we solve puzzles in approximately 1.15× the theoretical minimum operations. Most public implementations run at K=1.6 or worse.
+Our implementation achieves **K=1.15** efficiency, meaning we solve puzzles in approximately 1.15x the theoretical minimum operations. Most public implementations run at K=1.6 or worse.
 
 ## Features
 
@@ -190,7 +190,7 @@ Other:
 
 **This software is designed for legitimate puzzle solving and security research.**
 
-The Bitcoin Puzzle addresses have no legitimate owner claiming them — they were created specifically as a cryptographic challenge. The same cannot be said for other Bitcoin addresses.
+The Bitcoin Puzzle addresses have no legitimate owner claiming them. They were created specifically as a cryptographic challenge. The same cannot be said for other Bitcoin addresses.
 
 **Do not use this tool to:**
 - Attempt to crack wallets you don't own
@@ -201,7 +201,7 @@ Using cryptographic tools against systems without authorization is illegal in mo
 
 **Operational security:**
 - The pool connection uses TLS encryption
-- Your private keys are never transmitted — only Distinguished Points
+- Your private keys are never transmitted, only Distinguished Points
 - The pool cannot solve puzzles without contributors; it's a coordination mechanism, not a key escrow
 
 ## Architecture
@@ -243,11 +243,13 @@ Areas where contributions would be particularly valuable:
 
 Need more features? [collider pro](https://collisionprotocol.com/pro) includes:
 
-- **Brain wallet scanner** — Check passphrases against funded addresses
-- **Bloom filter** — 50M+ funded address database
-- **PCFG generation** — Learn password patterns from wordlists
-- **Rule engine** — Transform candidates (leetspeak, case mutations, etc.)
-- **Custom pool support** — Connect to any JLP-compatible pool
+- **Opportunistic brainwallet**: Every key generated during pool mining is checked against 50M+ funded addresses for free bonus hits
+- **Dedicated brain wallet cracker**: Targeted passphrase cracking mode
+- **Bloom filter**: 50M+ funded address database included
+- **PCFG generation**: Learn password patterns from wordlists
+- **Markov chains**: Character-level probability models
+- **Rule engine**: Transform candidates (leetspeak, case mutations, etc.)
+- **Interactive menu**: Auto-configuration and guided setup
 
 One-time purchase: $49.99 per major version.
 
@@ -260,9 +262,9 @@ One-time purchase: $49.99 per major version.
 
 ## Acknowledgments
 
-- [RetiredCoder](https://github.com/RetiredCoder) — RCKangaroo implementation
-- [Jean-Luc Pons](https://github.com/JeanLucPons) — Original Kangaroo GPU work
-- bitcoin-core/secp256k1 — Reference implementation
+- [RetiredCoder](https://github.com/RetiredCoder): RCKangaroo implementation
+- [Jean-Luc Pons](https://github.com/JeanLucPons): Original Kangaroo GPU work
+- bitcoin-core/secp256k1: Reference implementation
 
 ## License
 
