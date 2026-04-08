@@ -1,0 +1,198 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g., v1.0.0)'
+        required: true
+        type: string
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.14
+        id: cuda-toolkit
+        with:
+          cuda: '12.2.0'
+          method: 'network'
+          sub-packages: '["nvcc", "cudart"]'
+
+      - name: Configure CMake
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} \
+            -DCMAKE_CUDA_ARCHITECTURES="75;80;86;89"
+
+      - name: Build
+        run: cmake --build build --config ${{env.BUILD_TYPE}}
+
+      - name: Package
+        run: |
+          mkdir -p release
+          cp build/collider release/
+          cp README.md release/
+          cp -r docs release/
+          tar -czvf theCollider-linux-x64.tar.gz -C release .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: theCollider-linux-x64
+          path: theCollider-linux-x64.tar.gz
+
+  build-windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.14
+        id: cuda-toolkit
+        with:
+          cuda: '12.2.0'
+          method: 'network'
+          sub-packages: '["nvcc", "cudart", "visual_studio_integration"]'
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install Ninja
+        run: choco install ninja
+
+      - name: Configure CMake
+        run: |
+          cmake -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} `
+            -DCMAKE_CUDA_ARCHITECTURES="75;80;86;89"
+
+      - name: Build
+        run: cmake --build build --config ${{env.BUILD_TYPE}}
+
+      - name: Package
+        run: |
+          mkdir release
+          copy build\collider.exe release\
+          copy README.md release\
+          xcopy docs release\docs\ /E /I
+          Compress-Archive -Path release\* -DestinationPath theCollider-windows-x64.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: theCollider-windows-x64
+          path: theCollider-windows-x64.zip
+
+  build-macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          brew install cmake ninja
+
+      - name: Configure CMake (CPU-only for macOS)
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} \
+            -DCOLLIDER_USE_CUDA=OFF \
+            -DCOLLIDER_USE_METAL=ON
+
+      - name: Build
+        run: cmake --build build --config ${{env.BUILD_TYPE}}
+
+      - name: Package
+        run: |
+          mkdir -p release
+          cp build/collider release/
+          cp README.md release/
+          cp -r docs release/
+          tar -czvf theCollider-macos-arm64.tar.gz -C release .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: theCollider-macos-arm64
+          path: theCollider-macos-arm64.tar.gz
+
+  create-release:
+    needs: [build-linux, build-windows, build-macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Get tag name
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: theCollider ${{ steps.tag.outputs.tag }}
+          draft: false
+          prerelease: false
+          files: |
+            artifacts/theCollider-linux-x64/theCollider-linux-x64.tar.gz
+            artifacts/theCollider-windows-x64/theCollider-windows-x64.zip
+            artifacts/theCollider-macos-arm64/theCollider-macos-arm64.tar.gz
+          body: |
+            ## theCollider ${{ steps.tag.outputs.tag }}
+
+            GPU-accelerated Bitcoin puzzle solver using Pollard's Kangaroo algorithm.
+
+            ### Downloads
+
+            | Platform | Architecture | File |
+            |----------|--------------|------|
+            | Linux | x64 (CUDA) | `theCollider-linux-x64.tar.gz` |
+            | Windows | x64 (CUDA) | `theCollider-windows-x64.zip` |
+            | macOS | ARM64 (Metal) | `theCollider-macos-arm64.tar.gz` |
+
+            ### Requirements
+
+            - **Linux/Windows**: NVIDIA GPU with CUDA support (Compute Capability 7.5+)
+            - **macOS**: Apple Silicon (M1/M2/M3) with Metal support
+
+            ### Quick Start
+
+            ```bash
+            # Extract and run
+            ./collider --puzzle 71
+            ```
+
+            See [documentation](docs/) for detailed usage instructions.
