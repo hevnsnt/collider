@@ -3250,9 +3250,11 @@ int main(int argc, char* argv[]) {
 
         std::cout << "+==============================================================+\n\n";
 
-        std::cout << "[!] Note: Puzzle mode is using CPU simulation.\n";
-        std::cout << "    Real GPU performance will be significantly higher.\n";
-        std::cout << "    Once GPU pipeline is integrated, expect ~1B+ keys/sec per GPU.\n";
+        // For large unsolved puzzles, suggest pool mode
+        if (!puzzle->solved && puzzle->bits >= 50) {
+            std::cout << "[*] Tip: For puzzles this size, pool mining is recommended.\n";
+            std::cout << "    Run: collider --worker <your_btc_address>\n";
+        }
 
         } // End of puzzle iteration for loop
 

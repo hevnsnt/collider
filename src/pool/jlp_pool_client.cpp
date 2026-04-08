@@ -482,13 +482,6 @@ bool JLPPoolClient::receive_message(JLPHeader& header, std::vector<uint8_t>& pay
         return false;
     }
 
-    // Validate payload size (max 10MB to prevent OOM)
-    constexpr uint32_t MAX_PAYLOAD_SIZE = 10 * 1024 * 1024;
-    if (header.payload_size > MAX_PAYLOAD_SIZE) {
-        std::cerr << "[Pool] Payload size exceeds limit: " << header.payload_size << " bytes" << std::endl;
-        return false;
-    }
-
     // Receive payload
     if (header.payload_size > 0) {
         payload.resize(header.payload_size);

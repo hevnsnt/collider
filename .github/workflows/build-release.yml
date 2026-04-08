@@ -46,7 +46,7 @@ jobs:
         cmake --version
     
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@v5
       with:
         submodules: false
     
@@ -71,7 +71,7 @@ jobs:
         file build/collider
     
     - name: Upload Linux binary
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v5
       with:
         name: collider-linux-x64
         path: build/collider
@@ -85,7 +85,7 @@ jobs:
     
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@v5
       with:
         submodules: false
     
@@ -124,7 +124,7 @@ jobs:
       shell: pwsh
     
     - name: Upload Windows binary
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v5
       with:
         name: collider-windows-x64
         path: build/Release/collider.exe
@@ -138,14 +138,13 @@ jobs:
     
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@v5
       with:
         submodules: false
     
     - name: Install dependencies
       run: |
-        brew update
-        brew install cmake openssl
+        brew install --quiet cmake openssl 2>/dev/null || true
     
     - name: Configure CMake
       run: |
@@ -170,7 +169,7 @@ jobs:
         otool -L build/collider || true
 
     - name: Upload macOS binary
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v5
       with:
         name: collider-macos-arm64
         path: build/collider
@@ -182,10 +181,10 @@ jobs:
     
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@v5
     
     - name: Download all artifacts
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@v5
       with:
         path: artifacts/
     

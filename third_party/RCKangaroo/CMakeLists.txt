@@ -38,7 +38,7 @@ if(MSVC)
     )
 else()
     target_compile_options(rckangaroo PRIVATE
-        $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wno-unused-function>
+        $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wno-unused-function -Wno-unknown-pragmas -Wno-comment -Wno-sign-compare -Wno-unused-variable -Wno-unused-result>
     )
 endif()
 
