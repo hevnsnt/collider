@@ -10,23 +10,17 @@ sudo apt update
 sudo apt install -y build-essential cmake git libssl-dev
 
 # CUDA Toolkit (12.x or newer)
-# Option 1: From NVIDIA's repo (recommended)
-wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
-sudo dpkg -i cuda-keyring_1.1-1_all.deb
-sudo apt update
-sudo apt install -y cuda-toolkit-12-6
-
-# Option 2: From your distro's repo (may be older)
-sudo apt install -y nvidia-cuda-toolkit
+# Download from: https://developer.nvidia.com/cuda-downloads
+# Select Linux > x86_64 > your distro > deb (network)
+# Follow the install instructions on that page
 ```
 
 ### Fedora / RHEL
 
 ```bash
 sudo dnf install -y gcc-c++ cmake git openssl-devel
-# Install CUDA from NVIDIA's RPM repo
-sudo dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/fedora39/x86_64/cuda-fedora39.repo
-sudo dnf install -y cuda-toolkit-12-6
+# Install CUDA from: https://developer.nvidia.com/cuda-downloads
+# Select Linux > x86_64 > Fedora > rpm (network)
 ```
 
 ### Arch Linux
@@ -55,7 +49,7 @@ cmake .. \
   -DCOLLIDER_USE_CUDA=ON \
   -DCMAKE_CUDA_ARCHITECTURES="75;86;89"
 
-make -j$(nproc)
+cmake --build . --target collider -- -j$(nproc)
 ```
 
 The executable will be at: `build/collider`

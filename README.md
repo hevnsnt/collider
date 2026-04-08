@@ -13,7 +13,7 @@ Pool: 47.2% | Speed: 8.14 GKeys/s | DPs: 1.2M | Sent: 847K | ETA: ~2.3 years
 
 ## The Bitcoin Puzzle
 
-In 2015, someone created 256 Bitcoin addresses with private keys of increasing difficulty. The first 70 have been solved. Puzzle #135 holds **13.5 BTC** (~$1.3M at current prices) and requires finding a 135-bit private key.
+In 2015, someone created 160 Bitcoin addresses with private keys of increasing difficulty. The first 70 have been solved, along with every 5th puzzle up to #130. Puzzle #135 holds **13.5 BTC** and requires finding a 135-bit private key.
 
 The math: 135-bit keyspace = 2^135 possibilities. Brute force at 10 billion keys/second would take longer than the age of the universe.
 
@@ -59,23 +59,13 @@ Platform-specific build guides:
 - [**Linux Build Guide**](docs/BUILD-LINUX.md)
 - [**macOS Build Guide**](docs/BUILD-MACOS.md)
 
-### Quick Start (all platforms)
-
-```bash
-git clone https://github.com/hevnsnt/collider.git
-cd collider
-mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-cmake --build . --config Release --target collider
-```
-
-See the platform-specific guides for prerequisites and troubleshooting.
+Requires an NVIDIA GPU (CUDA) or Apple Silicon (Metal). See the platform-specific guides for prerequisites and step-by-step instructions.
 
 ## Usage
 
 ### Pool Mining (Recommended)
 
-Solo solving Puzzle #135 with a single RTX 4090 would take approximately 195 years. Pool mining distributes the work across many GPUs.
+Pool mining distributes the work across many GPUs, making otherwise intractable puzzles solvable.
 
 ```bash
 # Basic pool connection
@@ -91,17 +81,14 @@ Your Bitcoin address is your identity and payout destination. When the puzzle is
 
 ### Solo Mode
 
-If you want to mine directly without the pool:
+If you want to solve directly without the pool:
 
 ```bash
 # Target a specific puzzle
 ./collider --puzzle 135
-
-# With Kangaroo algorithm (required for puzzles with known public keys)
-./collider --puzzle 135 --kangaroo
 ```
 
-Note: Solo mode is technically possible but economically impractical for high-bit puzzles.
+The solver automatically selects the best algorithm based on whether the puzzle's public key is known (Kangaroo) or not (brute force). Solo mode works but is impractical for high-bit puzzles without a large GPU farm.
 
 ### Benchmarking
 
@@ -146,8 +133,7 @@ Pool Options:
   --pool <host:port>        Pool server (default: collisionprotocol.com:17403)
 
 Solo Options:
-  --puzzle, -P <number>     Target puzzle number
-  --kangaroo                Use Kangaroo algorithm
+  --puzzle <number>         Target puzzle number (1-160)
   --dp-bits <n>             Distinguished point bits (default: auto)
 
 GPU Options:
@@ -202,7 +188,7 @@ collider implements the JLP (Jean-Luc Pons) protocol for pool communication:
 - 8-byte header: `KANG` magic + type + flags + length
 - Message types: AUTH, WORK_REQ, WORK_ASN, DP_SUBMIT, DP_BATCH
 
-Full protocol specification: [collisionprotocol.com/protocol](https://collisionprotocol.com/protocol)
+See the source code in `src/pool/` for implementation details.
 
 ## Contributing
 
@@ -231,7 +217,6 @@ One-time purchase: $49.99 per major version.
 
 - Website: [collisionprotocol.com](https://collisionprotocol.com)
 - Pool stats: [collisionprotocol.com/pool](https://collisionprotocol.com/pool)
-- Protocol spec: [collisionprotocol.com/protocol](https://collisionprotocol.com/protocol)
 - Pro version: [collisionprotocol.com/pro](https://collisionprotocol.com/pro)
 
 ## Acknowledgments

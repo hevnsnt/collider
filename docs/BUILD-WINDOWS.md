@@ -11,35 +11,12 @@
    - Select Windows > x86_64 > your Windows version
    - After install, verify: `nvcc --version`
 
-3. **CMake 3.18+** (usually included with Visual Studio)
+3. **CMake 3.18+** (included with Visual Studio)
    - Verify: `cmake --version`
-
-4. **vcpkg** (optional, for OpenSSL -- Visual Studio 2022 includes it)
-   - If not bundled: https://github.com/microsoft/vcpkg
 
 ## Build Steps
 
-### Option A: Command Line (Recommended)
-
-Open **x64 Native Tools Command Prompt for VS 2022** (search for it in Start menu).
-
-```cmd
-git clone https://github.com/hevnsnt/collider.git
-cd collider
-mkdir build
-cd build
-
-cmake .. -G "Visual Studio 17 2022" -A x64 ^
-  -DCMAKE_BUILD_TYPE=Release ^
-  -DCOLLIDER_USE_CUDA=ON ^
-  -DCMAKE_CUDA_ARCHITECTURES="75;86;89"
-
-cmake --build . --config Release --target collider
-```
-
-The executable will be at: `build\Release\collider.exe`
-
-### Option B: Using Ninja (Faster Builds)
+Open **x64 Native Tools Command Prompt for VS 2022** (search for it in Start menu). All commands must be run from this prompt, not a regular cmd or PowerShell.
 
 ```cmd
 git clone https://github.com/hevnsnt/collider.git
@@ -56,6 +33,8 @@ ninja collider
 ```
 
 The executable will be at: `build\collider.exe`
+
+OpenSSL DLLs are automatically copied next to the executable after build.
 
 ## CUDA Architecture Guide
 
@@ -80,19 +59,21 @@ You need to run from the VS Developer Command Prompt, not a regular cmd/PowerShe
 CUDA Toolkit isn't in PATH. Add `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.x\bin` to your PATH, or reinstall CUDA with "Add to PATH" checked.
 
 **OpenSSL not found**
-vcpkg should handle this automatically. If not:
+CMake should find OpenSSL automatically via vcpkg. If it fails, install OpenSSL manually:
 ```cmd
 vcpkg install openssl:x64-windows
 ```
-Then add `-DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake` to your cmake command.
+Then add `-DOPENSSL_ROOT_DIR="C:/vcpkg/installed/x64-windows"` to your cmake command.
 
-**"CUDA_ARCHITECTURES" error**
-Your CMake version may be too old. Update to CMake 3.18+.
+**vcpkg errors ("Unable to find Visual Studio instance")**
+The bundled vcpkg may be outdated. Disable it and point to an existing OpenSSL:
+```cmd
+cmake .. -G Ninja -DVCPKG_MANIFEST_MODE=OFF -DOPENSSL_ROOT_DIR="path/to/openssl" ...
+```
 
 ## Running
 
 ```cmd
-cd build\Release
 collider.exe --worker bc1qYourBitcoinAddress
 ```
 

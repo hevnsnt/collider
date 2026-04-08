@@ -3,9 +3,9 @@
 ## Important Notes
 
 - collider uses **Metal** on macOS (not CUDA)
-- Only **Apple Silicon** (M1/M2/M3/M4) Macs are supported
+- **Apple Silicon** (M1/M2/M3/M4) Macs are recommended
 - Performance is roughly 1/10th of equivalent NVIDIA hardware due to Metal's compute limitations
-- Intel Macs are not supported (no Metal compute, no CUDA)
+- Intel Macs may compile but are untested and not recommended
 
 ## Prerequisites
 
@@ -43,7 +43,7 @@ cmake .. \
   -DCOLLIDER_USE_METAL=ON \
   -DOPENSSL_ROOT_DIR=$OPENSSL_ROOT_DIR
 
-make -j$(sysctl -n hw.ncpu)
+cmake --build . --target collider -- -j$(sysctl -n hw.ncpu)
 ```
 
 The executable will be at: `build/collider`
@@ -63,8 +63,8 @@ Make sure you have Xcode Command Line Tools installed:
 xcode-select --install
 ```
 
-**"Unsupported architecture" or build fails on Intel Mac**
-Intel Macs are not supported. The Metal compute backend requires Apple Silicon.
+**Build fails on Intel Mac**
+Intel Macs are not officially supported. Apple Silicon is required for Metal compute.
 
 ## Expected Performance
 
