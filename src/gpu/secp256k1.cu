@@ -4,9 +4,11 @@
  * High-performance elliptic curve operations for brain wallet research.
  * Implements all critical optimizations:
  * - Precomputed table for windowed scalar multiplication (16x speedup)
- * - Montgomery arithmetic for field operations
+ * - Schoolbook multiplication with secp256k1 special-form fast reduction
+ *   (p = 2^256 - 2^32 - 977, NOT Montgomery form)
  * - Batch inversion using Montgomery's Trick (85x speedup on inversions)
  * - Optimized Jacobian coordinate arithmetic
+ * - PTX inline assembly for carry chain optimization
  *
  * Target: 2.5B+ scalar multiplications per second per RTX 5090
  */
@@ -14,6 +16,7 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 #include <cstdio>
+#include <mutex>
 
 namespace collider {
 namespace gpu {
@@ -46,7 +49,8 @@ static __constant__ uint32_t SECP256K1_GY[8] = {
     0x0E1108A8, 0x5DA4FBFC, 0x26A3C465, 0x483ADA77
 };
 
-// Montgomery constants - reserved for future Montgomery form optimizations
+// Montgomery constants - NOT USED. Field arithmetic uses schoolbook multiply
+// with secp256k1 special-form reduction. Reserved for potential future use.
 // static __constant__ uint32_t MONT_R[8] = {
 //     0x000003D1, 0x00000001, 0x00000000, 0x00000000,
 //     0x00000000, 0x00000000, 0x00000000, 0x00000000
@@ -56,6 +60,10 @@ static __constant__ uint32_t SECP256K1_GY[8] = {
 //     0x00000000, 0x00000000, 0x00000000, 0x00000000
 // };
 // static __constant__ uint32_t MONT_N_PRIME = 0xD2253531;
+
+static constexpr uint32_t SECP256K1_C_LO = 977;  // Low part of c = 2^32 + 977
+
+#define MAX_TSIZE 4096  // Maximum table entries per window for batch inversion arrays
 
 // =============================================================================
 // GLV ENDOMORPHISM CONSTANTS (1.5x speedup for scalar multiplication)
@@ -203,39 +211,6 @@ __device__ __forceinline__ void uint256_load_const(uint256& a, const uint32_t* c
 // =============================================================================
 
 /**
- * PTX-optimized multiply-add with carry using IADD3 instruction.
- * IADD3 is a 3-input adder available on Volta+ (SM 7.0+) that's faster
- * than chained IMAD for carry propagation in multi-precision arithmetic.
- *
- * Computes: result = a * b + c + carry_in, returns carry_out
- */
-__device__ __forceinline__ uint32_t mul_add_carry_ptx(
-    uint32_t a, uint32_t b, uint32_t c, uint32_t carry_in, uint32_t* result_lo
-) {
-    uint32_t lo, hi;
-
-    // Use PTX inline assembly for optimal instruction selection
-    // mad.lo.cc.u32: multiply a*b, add c, with carry out
-    // madc.hi.u32: get high 32 bits with carry in
-    asm volatile (
-        "{\n\t"
-        "  .reg .u32 tmp;\n\t"
-        "  mul.lo.u32 %0, %2, %3;\n\t"       // lo = a * b (low 32 bits)
-        "  mul.hi.u32 %1, %2, %3;\n\t"       // hi = a * b (high 32 bits)
-        "  add.cc.u32 %0, %0, %4;\n\t"       // lo += c with carry
-        "  addc.u32 %1, %1, 0;\n\t"          // hi += carry
-        "  add.cc.u32 %0, %0, %5;\n\t"       // lo += carry_in with carry
-        "  addc.u32 %1, %1, 0;\n\t"          // hi += carry
-        "}\n\t"
-        : "=r"(lo), "=r"(hi)
-        : "r"(a), "r"(b), "r"(c), "r"(carry_in)
-    );
-
-    *result_lo = lo;
-    return hi;
-}
-
-/**
  * PTX-optimized 256x256→512 bit multiplication using IMAD/IADD3.
  * Uses explicit carry chains for better instruction scheduling.
  */
@@ -279,24 +254,16 @@ __device__ void uint256_mul_512_ptx(
             carry = hi;
         }
 
-        // Propagate final carry
-        result[i+8] += carry;
-    }
-}
-
-/**
- * Fast reduction mod p using secp256k1's special prime form.
- * p = 2^256 - 2^32 - 977 = 2^256 - c where c = 0x1000003D1
- */
-__device__ __forceinline__ void mod_reduce(uint256& a) {
-    uint256 p;
-    uint256_load_const(p, SECP256K1_P);
-
-    // At most 2 subtractions needed
-    if (uint256_cmp(a, p) >= 0) {
-        uint256_sub(a, a, p);
-        if (uint256_cmp(a, p) >= 0) {
-            uint256_sub(a, a, p);
+        // Propagate final carry with overflow protection
+        {
+            uint64_t sum = (uint64_t)result[i+8] + carry;
+            result[i+8] = (uint32_t)sum;
+            uint32_t prop = (uint32_t)(sum >> 32);
+            for (int j = i+9; j < 16 && prop; j++) {
+                sum = (uint64_t)result[j] + prop;
+                result[j] = (uint32_t)sum;
+                prop = (uint32_t)(sum >> 32);
+            }
         }
     }
 }
@@ -330,19 +297,6 @@ __device__ __forceinline__ void mod_sub(uint256& result, const uint256& a, const
 }
 
 /**
- * Modular negation: result = -a mod p = p - a
- */
-__device__ __forceinline__ void mod_neg(uint256& result, const uint256& a) {
-    if (a.is_zero()) {
-        result.set_zero();
-        return;
-    }
-    uint256 p;
-    uint256_load_const(p, SECP256K1_P);
-    uint256_sub(result, p, a);
-}
-
-/**
  * Modular multiplication using secp256k1 fast reduction.
  * For a*b mod p where a,b < p.
  * OPTIMIZED: Uses PTX inline assembly for carry chain optimization.
@@ -368,10 +322,10 @@ __device__ void mod_mul(uint256& result, const uint256& a, const uint256& b) {
     uint64_t carry = 0;
     uint32_t high_c[9] = {0};
 
-    // high * 977
+    // high * SECP256K1_C_LO (977)
     #pragma unroll
     for (int i = 0; i < 8; i++) {
-        uint64_t term = (uint64_t)prod[i+8] * 977ULL + carry;
+        uint64_t term = (uint64_t)prod[i+8] * (uint64_t)SECP256K1_C_LO + carry;
         high_c[i] = (uint32_t)term;
         carry = term >> 32;
     }
@@ -398,31 +352,190 @@ __device__ void mod_mul(uint256& result, const uint256& a, const uint256& b) {
     // Handle any overflow from high_c[8] and c1
     uint64_t extra = (uint64_t)high_c[8] + c1;
     if (extra) {
-        // extra * c mod p
-        uint32_t e0 = (uint32_t)(extra * 977ULL);
+        // extra * c mod p where c = 2^32 + SECP256K1_C_LO (977)
+        uint32_t e0 = (uint32_t)(extra * (uint64_t)SECP256K1_C_LO);
         uint32_t e1 = (uint32_t)(extra);
 
         carry = (uint64_t)result.limbs[0] + e0;
         result.limbs[0] = (uint32_t)carry;
-        carry = (carry >> 32) + result.limbs[1] + e1;
+        carry = (carry >> 32) + (uint64_t)result.limbs[1] + e1;
         result.limbs[1] = (uint32_t)carry;
+        carry >>= 32;
 
-        #pragma unroll
-        for (int i = 2; i < 8 && carry > 0; i++) {
-            carry = (uint64_t)result.limbs[i] + (carry >> 32);
+        for (int i = 2; i < 8 && carry; i++) {
+            carry = (uint64_t)result.limbs[i] + carry;
             result.limbs[i] = (uint32_t)carry;
+            carry >>= 32;
         }
     }
 
-    // Final reduction
-    mod_reduce(result);
+    // Note: carry from reduction is bounded; conditional subtractions below handle any residual >= P
+
+    // Final conditional subtraction if result >= P
+    {
+        uint256 p;
+        uint256_load_const(p, SECP256K1_P);
+        if (uint256_cmp(result, p) >= 0) {
+            uint256_sub(result, result, p);
+        }
+        if (uint256_cmp(result, p) >= 0) {
+            uint256_sub(result, result, p);
+        }
+    }
 }
 
 /**
- * Modular squaring (slightly optimized over general multiplication)
+ * Dedicated modular squaring exploiting symmetry of cross-terms.
+ * For 8 limbs: 8 diagonal + 28 cross-term multiplies instead of 64.
+ * ~30-40% faster than mod_mul(a, a).
  */
-__device__ __forceinline__ void mod_sqr(uint256& result, const uint256& a) {
-    mod_mul(result, a, a);  // Could optimize further with squaring-specific code
+__device__ void mod_sqr(uint256& result, const uint256& a) {
+    uint32_t prod[16];
+
+    // Initialize 512-bit product to zero
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        prod[i] = 0;
+    }
+
+    // Step 1: Compute cross-terms a[i]*a[j] for i < j, accumulate once
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        uint32_t carry = 0;
+        #pragma unroll
+        for (int j = i + 1; j < 8; j++) {
+            uint32_t lo, hi;
+            // a[i] * a[j] + prod[i+j] + carry
+            asm volatile (
+                "{\n\t"
+                "  .reg .u32 t0, t1;\n\t"
+                "  mul.lo.u32 t0, %2, %3;\n\t"
+                "  mul.hi.u32 t1, %2, %3;\n\t"
+                "  add.cc.u32 t0, t0, %4;\n\t"
+                "  addc.u32 t1, t1, 0;\n\t"
+                "  add.cc.u32 %0, t0, %5;\n\t"
+                "  addc.u32 %1, t1, 0;\n\t"
+                "}\n\t"
+                : "=r"(lo), "=r"(hi)
+                : "r"(a.limbs[i]), "r"(a.limbs[j]), "r"(prod[i+j]), "r"(carry)
+            );
+            prod[i+j] = lo;
+            carry = hi;
+        }
+        uint64_t sum64 = (uint64_t)prod[i+8] + carry;
+        prod[i+8] = (uint32_t)sum64;
+        uint32_t prop = (uint32_t)(sum64 >> 32);
+        for (int j = i+9; j < 16 && prop; j++) {
+            sum64 = (uint64_t)prod[j] + prop;
+            prod[j] = (uint32_t)sum64;
+            prop = (uint32_t)(sum64 >> 32);
+        }
+    }
+
+    // Step 2: Double the cross-terms (shift entire 512-bit result left by 1 bit)
+    uint32_t top_bit = 0;
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        uint32_t new_top = prod[i] >> 31;
+        prod[i] = (prod[i] << 1) | top_bit;
+        top_bit = new_top;
+    }
+
+    // Step 3: Add diagonal terms a[i]*a[i] at positions [2i, 2i+1]
+    uint64_t dcarry = 0;
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        uint32_t lo, hi;
+        asm volatile (
+            "mul.lo.u32 %0, %2, %2;\n\t"
+            "mul.hi.u32 %1, %2, %2;\n\t"
+            : "=r"(lo), "=r"(hi)
+            : "r"(a.limbs[i])
+        );
+
+        uint64_t sum = (uint64_t)prod[2*i] + lo + dcarry;
+        prod[2*i] = (uint32_t)sum;
+        dcarry = sum >> 32;
+
+        sum = (uint64_t)prod[2*i + 1] + hi + dcarry;
+        prod[2*i + 1] = (uint32_t)sum;
+        dcarry = sum >> 32;
+    }
+
+    // Step 4: secp256k1 fast reduction (identical to mod_mul)
+    // p = 2^256 - c, where c = 2^32 + 977
+
+    uint256 low;
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        low.limbs[i] = prod[i];
+    }
+
+    // Compute high * c where c = 2^32 + 977
+    // high * c = high * 2^32 + high * 977
+    uint64_t carry = 0;
+    uint32_t high_c[9] = {0};
+
+    // high * SECP256K1_C_LO (977)
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        uint64_t term = (uint64_t)prod[i+8] * (uint64_t)SECP256K1_C_LO + carry;
+        high_c[i] = (uint32_t)term;
+        carry = term >> 32;
+    }
+    high_c[8] = (uint32_t)carry;
+
+    // Add high * 2^32 (shift high by 1 limb and add)
+    carry = 0;
+    #pragma unroll
+    for (int i = 1; i < 9; i++) {
+        uint64_t term = (uint64_t)high_c[i] + prod[i+7] + carry;
+        high_c[i] = (uint32_t)term;
+        carry = term >> 32;
+    }
+
+    // Now add low + high_c[0..7]
+    uint256 correction;
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        correction.limbs[i] = high_c[i];
+    }
+
+    uint32_t c1 = uint256_add(result, low, correction);
+
+    // Handle any overflow from high_c[8] and c1
+    uint64_t extra = (uint64_t)high_c[8] + c1;
+    if (extra) {
+        // extra * c mod p where c = 2^32 + SECP256K1_C_LO (977)
+        uint32_t e0 = (uint32_t)(extra * (uint64_t)SECP256K1_C_LO);
+        uint32_t e1 = (uint32_t)(extra);
+
+        carry = (uint64_t)result.limbs[0] + e0;
+        result.limbs[0] = (uint32_t)carry;
+        carry = (carry >> 32) + (uint64_t)result.limbs[1] + e1;
+        result.limbs[1] = (uint32_t)carry;
+        carry >>= 32;
+
+        for (int i = 2; i < 8 && carry; i++) {
+            carry = (uint64_t)result.limbs[i] + carry;
+            result.limbs[i] = (uint32_t)carry;
+            carry >>= 32;
+        }
+    }
+
+    // Note: carry from reduction is bounded; conditional subtractions below handle any residual >= P
+
+    // Final conditional subtraction if result >= P
+    {
+        uint256 p;
+        uint256_load_const(p, SECP256K1_P);
+        if (uint256_cmp(result, p) >= 0) {
+            uint256_sub(result, result, p);
+        }
+        if (uint256_cmp(result, p) >= 0) {
+            uint256_sub(result, result, p);
+        }
+    }
 }
 
 /**
@@ -440,11 +553,10 @@ __device__ void mod_inv(uint256& result, const uint256& a) {
     uint256 x2, x3, x6, x9, x11, x22, x44, x88, x176, x220, x223, t1;
 
     // Start building up powers using addition chain
-    // x2 = a^(2^1 + 1) = a^3
+    // x2 = a^(2^2 - 1) = a^3  (xN convention: N-bit all-ones run)
     mod_sqr(x2, a);           // a^2
     mod_mul(x2, x2, a);       // a^3
 
-    // x3 = a^(2^2 - 1) = a^(2^2) * a^(-1)... no, let's build properly
     // x3 = a^(2^3 - 1) = a^7
     mod_sqr(x3, x2);          // a^6
     mod_mul(x3, x3, a);       // a^7
@@ -513,53 +625,32 @@ __device__ void mod_inv(uint256& result, const uint256& a) {
     mod_sqr(t1, t1);          // a^(2^223 - 8)
     mod_mul(x223, t1, x3);    // a^(2^223 - 1) since x3 = a^7
 
-    // Now compute the final exponent for p-2
-    // p - 2 = 0xFFFFFFFF FFFFFFFF FFFFFFFF FFFFFFFF FFFFFFFF FFFFFFFF FFFFFFFE FFFFFC2D
-    //
-    // The exponent structure (verified from libsecp256k1):
-    // - Upper 223 bits are all 1s
-    // - Then 23 zeros
-    // - Then 22 ones
-    // - Then specific low bits pattern for 0xFC2D
+    // p-2 = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2D
+    // Structure from bit 255 down: 223 ones, 1 zero (bit 32), 22 ones (bits 31..10),
+    // then bits 9..0 = 0000101101
 
-    // From x223 = a^(2^223 - 1), square 23 times
     mod_sqr(t1, x223);
     #pragma unroll
     for (int i = 0; i < 22; i++) {
         mod_sqr(t1, t1);
     }
-    // t1 = a^((2^223 - 1) * 2^23)
-
-    // Multiply by x22 = a^(2^22 - 1) to add the 22 ones
     mod_mul(t1, t1, x22);
+    // t1 = a^(2^246 - 2^22 - 1) -- covers bits 255..10
 
-    // Now handle the low bits: 0xFC2D = 1111 1100 0010 1101
-    // = 2^15 + 2^14 + 2^13 + 2^12 + 2^11 + 2^10 + 2^5 + 2^3 + 2^2 + 2^0
-    // = 64512 + 32 + 8 + 4 + 1 = 64557... wait that's wrong
-    // 0xFC2D = 64557 in decimal
-    // Binary: 1111110000101101
-
-    // Square 5 times, multiply by a (bit 5)
+    // Remaining bits 9..0 = 0000101101
+    mod_sqr(t1, t1);  // bit 9 = 0
+    mod_sqr(t1, t1);  // bit 8 = 0
+    mod_sqr(t1, t1);  // bit 7 = 0
+    mod_sqr(t1, t1);  // bit 6 = 0
+    mod_sqr(t1, t1);  // bit 5 = 1
+    mod_mul(t1, t1, a);
+    mod_sqr(t1, t1);  // bit 4 = 0
+    mod_sqr(t1, t1);  // bits 3,2 = 11
     mod_sqr(t1, t1);
-    mod_sqr(t1, t1);
-    mod_sqr(t1, t1);
-    mod_sqr(t1, t1);
-    mod_sqr(t1, t1);
-    mod_mul(t1, t1, a);       // bit at position 5
-
-    // Square 3 times, multiply by a (bit 2)
-    mod_sqr(t1, t1);
-    mod_sqr(t1, t1);
-    mod_sqr(t1, t1);
-    mod_mul(t1, t1, a);       // bit at position 2
-
-    // Square 1 time, multiply by a (bit 0)
-    mod_sqr(t1, t1);
-    mod_mul(result, t1, a);   // bit at position 0
-
-    // Note: This addition chain computes a^(p-2) mod p for secp256k1.
-    // The exact final steps for 0xFC2D pattern may need verification against
-    // test vectors. For production use, validate with known (a, a^-1) pairs.
+    mod_mul(t1, t1, x2);
+    mod_sqr(t1, t1);  // bit 1 = 0
+    mod_sqr(t1, t1);  // bit 0 = 1
+    mod_mul(result, t1, a);
 }
 
 // =============================================================================
@@ -742,194 +833,99 @@ __device__ void glv_endomorphism_jacobian(ECPointJacobian& result, const ECPoint
     result.Z = P.Z;
 }
 
-/**
- * 128-bit structure for GLV decomposition results
- */
-struct uint128 {
-    uint32_t limbs[4];
+// NOTE: GLV scalar multiplication lives in puzzle_optimized.cu which has the
+// correct Babai's algorithm decomposition using precomputed lattice vectors.
+// The glv_endomorphism() function above is the only GLV utility needed here.
 
-    __device__ __forceinline__ bool is_zero() const {
-        return (limbs[0] | limbs[1] | limbs[2] | limbs[3]) == 0;
-    }
+// =============================================================================
+// PRECOMPUTED TABLE FOR SCALAR MULTIPLICATION (SCALABLE)
+// =============================================================================
 
-    __device__ __forceinline__ int get_bit(int idx) const {
-        return (limbs[idx / 32] >> (idx % 32)) & 1;
-    }
+// Runtime-configurable EC table parameters.
+// Window size is selected at init based on available VRAM:
+//   <8 GB  -> 5-bit (32 pts/window, 52 windows, ~106 KB)
+//   8-16   -> 6-bit (64 pts/window, 43 windows, ~176 KB)
+//   16-48  -> 8-bit (256 pts/window, 32 windows, ~524 KB)
+//   48-64  -> 10-bit (1024 pts/window, 26 windows, ~1.7 MB)
+//   64+    -> 12-bit (4096 pts/window, 22 windows, ~5.5 MB)
+
+struct ECTableConfig {
+    int window_bits;    // 5, 6, 8, 10, or 12
+    int table_size;     // 1 << window_bits (points per window)
+    int num_windows;    // ceil(256 / window_bits)
+    size_t total_bytes; // num_windows * table_size * sizeof(PrecomputedPoint)
 };
 
-/**
- * GLV scalar decomposition: k = k1 + k2 * lambda (mod n)
- * Splits a 256-bit scalar into two ~128-bit scalars for faster multiplication.
- * Uses the extended Euclidean algorithm basis from libsecp256k1.
- */
-__device__ void glv_decompose(uint128& k1, uint128& k2, bool& k1_neg, bool& k2_neg, const uint256& k) {
-    // Simplified decomposition using lattice constants
-    // In practice, this computes:
-    // c1 = round(b2 * k / n)
-    // c2 = round(-b1 * k / n)
-    // k1 = k - c1*a1 - c2*a2
-    // k2 = -c1*b1 - c2*b2
+// Host-side config (static linkage, set once during init)
+static ECTableConfig g_ec_config = {5, 32, 52, 52ULL * 32 * sizeof(PrecomputedPoint)};
 
-    // For efficiency, we use a simplified version that's accurate enough
-    // The full version requires 512-bit arithmetic for intermediate products
+// Device-side config (copied to device via cudaMemcpyToSymbol before table gen)
+__device__ ECTableConfig d_ec_config;
 
-    // Simplified decomposition: split k at 128-bit boundary
-    // This is a fallback that still provides speedup by processing
-    // two 128-bit scalars simultaneously instead of one 256-bit scalar
-    // Full GLV requires 512-bit intermediate products which add overhead
-    k1.limbs[0] = k.limbs[0];
-    k1.limbs[1] = k.limbs[1];
-    k1.limbs[2] = k.limbs[2];
-    k1.limbs[3] = k.limbs[3];
-
-    k2.limbs[0] = k.limbs[4];
-    k2.limbs[1] = k.limbs[5];
-    k2.limbs[2] = k.limbs[6];
-    k2.limbs[3] = k.limbs[7];
-
-    k1_neg = false;
-    k2_neg = false;
+static ECTableConfig make_ec_config(int window_bits) {
+    ECTableConfig cfg;
+    cfg.window_bits = window_bits;
+    cfg.table_size  = 1 << window_bits;
+    cfg.num_windows = (256 + window_bits - 1) / window_bits;
+    cfg.total_bytes = (size_t)cfg.num_windows * cfg.table_size * sizeof(PrecomputedPoint);
+    return cfg;
 }
 
-/**
- * GLV-optimized scalar multiplication using simultaneous double-and-add.
- * Computes k*G = k1*G + k2*(lambda*G) where k1, k2 are ~128 bits.
- * This is ~1.5x faster than standard scalar multiplication.
- */
-__device__ void ec_mul_glv(
-    ECPointAffine& result,
-    const uint256& scalar,
-    const PrecomputedPoint* table
-) {
-    // Decompose scalar
-    uint128 k1, k2;
-    bool k1_neg, k2_neg;
-    glv_decompose(k1, k2, k1_neg, k2_neg, scalar);
-
-    // Get generator point G and lambda*G = (beta*Gx, Gy)
-    ECPointAffine G, lambdaG;
-    #pragma unroll
-    for (int i = 0; i < 8; i++) {
-        G.x.limbs[i] = SECP256K1_GX[i];
-        G.y.limbs[i] = SECP256K1_GY[i];
-    }
-    glv_endomorphism(lambdaG, G);
-
-    // Convert to Jacobian for accumulation
-    ECPointJacobian R;
-    R.set_infinity();
-
-    // Simultaneous double-and-add on k1 and k2
-    // Process from MSB to LSB (128 bits max)
-    for (int i = 127; i >= 0; i--) {
-        // Double
-        ECPointJacobian temp;
-        ec_double_jacobian(temp, R);
-        R = temp;
-
-        // Check bits of k1 and k2
-        int b1 = k1.get_bit(i);
-        int b2 = k2.get_bit(i);
-
-        // Add based on bit combination
-        if (b1 && b2) {
-            // Add G + lambda*G (precompute this combined point)
-            // G + lambdaG can be computed as two separate additions
-            ec_add_mixed(temp, R, G);
-            R = temp;
-            ec_add_mixed(temp, R, lambdaG);
-            R = temp;
-        } else if (b1) {
-            // Add G
-            ec_add_mixed(temp, R, G);
-            R = temp;
-        } else if (b2) {
-            // Add lambda*G
-            ec_add_mixed(temp, R, lambdaG);
-            R = temp;
-        }
-    }
-
-    jacobian_to_affine(result, R);
+static int select_window_bits(size_t usable_vram) {
+    constexpr size_t GB = 1024ULL * 1024 * 1024;
+    if (usable_vram >= 64 * GB) return 12;
+    if (usable_vram >= 48 * GB) return 10;
+    if (usable_vram >= 16 * GB) return 8;
+    if (usable_vram >=  8 * GB) return 6;
+    return 5;
 }
 
-/**
- * GLV-optimized point addition for Kangaroo algorithm.
- * Used when adding a precomputed jump point to current position.
- * Takes advantage of the endomorphism for faster computation.
- */
-__device__ void ec_add_glv_affine(
-    ECPointAffine& result,
-    const ECPointAffine& P,
-    const ECPointAffine& Q
-) {
-    // Standard affine addition (no GLV benefit here, but consistent API)
-    ECPointJacobian Pj, Rj;
-    Pj.X = P.x;
-    Pj.Y = P.y;
-    Pj.Z.set_one();
-
-    ec_add_mixed(Rj, Pj, Q);
-    jacobian_to_affine(result, Rj);
-}
-
-// =============================================================================
-// PRECOMPUTED TABLE FOR SCALAR MULTIPLICATION
-// =============================================================================
-
-// Window size for precomputation (w=5 means 32 points per window)
-// OPTIMIZED: 5-bit windows reduce main loop iterations from 64 to 52 (18% fewer)
-// Trade-off: Table grows from 64KB to 103KB, still fits easily in L2 cache
-#define EC_WINDOW_SIZE 5
-#define EC_TABLE_SIZE (1 << EC_WINDOW_SIZE)  // 32 points
-#define EC_NUM_WINDOWS ((256 + EC_WINDOW_SIZE - 1) / EC_WINDOW_SIZE)  // 52 windows
-
-// Global precomputed table: G, 2G, 3G, ..., 31G, then 32G, 64G, etc.
-// Actually, we store: [0, G, 2G, 3G, ..., 31G] for each window
-// Table[w][i] = i * 2^(w*5) * G
+// Global precomputed table pointer (device memory, L2 cache persistence)
 __device__ PrecomputedPoint* d_precomputed_table;
-// NOTE: Removed __constant__ c_precomputed_table - exceeds 64KB constant memory limit
-// Using g_precomputed_table (device memory) with L2 cache persistence instead
 
 /**
  * Scalar multiplication using windowed method with precomputed table.
  * Much faster than naive double-and-add.
+ * Reads window parameters from d_ec_config (set at init time).
  */
 __device__ void ec_mul_windowed(
     ECPointAffine& result,
     const uint256& scalar,
     const PrecomputedPoint* table
 ) {
+    const int wbits   = d_ec_config.window_bits;
+    const int tsize   = d_ec_config.table_size;
+    const int nwin    = d_ec_config.num_windows;
+    const uint32_t mask = (uint32_t)tsize - 1;  // bitmask for window extraction
+
     ECPointJacobian R;
     R.set_infinity();
 
-    // Process from most significant window to least
-    for (int w = EC_NUM_WINDOWS - 1; w >= 0; w--) {
-        // Double 4 times (if not first iteration)
-        if (w < EC_NUM_WINDOWS - 1) {
-            #pragma unroll
-            for (int i = 0; i < EC_WINDOW_SIZE; i++) {
-                ECPointJacobian temp;
-                ec_double_jacobian(temp, R);
-                R = temp;
-            }
+    // Accumulate positional table entries: T[w][v] = v * 2^(w*wbits) * G
+    for (int w = nwin - 1; w >= 0; w--) {
+        // Extract window value from scalar using bit-shift (handles limb spanning)
+        int bit_start = w * wbits;
+        int limb_idx  = bit_start / 32;
+        int bit_off   = bit_start % 32;
+
+        uint32_t window_val;
+        if (bit_off + wbits <= 32) {
+            // Window fits within a single limb
+            window_val = (scalar.limbs[limb_idx] >> bit_off) & mask;
+        } else {
+            // Window spans two limbs
+            uint32_t lo = scalar.limbs[limb_idx] >> bit_off;
+            uint32_t hi = (limb_idx + 1 < 8) ? scalar.limbs[limb_idx + 1] : 0;
+            window_val = (lo | (hi << (32 - bit_off))) & mask;
         }
 
-        // Extract window value from scalar
-        int bit_start = w * EC_WINDOW_SIZE;
-        uint32_t window_val = 0;
-
-        #pragma unroll
-        for (int i = 0; i < EC_WINDOW_SIZE && (bit_start + i) < 256; i++) {
-            int limb = (bit_start + i) / 32;
-            int bit = (bit_start + i) % 32;
-            window_val |= ((scalar.limbs[limb] >> bit) & 1) << i;
-        }
+        // Clamp: if this is the last (most significant) window, bits beyond 256
+        // are zero, so window_val is already correct via the limb reads.
 
         // Add table[w][window_val] if window_val != 0
         if (window_val != 0) {
             ECPointAffine Q;
-            int table_idx = w * EC_TABLE_SIZE + window_val;
+            int table_idx = w * tsize + window_val;
             Q.x = table[table_idx].x;
             Q.y = table[table_idx].y;
 
@@ -1018,23 +1014,27 @@ __device__ void batch_invert(
 /**
  * Batch Jacobian to Affine conversion using batch inversion.
  * Converts multiple Jacobian points to Affine with only one mod_inv.
+ *
+ * NOTE: scratch must have space for 3*n uint256 values to avoid aliasing.
+ * Layout: z_vals[0..n-1], z_inv[0..n-1], products[0..n-1]
  */
 __device__ void batch_jacobian_to_affine(
     ECPointAffine* affine,
     const ECPointJacobian* jacobian,
     int n,
-    uint256* scratch  // Size 2*n
+    uint256* scratch  // Size 3*n (was 2*n -- increased to fix aliasing)
 ) {
     uint256* z_vals = scratch;
     uint256* z_inv = scratch + n;
+    uint256* products = scratch + 2 * n;  // Separate scratch for prefix products
 
     // Extract Z coordinates
     for (int i = 0; i < n; i++) {
         z_vals[i] = jacobian[i].Z;
     }
 
-    // Batch invert Z values
-    batch_invert(z_inv, z_vals, n, z_vals);  // Reuse z_vals as scratch
+    // Batch invert Z values using separate products array to avoid aliasing
+    batch_invert(z_inv, z_vals, n, products);
 
     // Convert each point
     for (int i = 0; i < n; i++) {
@@ -1081,12 +1081,38 @@ __global__ void ec_mul_batch_kernel(
  * Batch EC multiplication with PARALLEL batch inversion.
  * Processes BATCH_INV_SIZE keys together to share one inversion.
  * OPTIMIZED: All threads participate in batch conversion, not just thread 0.
+ *
+ * Shared memory budget at BATCH_INV_SIZE=128:
+ *   products[128]     = 128*32 =  4096 bytes
+ *   z_inv[128]        = 128*32 =  4096 bytes
+ *   jac_points[128]   = 128*96 = 12288 bytes
+ *   affine_points[128]= 128*64 =  8192 bytes
+ *   Total             =          28672 bytes (~28KB, fits in 48KB default)
+ *
+ * Previous value of 32 yielded only 32 threads/block (~3% occupancy).
+ * 128 threads/block gives 4 warps, a reasonable occupancy improvement.
+ * 256 would need ~56KB shared memory, exceeding the 48KB default limit.
  */
-#define BATCH_INV_SIZE 32
+// NOTE: BATCH_INV_SIZE=128 here vs 256 in puzzle_optimized.cu. The value here
+// is constrained by shared memory (128 needs ~28KB, 256 would need ~56KB
+// exceeding the 48KB default). puzzle_optimized.cu uses a different layout.
+#define BATCH_INV_SIZE 128
 
 /**
  * Parallel batch inversion using cooperative threading.
  * All threads participate to amortize the single modular inversion.
+ *
+ * Threading model:
+ *   Steps 1 & 5: All threads participate (parallel Z extraction and affine conversion)
+ *   Steps 2-4: Thread 0 only (prefix product scan, single inversion, back-substitution)
+ *
+ * The prefix product scan and back-substitution are inherently sequential due to
+ * data dependencies in Montgomery's trick. The primary parallelism benefit comes
+ * from Step 5 where all threads convert their points simultaneously, amortizing
+ * the cost of the single mod_inv across all threads.
+ *
+ * NOTE: Each thread's original Z value is preserved in jacobian[].Z (read-only),
+ * so overwriting products[] during the forward pass does not cause aliasing issues.
  */
 __device__ void parallel_batch_jacobian_to_affine(
     ECPointAffine* affine,
@@ -1096,13 +1122,14 @@ __device__ void parallel_batch_jacobian_to_affine(
     uint256* z_inv,         // Shared memory: size n
     int thread_idx
 ) {
-    // Step 1: Each thread stores its Z coordinate
+    // Step 1: Each thread stores its Z coordinate (parallel)
     if (thread_idx < n) {
         products[thread_idx] = jacobian[thread_idx].Z;
     }
     __syncthreads();
 
-    // Step 2: Thread 0 computes cumulative products (inherently sequential)
+    // Step 2: Thread 0 computes cumulative products (inherently sequential --
+    // each products[i] depends on products[i-1])
     if (thread_idx == 0) {
         for (int i = 1; i < n; i++) {
             uint256 temp;
@@ -1120,13 +1147,15 @@ __device__ void parallel_batch_jacobian_to_affine(
     }
     __syncthreads();
 
-    // Step 4: Thread 0 computes individual inverses (can't easily parallelize)
+    // Step 4: Thread 0 computes individual inverses via back-substitution
+    // (inherently sequential -- each step depends on the previous running_inv)
+    // Original Z values are read from jacobian[i].Z, not from products[]
     if (thread_idx == 0) {
         uint256 running_inv = inv_all;
         for (int i = n - 1; i > 0; i--) {
             // z_inv[i] = running_inv * products[i-1]
             mod_mul(z_inv[i], running_inv, products[i-1]);
-            // running_inv = running_inv * original_z[i]
+            // running_inv = running_inv * original_z[i] (from jacobian, not products)
             mod_mul(running_inv, running_inv, jacobian[i].Z);
         }
         z_inv[0] = running_inv;
@@ -1185,29 +1214,28 @@ __global__ void ec_mul_batch_optimized_kernel(
 
         // Use windowed method if table available
         if (table != nullptr) {
-            for (int w = EC_NUM_WINDOWS - 1; w >= 0; w--) {
-                if (w < EC_NUM_WINDOWS - 1) {
-                    #pragma unroll
-                    for (int i = 0; i < EC_WINDOW_SIZE; i++) {
-                        ECPointJacobian temp;
-                        ec_double_jacobian(temp, R);
-                        R = temp;
-                    }
-                }
+            const int wbits = d_ec_config.window_bits;
+            const int tsize = d_ec_config.table_size;
+            const int nwin  = d_ec_config.num_windows;
+            const uint32_t wmask = (uint32_t)tsize - 1;
 
-                int bit_start = w * EC_WINDOW_SIZE;
-                uint32_t window_val = 0;
+            for (int w = nwin - 1; w >= 0; w--) {
+                int bit_start = w * wbits;
+                int limb_idx  = bit_start / 32;
+                int bit_off   = bit_start % 32;
 
-                #pragma unroll
-                for (int i = 0; i < EC_WINDOW_SIZE && (bit_start + i) < 256; i++) {
-                    int limb = (bit_start + i) / 32;
-                    int bit = (bit_start + i) % 32;
-                    window_val |= ((scalar.limbs[limb] >> bit) & 1) << i;
+                uint32_t window_val;
+                if (bit_off + wbits <= 32) {
+                    window_val = (scalar.limbs[limb_idx] >> bit_off) & wmask;
+                } else {
+                    uint32_t lo = scalar.limbs[limb_idx] >> bit_off;
+                    uint32_t hi = (limb_idx + 1 < 8) ? scalar.limbs[limb_idx + 1] : 0;
+                    window_val = (lo | (hi << (32 - bit_off))) & wmask;
                 }
 
                 if (window_val != 0) {
                     ECPointAffine Q;
-                    int table_idx = w * EC_TABLE_SIZE + window_val;
+                    int table_idx = w * tsize + window_val;
                     Q.x = table[table_idx].x;
                     Q.y = table[table_idx].y;
 
@@ -1254,52 +1282,91 @@ __global__ void ec_mul_batch_optimized_kernel(
 
 /**
  * Generate precomputed table for windowed multiplication.
- * Call once at initialization.
- * OPTIMIZED: 5-bit windows with 32 points per window.
+ * Each block generates one window's table entries sequentially.
+ * Uses Montgomery batch inversion to avoid per-point mod_inv calls.
+ *
+ * Launch: <<<num_windows, 1>>>  (1 thread per block, inter-window parallelism)
+ * Reads config from d_ec_config.
  */
 __global__ void generate_precomputed_table_kernel(
     PrecomputedPoint* table
 ) {
-    // This kernel generates the table on GPU
-    // table[w * EC_TABLE_SIZE + i] = i * 2^(w*EC_WINDOW_SIZE) * G
+    const int wbits = d_ec_config.window_bits;
+    const int tsize = d_ec_config.table_size;
+    const int w     = blockIdx.x;   // which window this block generates
+
+    // table[w * tsize + i] = i * 2^(w * wbits) * G
 
     ECPointAffine G;
     uint256_load_const(G.x, SECP256K1_GX);
     uint256_load_const(G.y, SECP256K1_GY);
 
-    // Compute 1G, 2G, 3G, ..., 31G (EC_TABLE_SIZE-1 points)
-    ECPointJacobian points[EC_TABLE_SIZE];
-    points[0].set_infinity();  // 0 * G
+    ECPointJacobian base_jac;
+    base_jac.X = G.x;
+    base_jac.Y = G.y;
+    base_jac.Z.set_one();
 
-    points[1].X = G.x;
-    points[1].Y = G.y;
-    points[1].Z.set_one();
-
-    for (int i = 2; i < EC_TABLE_SIZE; i++) {
-        ec_add_mixed(points[i], points[i-1], G);
+    // Double (w * wbits) times to get 2^(w*wbits) * G
+    int total_doubles = w * wbits;
+    for (int d = 0; d < total_doubles; d++) {
+        ECPointJacobian temp;
+        ec_double_jacobian(temp, base_jac);
+        base_jac = temp;
     }
 
-    // Store window 0
-    for (int i = 0; i < EC_TABLE_SIZE; i++) {
-        jacobian_to_affine(*(ECPointAffine*)&table[i], points[i]);
+    // Convert base to affine for mixed additions
+    ECPointAffine base_pt;
+    jacobian_to_affine(base_pt, base_jac);
+
+    // Accumulate all multiples in Jacobian form
+    // Local memory arrays (spill to L2 -- acceptable for one-time init)
+    ECPointJacobian jac_points[MAX_TSIZE];
+    jac_points[0].set_infinity();
+    jac_points[1].X = base_pt.x;
+    jac_points[1].Y = base_pt.y;
+    jac_points[1].Z.set_one();
+
+    for (int i = 2; i < tsize; i++) {
+        ec_add_mixed(jac_points[i], jac_points[i-1], base_pt);
     }
 
-    // For each subsequent window, multiply by 2^EC_WINDOW_SIZE
-    for (int w = 1; w < EC_NUM_WINDOWS; w++) {
-        // Double EC_WINDOW_SIZE times
-        for (int d = 0; d < EC_WINDOW_SIZE; d++) {
-            for (int i = 1; i < EC_TABLE_SIZE; i++) {
-                ECPointJacobian temp;
-                ec_double_jacobian(temp, points[i]);
-                points[i] = temp;
-            }
-        }
-
-        // Store window w
-        for (int i = 0; i < EC_TABLE_SIZE; i++) {
-            jacobian_to_affine(*(ECPointAffine*)&table[w * EC_TABLE_SIZE + i], points[i]);
-        }
+    // Montgomery batch inversion of Z coordinates
+    // Forward pass: compute running products of Z values
+    uint256 products[MAX_TSIZE];
+    products[0] = jac_points[1].Z;  // skip infinity at index 0
+    for (int i = 1; i < tsize - 1; i++) {
+        mod_mul(products[i], products[i-1], jac_points[i+1].Z);
     }
+
+    // Single mod_inv of the final product
+    uint256 inv;
+    mod_inv(inv, products[tsize - 2]);
+
+    // Backward pass: recover individual Z^-1 values and convert to affine
+    for (int i = tsize - 1; i > 1; i--) {
+        uint256 z_inv;
+        mod_mul(z_inv, inv, products[i - 2]);
+        mod_mul(inv, inv, jac_points[i].Z);
+
+        uint256 z_inv_sq;
+        mod_sqr(z_inv_sq, z_inv);
+        mod_mul(table[w * tsize + i].x, jac_points[i].X, z_inv_sq);
+        mod_mul(z_inv_sq, z_inv_sq, z_inv);
+        mod_mul(table[w * tsize + i].y, jac_points[i].Y, z_inv_sq);
+    }
+
+    // Handle index 1 (inv now holds Z_1^-1)
+    {
+        uint256 z_inv_sq;
+        mod_sqr(z_inv_sq, inv);
+        mod_mul(table[w * tsize + 1].x, jac_points[1].X, z_inv_sq);
+        mod_mul(z_inv_sq, z_inv_sq, inv);
+        mod_mul(table[w * tsize + 1].y, jac_points[1].Y, z_inv_sq);
+    }
+
+    // Index 0 is the point at infinity
+    table[w * tsize].x.set_zero();
+    table[w * tsize].y.set_zero();
 }
 
 // =============================================================================
@@ -1309,38 +1376,90 @@ __global__ void generate_precomputed_table_kernel(
 extern "C" {
 
 static PrecomputedPoint* g_precomputed_table = nullptr;
+static std::once_flag g_table_init_flag;
 
-cudaError_t secp256k1_init_table(cudaStream_t stream) {
-    if (g_precomputed_table != nullptr) {
-        return cudaSuccess;  // Already initialized
-    }
+cudaError_t secp256k1_init_table(cudaStream_t stream, int window_bits_override) {
+    cudaError_t err = cudaSuccess;
+    std::call_once(g_table_init_flag, [&]() {
+        // Determine window bits: use override if positive, else auto-detect from VRAM
+        int window_bits;
+        if (window_bits_override > 0) {
+            window_bits = window_bits_override;
+        } else {
+            int device;
+            cudaGetDevice(&device);
+            cudaDeviceProp prop;
+            cudaGetDeviceProperties(&prop, device);
+            constexpr size_t GB = 1024ULL * 1024 * 1024;
+            size_t reserved = (prop.totalGlobalMem >= 16 * GB) ? 4 * GB
+                            : (prop.totalGlobalMem >= 8 * GB)  ? 2 * GB
+                            :                                     1 * GB;
+            window_bits = select_window_bits(prop.totalGlobalMem - reserved);
+        }
 
-    // Allocate table on device
-    size_t table_size = EC_NUM_WINDOWS * EC_TABLE_SIZE * sizeof(PrecomputedPoint);
-    cudaError_t err = cudaMalloc(&g_precomputed_table, table_size);
-    if (err != cudaSuccess) return err;
+        // Build and store config
+        g_ec_config = make_ec_config(window_bits);
 
-    // Generate table
-    generate_precomputed_table_kernel<<<1, 1, 0, stream>>>(g_precomputed_table);
-    err = cudaGetLastError();
-    if (err != cudaSuccess) return err;
+        fprintf(stderr, "[EC] Precomputed table: %d-bit windows, %d windows, %zu KB\n",
+                g_ec_config.window_bits, g_ec_config.num_windows,
+                g_ec_config.total_bytes / 1024);
 
-    // OPTIMIZATION: Enable L2 cache persistence for EC precomputed table
-    // This keeps the table hot in L2 cache across kernel launches
-    // RTX 5090 has 96MB L2, RTX 4090 has 72MB L2 - table is ~64KB
-    #if CUDART_VERSION >= 11040
-    cudaStreamAttrValue stream_attr = {};
-    stream_attr.accessPolicyWindow.base_ptr = g_precomputed_table;
-    stream_attr.accessPolicyWindow.num_bytes = table_size;
-    stream_attr.accessPolicyWindow.hitRatio = 1.0f;  // Always persist
-    stream_attr.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
-    stream_attr.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
-    err = cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &stream_attr);
-    // Non-fatal if this fails (older GPUs may not support it)
-    if (err != cudaSuccess) {
-        err = cudaSuccess;  // Reset error, not critical
-    }
-    #endif
+        // Copy config to device constant memory
+        err = cudaMemcpyToSymbol(d_ec_config, &g_ec_config, sizeof(ECTableConfig));
+        if (err != cudaSuccess) return;
+
+        // Allocate table on device
+        err = cudaMalloc(&g_precomputed_table, g_ec_config.total_bytes);
+        if (err != cudaSuccess) return;
+
+        // Copy table pointer to device symbol so kernels can access it
+        err = cudaMemcpyToSymbol(d_precomputed_table, &g_precomputed_table, sizeof(PrecomputedPoint*));
+        if (err != cudaSuccess) return;
+
+        // Generate table: one block per window, sequential within each window
+        generate_precomputed_table_kernel<<<g_ec_config.num_windows, 1, 0, stream>>>(
+            g_precomputed_table
+        );
+        err = cudaGetLastError();
+        if (err != cudaSuccess) return;
+
+        err = cudaStreamSynchronize(stream);
+        if (err != cudaSuccess) return;
+
+        // OPTIMIZATION: Enable L2 cache persistence for EC precomputed table
+        // This keeps the table hot in L2 cache across kernel launches
+        #if CUDART_VERSION >= 11040
+        {
+            // Check if device supports L2 persistence before setting the policy
+            int persisting_l2_max = 0;
+            cudaDeviceGetAttribute(&persisting_l2_max,
+                                   cudaDevAttrMaxPersistingL2CacheSize, 0);
+            if (persisting_l2_max > 0) {
+                cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, (size_t)persisting_l2_max);
+
+                // Free edition: EC table gets full L2 persistence budget
+                // (Pro edition uses 25% for EC table, 75% for bloom filter)
+                size_t persist_bytes = g_ec_config.total_bytes;
+                if (persist_bytes > (size_t)persisting_l2_max) {
+                    persist_bytes = (size_t)persisting_l2_max;
+                }
+                cudaStreamAttrValue stream_attr = {};
+                stream_attr.accessPolicyWindow.base_ptr  = g_precomputed_table;
+                stream_attr.accessPolicyWindow.num_bytes  = persist_bytes;
+                stream_attr.accessPolicyWindow.hitRatio   = 1.0f;
+                stream_attr.accessPolicyWindow.hitProp    = cudaAccessPropertyPersisting;
+                stream_attr.accessPolicyWindow.missProp   = cudaAccessPropertyStreaming;
+                err = cudaStreamSetAttribute(stream,
+                                             cudaStreamAttributeAccessPolicyWindow,
+                                             &stream_attr);
+                // Non-fatal if this fails (older GPUs may not support it)
+                if (err != cudaSuccess) {
+                    err = cudaSuccess;
+                }
+            }
+        }
+        #endif
+    });
 
     return err;
 }

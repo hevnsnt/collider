@@ -224,23 +224,11 @@ __global__ void ripemd160_batch_kernel(
     ripemd160_hash(in, out);
 }
 
-/**
- * Combined SHA256 + RIPEMD160 for public key to address.
- * Input: 65-byte uncompressed public key (04 || x || y)
- * Output: 20-byte address hash (hash160)
- */
-__device__ void pubkey_to_hash160(
-    const uint8_t* pubkey,  // 65 bytes
-    uint8_t* hash160        // 20 bytes
-) {
-    uint8_t sha256_out[32];
-
-    // First SHA256 of pubkey
-    // (Would call sha256_hash here - simplified for this file)
-
-    // Then RIPEMD160
-    ripemd160_hash(sha256_out, hash160);
-}
+// NOTE: pubkey_to_hash160 is intentionally not implemented here.
+// The fused SHA256+RIPEMD160 pipeline in puzzle_optimized.cu handles
+// the full pubkey -> hash160 conversion with proper SHA256 computation.
+// A standalone version was removed because it used uninitialized SHA256
+// output, producing incorrect results.
 
 // Host wrapper
 extern "C" {

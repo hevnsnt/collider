@@ -4,6 +4,7 @@
 // https://github.com/RetiredC
 
 
+#include <cstdint>
 #include "defs.h"
 #include "RCGpuUtils.h"
 
@@ -57,12 +58,15 @@ __global__ void KernelA(const TKparams Kparams)
 
 	__align__(16) u64 x[4], y[4], tmp[4], tmp2[4];
 	u64 dp_mask64;
-	if (Kparams.DP >= 64)
-		dp_mask64 = 0xFFFFFFFFFFFFFFFFULL;
-	else if (Kparams.DP <= 0)
+	if (Kparams.DP <= 0)
 		dp_mask64 = 0ULL;
-	else
-		dp_mask64 = ~((1ULL << (64ULL - (u64)Kparams.DP)) - 1ULL);
+	else if (Kparams.DP >= 64)
+		dp_mask64 = ~0ULL;
+	else {
+		uint32_t shift = (uint32_t)(64ULL - (uint64_t)Kparams.DP);
+		if (shift > 63) shift = 63;
+		dp_mask64 = ~((1ULL << shift) - 1ULL);
+	}
 	u16 jmp_ind;
 
 	//copy kangs from global to L2
@@ -248,12 +252,15 @@ __global__ void KernelA(const TKparams Kparams)
 	__align__(16) u64 inverse[5];
 	__align__(16) u64 x[4], y[4], tmp[4], tmp2[4];
 	u64 dp_mask64;
-	if (Kparams.DP >= 64)
-		dp_mask64 = 0xFFFFFFFFFFFFFFFFULL;
-	else if (Kparams.DP <= 0)
+	if (Kparams.DP <= 0)
 		dp_mask64 = 0ULL;
-	else
-		dp_mask64 = ~((1ULL << (64ULL - (u64)Kparams.DP)) - 1ULL);
+	else if (Kparams.DP >= 64)
+		dp_mask64 = ~0ULL;
+	else {
+		uint32_t shift = (uint32_t)(64ULL - (uint64_t)Kparams.DP);
+		if (shift > 63) shift = 63;
+		dp_mask64 = ~((1ULL << shift) - 1ULL);
+	}
 	u16 jmp_ind;
 
 	//copy kangs from global to local

@@ -16,6 +16,7 @@
 #include "pool_client.hpp"
 #include <thread>
 #include <mutex>
+#include <shared_mutex>
 #include <queue>
 #include <condition_variable>
 
@@ -156,7 +157,7 @@ public:
 private:
     bool debug_mode_ = false;
     // Network
-    socket_t socket_;
+    socket_t socket_ = INVALID_SOCK;
     std::string host_;
     uint16_t port_;
     uint32_t timeout_ms_;
@@ -169,7 +170,7 @@ private:
     static constexpr uint32_t RECONNECT_BASE_DELAY_MS = 1000;    // Start at 1 second
     static constexpr uint32_t RECONNECT_MAX_DELAY_MS = 60000;    // Cap at 60 seconds
     static constexpr double RECONNECT_BACKOFF_MULTIPLIER = 2.0;  // Double each time
-    uint32_t reconnect_delay_ms_ = RECONNECT_BASE_DELAY_MS;
+    std::atomic<uint32_t> reconnect_delay_ms_{RECONNECT_BASE_DELAY_MS};
     uint32_t reconnect_attempts_ = 0;
 
     // TLS support
@@ -214,8 +215,8 @@ private:
     void sender_loop();
 
     // SSL I/O mutex - prevents concurrent SSL operations that corrupt TLS state
-    // Receiver uses try_lock + 100ms timeout so sender isn't starved
-    std::mutex ssl_io_mutex_;
+    // Receiver uses try_lock_for with 100ms timeout so sender isn't starved
+    std::timed_mutex ssl_io_mutex_;
 
     // Protocol helpers
     bool send_message(JLPMessageType type, const void* data, size_t size);

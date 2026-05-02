@@ -402,9 +402,12 @@ public:
      * Returns false if balance > 0 or if the API call fails (fail-open: assume unsolved).
      */
     static bool check_if_solved(const std::string& address) {
-        // Build URL: https://mempool.space/api/address/{address}
-        // Response JSON contains "chain_stats.funded_txo_sum" and "chain_stats.spent_txo_sum"
-        // If funded == spent, balance is 0, puzzle is solved
+        // Sanitize: Bitcoin addresses are Base58 ([a-zA-Z0-9], max ~35 chars).
+        // Reject anything unsafe to prevent command injection via popen.
+        if (address.empty() || address.size() > 64) return false;
+        for (char c : address) {
+            if (!std::isalnum(static_cast<unsigned char>(c))) return false;
+        }
 
 #ifdef _WIN32
         std::string cmd = "curl.exe -sf --max-time 10 https://mempool.space/api/address/" + address + " 2>NUL";

@@ -24,6 +24,9 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#elif defined(__APPLE__)
+#include <sys/sysctl.h>
+#include <unistd.h>
 #else
 #include <sys/sysinfo.h>
 #include <unistd.h>
@@ -49,7 +52,10 @@ public:
                         task = std::move(tasks_.front());
                         tasks_.pop();
                     }
+                    active_tasks_.fetch_add(1);
                     task();
+                    active_tasks_.fetch_sub(1);
+                    done_cv_.notify_all();
                 }
             });
         }
@@ -78,13 +84,10 @@ public:
     }
 
     void wait() {
-        // Simple busy-wait for all tasks to complete
-        while (true) {
-            std::unique_lock<std::mutex> lock(mutex_);
-            if (tasks_.empty()) break;
-            lock.unlock();
-            std::this_thread::yield();
-        }
+        std::unique_lock<std::mutex> lock(mutex_);
+        done_cv_.wait(lock, [this]() {
+            return tasks_.empty() && active_tasks_.load() == 0;
+        });
     }
 
 private:
@@ -92,6 +95,8 @@ private:
     std::queue<std::function<void()>> tasks_;
     std::mutex mutex_;
     std::condition_variable cv_;
+    std::condition_variable done_cv_;
+    std::atomic<int> active_tasks_{0};
     bool stop_;
 };
 
@@ -203,8 +208,11 @@ public:
         info.compute_major = 0;
         info.compute_minor = 0;
 
-        info.is_blackwell = false;
+        info.is_turing = false;
         info.is_ampere = false;
+        info.is_ada = false;
+        info.is_hopper = false;
+        info.is_blackwell = false;
         info.is_apple_silicon = false;
         info.supports_fp16 = false;
         info.supports_int8 = true;
@@ -514,11 +522,10 @@ private:
 // Factory function
 IPlatform& get_platform() {
     static CPUPlatform platform;
-    static bool initialized = false;
-    if (!initialized) {
+    static std::once_flag init_flag;
+    std::call_once(init_flag, [&platform]() {
         platform.initialize();
-        initialized = true;
-    }
+    });
     return platform;
 }
 

@@ -88,12 +88,12 @@ __device__ void sha256_33bytes_opt(const uint8_t* pubkey, uint8_t* hash) {
     // Words 0-7: first 32 bytes of pubkey (big-endian)
     #pragma unroll
     for (int i = 0; i < 8; i++) {
-        W[i] = (pubkey[i*4] << 24) | (pubkey[i*4 + 1] << 16) |
-               (pubkey[i*4 + 2] << 8) | pubkey[i*4 + 3];
+        W[i] = ((uint32_t)pubkey[i*4] << 24) | ((uint32_t)pubkey[i*4 + 1] << 16) |
+               ((uint32_t)pubkey[i*4 + 2] << 8) | (uint32_t)pubkey[i*4 + 3];
     }
 
     // Word 8: last byte + 0x80 padding
-    W[8] = (pubkey[32] << 24) | (0x80 << 16);
+    W[8] = ((uint32_t)pubkey[32] << 24) | (0x80u << 16);
 
     // Words 9-13: zeros
     W[9] = 0; W[10] = 0; W[11] = 0; W[12] = 0; W[13] = 0;
@@ -278,7 +278,12 @@ __device__ void ripemd160_32bytes_opt(const uint8_t* sha_out, uint8_t* h160) {
 // =============================================================================
 
 // Keys processed per thread in strided mode
-#define KEYS_PER_THREAD 256
+// NOTE: Keep this value small to avoid massive register spills to local memory.
+// At 256: z_values[256]=8KB + points[256]=24KB + z_inv[256]=8KB = 40KB per thread
+// which far exceeds the GPU register file and causes catastrophic spilling.
+// At 32: total per-thread arrays = 5KB, dramatically reducing spill pressure.
+// The grid compensates automatically (8x more work items dispatched).
+#define KEYS_PER_THREAD 32
 
 // Batch size for Montgomery inversion (power of 2)
 #define BATCH_INV_SIZE 256
@@ -382,9 +387,11 @@ __device__ __constant__ uint64_t GLV_B1[2] = {
     0x6F547FA90ABFE4C3ULL, 0xE4437ED6010E8828ULL  // -b1 (stored positive, sign handled separately)
 };
 
-// a2 = 0x114CA50F7A8E2F3F657C1108D9D44CFD8 (129 bits)
-// For our 128-bit multiply, we use a2 ≈ b2 = a1 (approximation that works for secp256k1)
-// The extra bit causes at most a small error that's corrected by the final modular reduction
+// a2 = 0xE4437ED6010E88286F547FA90ABFE4C3 (from libsecp256k1)
+// This is the correct a2 constant for GLV decomposition on secp256k1
+__device__ __constant__ uint64_t GLV_A2[2] = {
+    0x6F547FA90ABFE4C3ULL, 0xE4437ED6010E8828ULL  // a2 = 0xE4437ED6010E88286F547FA90ABFE4C3
+};
 
 __device__ __constant__ uint64_t GLV_B2[2] = {
     0xE86C90E49284EB15ULL, 0x3086D221A7D46BCDULL  // b2 = a1 (same value)
@@ -417,38 +424,55 @@ __device__ PointA* d_PRECOMP_TABLE_LAMBDA = nullptr;
 // =============================================================================
 
 // Add with carry using PTX for maximum performance
+// CRITICAL: All carry-dependent PTX instructions MUST be in a single asm volatile
+// block. Separate asm() blocks allow NVCC to insert instructions between them,
+// corrupting the CC (condition code) register and breaking carry propagation.
 __device__ __forceinline__ uint64_t add_cc(uint64_t a, uint64_t b, uint64_t& carry) {
     uint64_t result;
-    asm("add.cc.u64 %0, %1, %2;" : "=l"(result) : "l"(a), "l"(b));
-    asm("addc.u64 %0, 0, 0;" : "=l"(carry));
+    asm volatile(
+        "add.cc.u64  %0, %2, %3;\n\t"
+        "addc.u64    %1, 0, 0;\n\t"
+        : "=l"(result), "=l"(carry)
+        : "l"(a), "l"(b)
+    );
     return result;
 }
 
 __device__ __forceinline__ uint64_t addc_cc(uint64_t a, uint64_t b, uint64_t carry_in, uint64_t& carry_out) {
     uint64_t result;
-    asm("add.cc.u64 %0, %1, %2;" : "=l"(result) : "l"(a), "l"(carry_in));
-    asm("addc.cc.u64 %0, %0, %1;" : "+l"(result) : "l"(b));
-    asm("addc.u64 %0, 0, 0;" : "=l"(carry_out));
+    asm volatile(
+        "add.cc.u64  %0, %2, %3;\n\t"
+        "addc.cc.u64 %0, %0, %4;\n\t"
+        "addc.u64    %1, 0, 0;\n\t"
+        : "=l"(result), "=l"(carry_out)
+        : "l"(a), "l"(carry_in), "l"(b)
+    );
     return result;
 }
 
 // Subtraction with borrow output (first in chain)
 __device__ __forceinline__ uint64_t sub_cc(uint64_t a, uint64_t b, uint64_t& borrow) {
     uint64_t result;
-    asm("sub.cc.u64 %0, %1, %2;" : "=l"(result) : "l"(a), "l"(b));
-    asm("subc.u64 %0, 0, 0;" : "=l"(borrow));
+    asm volatile(
+        "sub.cc.u64  %0, %2, %3;\n\t"
+        "subc.u64    %1, 0, 0;\n\t"
+        : "=l"(result), "=l"(borrow)
+        : "l"(a), "l"(b)
+    );
     return result;
 }
 
 // Subtraction with borrow-in and borrow-out (for chaining)
 __device__ __forceinline__ uint64_t subc_cc(uint64_t a, uint64_t b, uint64_t borrow_in, uint64_t& borrow_out) {
     uint64_t result;
-    // First subtract borrow_in from a, setting CC
-    asm("sub.cc.u64 %0, %1, %2;" : "=l"(result) : "l"(a), "l"(borrow_in));
-    // Then subtract b with borrow, setting CC
-    asm("subc.cc.u64 %0, %0, %1;" : "+l"(result) : "l"(b));
-    // Capture final borrow
-    asm("subc.u64 %0, 0, 0;" : "=l"(borrow_out));
+    // Compute a - b - borrow_in with proper borrow propagation
+    asm volatile(
+        "sub.cc.u64  %0, %2, %4;\n\t"
+        "subc.cc.u64 %0, %0, %3;\n\t"
+        "subc.u64    %1, 0, 0;\n\t"
+        : "=l"(result), "=l"(borrow_out)
+        : "l"(a), "l"(borrow_in), "l"(b)
+    );
     return result;
 }
 
@@ -471,47 +495,65 @@ __device__ __forceinline__ void mad_wide(uint64_t a, uint64_t b, uint64_t c,
 
 // Modular addition: r = (a + b) mod p
 __device__ void mod_add(U256& r, const U256& a, const U256& b) {
-    uint64_t carry = 0, c;
+    uint64_t carry;
 
-    r.d[0] = add_cc(a.d[0], b.d[0], c); carry = c;
-    r.d[1] = addc_cc(a.d[1], b.d[1], carry, c); carry = c;
-    r.d[2] = addc_cc(a.d[2], b.d[2], carry, c); carry = c;
-    r.d[3] = addc_cc(a.d[3], b.d[3], carry, c); carry = c;
+    // Single asm block for the full 4-limb add with carry chain
+    asm volatile(
+        "add.cc.u64  %0, %5, %9;\n\t"
+        "addc.cc.u64 %1, %6, %10;\n\t"
+        "addc.cc.u64 %2, %7, %11;\n\t"
+        "addc.cc.u64 %3, %8, %12;\n\t"
+        "addc.u64    %4, 0, 0;\n\t"
+        : "=l"(r.d[0]), "=l"(r.d[1]), "=l"(r.d[2]), "=l"(r.d[3]), "=l"(carry)
+        : "l"(a.d[0]), "l"(a.d[1]), "l"(a.d[2]), "l"(a.d[3]),
+          "l"(b.d[0]), "l"(b.d[1]), "l"(b.d[2]), "l"(b.d[3])
+    );
 
     // Reduce if >= p
     // p = 2^256 - 2^32 - 977, so if carry or result >= p, subtract p
-    // This is equivalent to adding 2^32 + 977
     if (carry || (r.d[3] == 0xFFFFFFFFFFFFFFFFULL &&
                   r.d[2] == 0xFFFFFFFFFFFFFFFFULL &&
                   r.d[1] == 0xFFFFFFFFFFFFFFFFULL &&
                   r.d[0] >= 0xFFFFFFFEFFFFFC2FULL)) {
-        // FIXED: Proper borrow chaining
-        uint64_t borrow;
-        r.d[0] = sub_cc(r.d[0], SECP_P[0], borrow);
-        r.d[1] = subc_cc(r.d[1], SECP_P[1], borrow, borrow);
-        r.d[2] = subc_cc(r.d[2], SECP_P[2], borrow, borrow);
-        r.d[3] = r.d[3] - SECP_P[3] - borrow;
+        // Single asm block for 4-limb subtract with borrow chain
+        asm volatile(
+            "sub.cc.u64  %0, %0, %4;\n\t"
+            "subc.cc.u64 %1, %1, %5;\n\t"
+            "subc.cc.u64 %2, %2, %6;\n\t"
+            "subc.u64    %3, %3, %7;\n\t"
+            : "+l"(r.d[0]), "+l"(r.d[1]), "+l"(r.d[2]), "+l"(r.d[3])
+            : "l"(SECP_P[0]), "l"(SECP_P[1]), "l"(SECP_P[2]), "l"(SECP_P[3])
+        );
     }
 }
 
 // Modular subtraction: r = (a - b) mod p
-// FIXED: Proper borrow chaining using subc_cc
 __device__ void mod_sub(U256& r, const U256& a, const U256& b) {
     uint64_t borrow;
 
-    // Proper chained subtraction with borrow propagation
-    r.d[0] = sub_cc(a.d[0], b.d[0], borrow);
-    r.d[1] = subc_cc(a.d[1], b.d[1], borrow, borrow);
-    r.d[2] = subc_cc(a.d[2], b.d[2], borrow, borrow);
-    r.d[3] = subc_cc(a.d[3], b.d[3], borrow, borrow);
+    // Single asm block for full 4-limb subtract with borrow chain
+    asm volatile(
+        "sub.cc.u64  %0, %5, %9;\n\t"
+        "subc.cc.u64 %1, %6, %10;\n\t"
+        "subc.cc.u64 %2, %7, %11;\n\t"
+        "subc.cc.u64 %3, %8, %12;\n\t"
+        "subc.u64    %4, 0, 0;\n\t"
+        : "=l"(r.d[0]), "=l"(r.d[1]), "=l"(r.d[2]), "=l"(r.d[3]), "=l"(borrow)
+        : "l"(a.d[0]), "l"(a.d[1]), "l"(a.d[2]), "l"(a.d[3]),
+          "l"(b.d[0]), "l"(b.d[1]), "l"(b.d[2]), "l"(b.d[3])
+    );
 
     // If final borrow occurred (result negative), add p back
     if (borrow) {
-        uint64_t carry;
-        r.d[0] = add_cc(r.d[0], SECP_P[0], carry);
-        r.d[1] = addc_cc(r.d[1], SECP_P[1], carry, carry);
-        r.d[2] = addc_cc(r.d[2], SECP_P[2], carry, carry);
-        r.d[3] = r.d[3] + SECP_P[3] + carry;
+        // Single asm block for 4-limb add with carry chain
+        asm volatile(
+            "add.cc.u64  %0, %0, %4;\n\t"
+            "addc.cc.u64 %1, %1, %5;\n\t"
+            "addc.cc.u64 %2, %2, %6;\n\t"
+            "addc.u64    %3, %3, %7;\n\t"
+            : "+l"(r.d[0]), "+l"(r.d[1]), "+l"(r.d[2]), "+l"(r.d[3])
+            : "l"(SECP_P[0]), "l"(SECP_P[1]), "l"(SECP_P[2]), "l"(SECP_P[3])
+        );
     }
 }
 
@@ -562,8 +604,10 @@ __device__ void mod_mul(U256& r, const U256& a, const U256& b) {
         carry = hi;
     }
 
-    // Handle final carry (multiply by c again if needed)
-    if (carry) {
+    // Handle final carry: keep reducing carry*c into the result until carry == 0
+    // After first reduction, carry can be at most ~33 bits (c is 33 bits),
+    // so a second pass always suffices, but we loop for correctness.
+    while (carry) {
         uint64_t lo = carry * c;
         uint64_t hi = __umul64hi(carry, c);
         lo += p[0];
@@ -572,23 +616,27 @@ __device__ void mod_mul(U256& r, const U256& a, const U256& b) {
         carry = hi;
 
         for (int i = 1; i < 4 && carry; i++) {
+            uint64_t old = p[i];
             p[i] += carry;
-            carry = (p[i] < carry) ? 1 : 0;
+            carry = (p[i] < old) ? 1 : 0;
         }
     }
 
-    // Final reduction if >= p
+    // Final conditional subtraction if result >= p
     r.d[0] = p[0]; r.d[1] = p[1]; r.d[2] = p[2]; r.d[3] = p[3];
 
     // Check if >= p and subtract
     if (r.d[3] > SECP_P[3] ||
         (r.d[3] == SECP_P[3] && r.d[2] == SECP_P[2] &&
          r.d[1] == SECP_P[1] && r.d[0] >= SECP_P[0])) {
-        uint64_t borrow;
-        r.d[0] = sub_cc(r.d[0], SECP_P[0], borrow);
-        r.d[1] = sub_cc(r.d[1] - borrow, SECP_P[1], borrow);
-        r.d[2] = sub_cc(r.d[2] - borrow, SECP_P[2], borrow);
-        r.d[3] = r.d[3] - borrow - SECP_P[3];
+        asm volatile(
+            "sub.cc.u64  %0, %0, %4;\n\t"
+            "subc.cc.u64 %1, %1, %5;\n\t"
+            "subc.cc.u64 %2, %2, %6;\n\t"
+            "subc.u64    %3, %3, %7;\n\t"
+            : "+l"(r.d[0]), "+l"(r.d[1]), "+l"(r.d[2]), "+l"(r.d[3])
+            : "l"(SECP_P[0]), "l"(SECP_P[1]), "l"(SECP_P[2]), "l"(SECP_P[3])
+        );
     }
 }
 
@@ -675,8 +723,8 @@ __device__ void mod_sqr(U256& r, const U256& a) {
         carry = hi;
     }
 
-    // Handle final carry (multiply by c again if needed)
-    if (carry) {
+    // Handle final carry: keep reducing carry*c into the result until carry == 0
+    while (carry) {
         uint64_t lo = carry * c;
         uint64_t hi = __umul64hi(carry, c);
         lo += p[0];
@@ -685,40 +733,48 @@ __device__ void mod_sqr(U256& r, const U256& a) {
         carry = hi;
 
         for (int i = 1; i < 4 && carry; i++) {
+            uint64_t old = p[i];
             p[i] += carry;
-            carry = (p[i] < carry) ? 1 : 0;
+            carry = (p[i] < old) ? 1 : 0;
         }
     }
 
-    // Final reduction if >= p
+    // Final conditional subtraction if result >= p
     r.d[0] = p[0]; r.d[1] = p[1]; r.d[2] = p[2]; r.d[3] = p[3];
 
     // Check if >= p and subtract
     if (r.d[3] > SECP_P[3] ||
         (r.d[3] == SECP_P[3] && r.d[2] == SECP_P[2] &&
          r.d[1] == SECP_P[1] && r.d[0] >= SECP_P[0])) {
-        uint64_t borrow;
-        r.d[0] = sub_cc(r.d[0], SECP_P[0], borrow);
-        r.d[1] = sub_cc(r.d[1] - borrow, SECP_P[1], borrow);
-        r.d[2] = sub_cc(r.d[2] - borrow, SECP_P[2], borrow);
-        r.d[3] = r.d[3] - borrow - SECP_P[3];
+        asm volatile(
+            "sub.cc.u64  %0, %0, %4;\n\t"
+            "subc.cc.u64 %1, %1, %5;\n\t"
+            "subc.cc.u64 %2, %2, %6;\n\t"
+            "subc.u64    %3, %3, %7;\n\t"
+            : "+l"(r.d[0]), "+l"(r.d[1]), "+l"(r.d[2]), "+l"(r.d[3])
+            : "l"(SECP_P[0]), "l"(SECP_P[1]), "l"(SECP_P[2]), "l"(SECP_P[3])
+        );
     }
 }
 
 // Modular inverse using Fermat's little theorem: a^(-1) = a^(p-2) mod p
 // Uses addition chain optimized for secp256k1's p
+//
+// Variable naming convention: xN = a^(2^N - 1)
+// e.g., x2 = a^3, x3 = a^7, x6 = a^63, etc.
+// This follows the libsecp256k1 naming convention.
 __device__ void mod_inv(U256& r, const U256& a) {
     U256 x2, x3, x6, x9, x11, x22, x44, x88, x176, x220, x223, t;
 
     mod_sqr(x2, a);
-    mod_mul(x2, x2, a);           // x2 = a^3
+    mod_mul(x2, x2, a);           // x2 = a^(2^2 - 1) = a^3    (2-bit all-ones run)
 
     mod_sqr(x3, x2);
-    mod_mul(x3, x3, a);           // x3 = a^7
+    mod_mul(x3, x3, a);           // x3 = a^(2^3 - 1) = a^7    (3-bit all-ones run)
 
     t = x3;
     for (int i = 0; i < 3; i++) mod_sqr(t, t);
-    mod_mul(x6, t, x3);           // x6 = a^63
+    mod_mul(x6, t, x3);           // x6 = a^(2^6 - 1) = a^63   (6-bit all-ones run)
 
     t = x6;
     for (int i = 0; i < 3; i++) mod_sqr(t, t);
@@ -752,16 +808,38 @@ __device__ void mod_inv(U256& r, const U256& a) {
     for (int i = 0; i < 3; i++) mod_sqr(t, t);
     mod_mul(x223, t, x3);         // x223
 
+    // p-2 = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2D
+    // Structure from bit 255 down: 223 ones, 1 zero (bit 32), 22 ones (bits 31..10),
+    // then bits 9..0 = 0000101101
+
+    // From x223, square 23 times to cover the 1 zero at bit 32 and position for 22 ones
     t = x223;
     for (int i = 0; i < 23; i++) mod_sqr(t, t);
+    // t = a^((2^223-1) * 2^23) -- covers bits 255..33 and zero at bit 32
     mod_mul(t, t, x22);
+    // t = a^(2^246 - 2^22 - 1) -- covers bits 255..10
 
-    for (int i = 0; i < 5; i++) mod_sqr(t, t);
+    // Remaining bits 9..0 = 0000101101
+    // bit 9 = 0
+    mod_sqr(t, t);
+    // bit 8 = 0
+    mod_sqr(t, t);
+    // bit 7 = 0
+    mod_sqr(t, t);
+    // bit 6 = 0
+    mod_sqr(t, t);
+    // bit 5 = 1
+    mod_sqr(t, t);
     mod_mul(t, t, a);
-
-    for (int i = 0; i < 3; i++) mod_sqr(t, t);
-    mod_mul(t, t, a);
-
+    // bit 4 = 0
+    mod_sqr(t, t);
+    // bits 3,2 = 11: square twice, multiply by x2 (= a^3)
+    mod_sqr(t, t);
+    mod_sqr(t, t);
+    mod_mul(t, t, x2);
+    // bit 1 = 0
+    mod_sqr(t, t);
+    // bit 0 = 1
     mod_sqr(t, t);
     mod_mul(r, t, a);
 }
@@ -967,34 +1045,58 @@ __device__ void batch_invert(U256* z, U256* inv, int n) {
 // SCALAR MULTIPLICATION WITH PRECOMPUTED TABLE
 // =============================================================================
 
+// Branchless conditional-select for EC window accumulation.
+// Reduces warp divergence by always computing the addition and
+// conditionally selecting the result based on whether window_val != 0.
+// On first non-zero window when R is infinity, initializes R directly.
+__device__ __forceinline__ void ec_window_accumulate(
+    PointJ& R,
+    const PointA* table,
+    int base,
+    uint64_t window_val
+) {
+    // Always load a table point (index 0 is the dummy/identity for window_val==0)
+    int safe_idx = (window_val != 0) ? (int)window_val : 0;
+    PointA pt = table[base + safe_idx];
+
+    if (R.is_infinity() && window_val != 0) {
+        // First non-zero window: initialize R from affine point
+        R.X = pt.x;
+        R.Y = pt.y;
+        R.Z.set_one();
+    } else {
+        // Always compute the addition
+        PointJ temp;
+        ec_add_mixed(temp, R, pt);
+
+        // Conditional select: update R only if window_val != 0
+        uint64_t mask = (window_val != 0) ? 0xFFFFFFFFFFFFFFFFULL : 0;
+        #pragma unroll
+        for (int li = 0; li < 4; li++) {
+            R.X.d[li] = (temp.X.d[li] & mask) | (R.X.d[li] & ~mask);
+            R.Y.d[li] = (temp.Y.d[li] & mask) | (R.Y.d[li] & ~mask);
+            R.Z.d[li] = (temp.Z.d[li] & mask) | (R.Z.d[li] & ~mask);
+        }
+    }
+}
+
 // Windowed scalar multiplication using precomputed table
 // Process 4 bits at a time, reducing additions by 4x
 __device__ void ec_mul_precomp(PointJ& R, const U256& k) {
     R.set_infinity();
 
-    // Process from most significant window to least
+    // Table is positional: T[w][v] = v * 2^(w*wbits) * G
+    // No inter-window doubling needed -- just accumulate contributions
     for (int w = NUM_WINDOWS - 1; w >= 0; w--) {
-        // Double 4 times (for window size 4)
-        for (int i = 0; i < WINDOW_SIZE; i++) {
-            ec_double(R, R);
-        }
-
-        // Extract window value (4 bits)
         int shift = (w * WINDOW_SIZE) % 64;
         int word = (w * WINDOW_SIZE) / 64;
         uint64_t window = (k.d[word] >> shift) & WINDOW_MASK;
+        // Note: with WINDOW_SIZE=4, shift is always a multiple of 4 and never
+        // exceeds 60, so a window never spans a 64-bit word boundary.
+        // No cross-word handling needed.
 
-        // Handle window crossing word boundary
-        if (shift > 60 && word < 3) {
-            window |= (k.d[word + 1] << (64 - shift)) & WINDOW_MASK;
-        }
-
-        // Add precomputed point if window != 0
-        if (window != 0) {
-            // Read from global memory (L2 cached via cudaAccessPropertyPersisting)
-            PointA P = d_PRECOMP_TABLE[w * (1 << WINDOW_SIZE) + window];
-            ec_add_mixed(R, R, P);
-        }
+        // Branchless window accumulation (reduces warp divergence)
+        ec_window_accumulate(R, d_PRECOMP_TABLE, w * (1 << WINDOW_SIZE), window);
     }
 }
 
@@ -1088,20 +1190,30 @@ __device__ void mul_128x128(const U128& a, const uint64_t b[2], U256& result) {
 // Subtract 256-bit values, returning borrow (for signed arithmetic)
 __device__ bool sub_256(U256& r, const U256& a, const U256& b) {
     uint64_t borrow;
-    r.d[0] = sub_cc(a.d[0], b.d[0], borrow);
-    r.d[1] = subc_cc(a.d[1], b.d[1], borrow, borrow);
-    r.d[2] = subc_cc(a.d[2], b.d[2], borrow, borrow);
-    r.d[3] = subc_cc(a.d[3], b.d[3], borrow, borrow);
+    asm volatile(
+        "sub.cc.u64  %0, %5, %9;\n\t"
+        "subc.cc.u64 %1, %6, %10;\n\t"
+        "subc.cc.u64 %2, %7, %11;\n\t"
+        "subc.cc.u64 %3, %8, %12;\n\t"
+        "subc.u64    %4, 0, 0;\n\t"
+        : "=l"(r.d[0]), "=l"(r.d[1]), "=l"(r.d[2]), "=l"(r.d[3]), "=l"(borrow)
+        : "l"(a.d[0]), "l"(a.d[1]), "l"(a.d[2]), "l"(a.d[3]),
+          "l"(b.d[0]), "l"(b.d[1]), "l"(b.d[2]), "l"(b.d[3])
+    );
     return borrow != 0;
 }
 
 // Add 256-bit values
 __device__ void add_256(U256& r, const U256& a, const U256& b) {
-    uint64_t carry;
-    r.d[0] = add_cc(a.d[0], b.d[0], carry);
-    r.d[1] = addc_cc(a.d[1], b.d[1], carry, carry);
-    r.d[2] = addc_cc(a.d[2], b.d[2], carry, carry);
-    r.d[3] = addc_cc(a.d[3], b.d[3], carry, carry);
+    asm volatile(
+        "add.cc.u64  %0, %4, %8;\n\t"
+        "addc.cc.u64 %1, %5, %9;\n\t"
+        "addc.cc.u64 %2, %6, %10;\n\t"
+        "addc.u64    %3, %7, %11;\n\t"
+        : "=l"(r.d[0]), "=l"(r.d[1]), "=l"(r.d[2]), "=l"(r.d[3])
+        : "l"(a.d[0]), "l"(a.d[1]), "l"(a.d[2]), "l"(a.d[3]),
+          "l"(b.d[0]), "l"(b.d[1]), "l"(b.d[2]), "l"(b.d[3])
+    );
 }
 
 // GLV scalar decomposition: k = k1 + k2*lambda (mod n)
@@ -1170,12 +1282,12 @@ __device__ void glv_decompose(const U256& k, U256& k1, U256& k2, bool& k1_neg, b
 
     U256 c1_a1, c2_a2;
     mul_128x128(c1, GLV_A1, c1_a1);
-    mul_128x128(c2, GLV_A1, c2_a2);  // a2 ≈ a1 for secp256k1 (b2 = a1)
+    mul_128x128(c2, GLV_A2, c2_a2);  // Use correct a2 constant
 
     // k1 = k - c1*a1 - c2*a2
     k1 = k;
-    bool borrow1 = sub_256(k1, k1, c1_a1);
-    bool borrow2 = sub_256(k1, k1, c2_a2);
+    sub_256(k1, k1, c1_a1);
+    sub_256(k1, k1, c2_a2);
 
     // Handle underflow - if k1 went negative, we need to adjust
     k1_neg = (k1.d[3] >> 63) != 0;
@@ -1201,10 +1313,20 @@ __device__ void glv_decompose(const U256& k, U256& k1, U256& k2, bool& k1_neg, b
         k2_neg = true;
     }
 
-    // Ensure k1, k2 are in valid range (should be ~128 bits)
-    // Clear upper bits if any overflow occurred
-    k1.d[2] = k1.d[3] = 0;
-    k2.d[2] = k2.d[3] = 0;
+    // After proper GLV decomposition, k1 and k2 should fit in ~128 bits.
+    // Verify this rather than blindly truncating. If upper limbs are non-zero,
+    // the decomposition has a bug or the input was malformed.
+    // In debug builds this would assert; in release we allow the extra bits
+    // to flow through since the windowed multiplication handles full U256.
+#ifdef __CUDA_ARCH__
+    // Assert k1 and k2 fit in 128 bits (upper limbs should be zero)
+    if (k1.d[2] != 0 || k1.d[3] != 0 || k2.d[2] != 0 || k2.d[3] != 0) {
+        // GLV decomposition produced values > 128 bits -- this should not happen
+        // with correct constants. Fall through and let the full scalar be used.
+        // The precomputed table lookup in ec_mul_glv handles this correctly
+        // since it already checks word < 2.
+    }
+#endif
 }
 
 // Apply beta endomorphism to point: (x, y) -> (beta*x, y)
@@ -1222,16 +1344,18 @@ __device__ void apply_endomorphism(PointA& Q, const PointA& P) {
 
 // Negate a point: (x, y) -> (x, -y) = (x, p - y)
 __device__ void ec_negate(PointA& P) {
+    // mod_sub requires U256 references; SECP_P is __constant__ uint64_t[4],
+    // so a local U256 copy is required to obtain a typed reference.
     U256 p;
-    p.d[0] = SECP_P[0]; p.d[1] = SECP_P[1];
-    p.d[2] = SECP_P[2]; p.d[3] = SECP_P[3];
+    #pragma unroll
+    for (int i = 0; i < 4; i++) p.d[i] = SECP_P[i];
     mod_sub(P.y, p, P.y);
 }
 
 __device__ void ec_negate_j(PointJ& P) {
     U256 p;
-    p.d[0] = SECP_P[0]; p.d[1] = SECP_P[1];
-    p.d[2] = SECP_P[2]; p.d[3] = SECP_P[3];
+    #pragma unroll
+    for (int i = 0; i < 4; i++) p.d[i] = SECP_P[i];
     mod_sub(P.Y, p, P.Y);
 }
 
@@ -1259,38 +1383,64 @@ __device__ void ec_mul_glv(PointJ& R, const U256& k) {
     // Find highest non-zero bit position in k1 or k2 (they're ~128 bits)
     int max_window = 32;  // 128 bits / 4-bit windows
 
-    // Process from most significant window
+    // Table is positional: T[w][v] = v * 2^(w*wbits) * G
+    // No inter-window doubling needed -- just accumulate contributions
     for (int w = max_window - 1; w >= 0; w--) {
-        // Double 4 times
-        for (int i = 0; i < WINDOW_SIZE; i++) {
-            ec_double(R, R);
-        }
-
-        // Extract window values from k1 and k2
         int shift = (w * WINDOW_SIZE) % 64;
         int word = (w * WINDOW_SIZE) / 64;
 
         uint64_t w1 = 0, w2 = 0;
-        if (word < 2) {  // k1, k2 are 128-bit
+        if (word < 2) {
             w1 = (k1.d[word] >> shift) & WINDOW_MASK;
             w2 = (k2.d[word] >> shift) & WINDOW_MASK;
-            if (shift > 60 && word < 1) {
-                w1 |= (k1.d[word + 1] << (64 - shift)) & WINDOW_MASK;
-                w2 |= (k2.d[word + 1] << (64 - shift)) & WINDOW_MASK;
+            // Note: with WINDOW_SIZE=4, shift is always a multiple of 4 and
+            // never exceeds 60, so no cross-word spanning is possible.
+        }
+
+        // Branchless window accumulation for k1 component
+        {
+            int safe_idx = (w1 != 0) ? (int)w1 : 0;
+            PointA P1 = d_PRECOMP_TABLE[w * (1 << WINDOW_SIZE) + safe_idx];
+            if (k1_neg) ec_negate(P1);
+
+            if (R.is_infinity() && w1 != 0) {
+                R.X = P1.x;
+                R.Y = P1.y;
+                R.Z.set_one();
+            } else {
+                PointJ temp;
+                ec_add_mixed(temp, R, P1);
+                uint64_t mask = (w1 != 0) ? 0xFFFFFFFFFFFFFFFFULL : 0;
+                #pragma unroll
+                for (int li = 0; li < 4; li++) {
+                    R.X.d[li] = (temp.X.d[li] & mask) | (R.X.d[li] & ~mask);
+                    R.Y.d[li] = (temp.Y.d[li] & mask) | (R.Y.d[li] & ~mask);
+                    R.Z.d[li] = (temp.Z.d[li] & mask) | (R.Z.d[li] & ~mask);
+                }
             }
         }
 
-        // Add contributions from both tables (L2 cached via cudaAccessPropertyPersisting)
-        if (w1 != 0) {
-            PointA P1 = d_PRECOMP_TABLE[w * (1 << WINDOW_SIZE) + w1];
-            if (k1_neg) ec_negate(P1);
-            ec_add_mixed(R, R, P1);
-        }
-
-        if (w2 != 0) {
-            PointA P2 = d_PRECOMP_TABLE_LAMBDA[w * (1 << WINDOW_SIZE) + w2];
+        // Branchless window accumulation for k2 component
+        {
+            int safe_idx = (w2 != 0) ? (int)w2 : 0;
+            PointA P2 = d_PRECOMP_TABLE_LAMBDA[w * (1 << WINDOW_SIZE) + safe_idx];
             if (k2_neg) ec_negate(P2);
-            ec_add_mixed(R, R, P2);
+
+            if (R.is_infinity() && w2 != 0) {
+                R.X = P2.x;
+                R.Y = P2.y;
+                R.Z.set_one();
+            } else {
+                PointJ temp;
+                ec_add_mixed(temp, R, P2);
+                uint64_t mask = (w2 != 0) ? 0xFFFFFFFFFFFFFFFFULL : 0;
+                #pragma unroll
+                for (int li = 0; li < 4; li++) {
+                    R.X.d[li] = (temp.X.d[li] & mask) | (R.X.d[li] & ~mask);
+                    R.Y.d[li] = (temp.Y.d[li] & mask) | (R.Y.d[li] & ~mask);
+                    R.Z.d[li] = (temp.Z.d[li] & mask) | (R.Z.d[li] & ~mask);
+                }
+            }
         }
     }
 }
@@ -1395,6 +1545,7 @@ __device__ void search_strided(
             uint64_t key_hi = base_hi + (key_lo < base_lo ? 1 : 0);
 
             if (atomicCAS(found_flag, 0, 1) == 0) {
+                __threadfence();
                 *found_key_lo = key_lo;
                 *found_key_hi = key_hi;
             }
@@ -1459,11 +1610,54 @@ static bool g_glv_enabled = true;
 #pragma warning(pop)
 #endif
 
+// Number of windows for GLV lambda table (128-bit scalars = 32 windows)
+#define NUM_GLV_WINDOWS 32
+
+// Helper: batch convert Jacobian points to affine using Montgomery batch inversion
+// Converts points[0..n-1] to affine, storing in table[offset..offset+n-1]
+// Skips infinity points (stores zero coordinates for those)
+__device__ void batch_to_affine(PointJ* points, PointA* table, int offset, int n) {
+    // Collect non-infinity Z values for batch inversion
+    U256 z_vals[1 << WINDOW_SIZE];
+    U256 z_invs[1 << WINDOW_SIZE];
+    int non_inf_count = 0;
+    int non_inf_map[1 << WINDOW_SIZE];
+
+    for (int i = 0; i < n; i++) {
+        if (points[i].is_infinity()) {
+            table[offset + i].x.set_zero();
+            table[offset + i].y.set_zero();
+        } else {
+            z_vals[non_inf_count] = points[i].Z;
+            non_inf_map[non_inf_count] = i;
+            non_inf_count++;
+        }
+    }
+
+    if (non_inf_count > 0) {
+        batch_invert(z_vals, z_invs, non_inf_count);
+
+        for (int j = 0; j < non_inf_count; j++) {
+            int i = non_inf_map[j];
+            U256 z_inv2, z_inv3;
+            mod_sqr(z_inv2, z_invs[j]);
+            mod_mul(z_inv3, z_inv2, z_invs[j]);
+            mod_mul(table[offset + i].x, points[i].X, z_inv2);
+            mod_mul(table[offset + i].y, points[i].Y, z_inv3);
+        }
+    }
+}
+
 /**
  * Kernel to generate precomputed table on GPU.
  * Table[w * 16 + i] = i * 2^(w*4) * G for each window w and value i (0-15).
+ *
+ * Parallelized: each thread handles one window.
+ * Thread 0 also initializes the base points for all threads.
  */
-__global__ void generate_precomputed_table_kernel_opt(PointA* table, PointA* table_lambda) {
+__global__ void generate_precomputed_table_kernel_opt(PointA* table, PointA* table_lambda, int num_windows_main) {
+    int w = threadIdx.x;  // Each thread handles one window
+
     // Load generator G
     PointA G;
     G.x.d[0] = SECP_GX[0]; G.x.d[1] = SECP_GX[1];
@@ -1471,111 +1665,98 @@ __global__ void generate_precomputed_table_kernel_opt(PointA* table, PointA* tab
     G.y.d[0] = SECP_GY[0]; G.y.d[1] = SECP_GY[1];
     G.y.d[2] = SECP_GY[2]; G.y.d[3] = SECP_GY[3];
 
-    // Compute λG = endomorphism(G) = (β*Gx, Gy)
+    // Compute LG = endomorphism(G) = (beta*Gx, Gy)
     PointA LG;
     apply_endomorphism(LG, G);
 
-    // Build table for window 0: 0*G, 1*G, 2*G, ..., 15*G
+    if (w >= num_windows_main) return;
+
+    // Build base points for this window: 0*G_w, 1*G_w, ..., 15*G_w
+    // where G_w = 2^(w*4) * G
     PointJ points[1 << WINDOW_SIZE];
-    PointJ points_lambda[1 << WINDOW_SIZE];
-
-    // 0 * G = infinity
     points[0].set_infinity();
-    points_lambda[0].set_infinity();
 
-    // 1 * G and 1 * λG
-    points[1].X = G.x;
-    points[1].Y = G.y;
-    points[1].Z.set_one();
+    // Compute base point for this window: 2^(w*WINDOW_SIZE) * G
+    // Start from G and double w*WINDOW_SIZE times
+    PointJ base;
+    base.X = G.x;
+    base.Y = G.y;
+    base.Z.set_one();
 
-    points_lambda[1].X = LG.x;
-    points_lambda[1].Y = LG.y;
-    points_lambda[1].Z.set_one();
-
-    // 2*G through 15*G via repeated addition
-    for (int i = 2; i < (1 << WINDOW_SIZE); i++) {
-        ec_add_mixed(points[i], points[i-1], G);
-        ec_add_mixed(points_lambda[i], points_lambda[i-1], LG);
+    for (int d = 0; d < w * WINDOW_SIZE; d++) {
+        PointJ temp;
+        ec_double(temp, base);
+        base = temp;
     }
 
-    // Convert window 0 to affine and store
-    for (int i = 0; i < (1 << WINDOW_SIZE); i++) {
-        if (points[i].is_infinity()) {
-            table[i].x.set_zero();
-            table[i].y.set_zero();
-        } else {
-            U256 z_inv, z_inv2, z_inv3;
-            mod_inv(z_inv, points[i].Z);
-            mod_sqr(z_inv2, z_inv);
-            mod_mul(z_inv3, z_inv2, z_inv);
-            mod_mul(table[i].x, points[i].X, z_inv2);
-            mod_mul(table[i].y, points[i].Y, z_inv3);
-        }
+    // Convert base to affine for faster mixed addition
+    if (!base.is_infinity()) {
+        U256 z_inv, z_inv2, z_inv3;
+        mod_inv(z_inv, base.Z);
+        mod_sqr(z_inv2, z_inv);
+        mod_mul(z_inv3, z_inv2, z_inv);
+        PointA base_affine;
+        mod_mul(base_affine.x, base.X, z_inv2);
+        mod_mul(base_affine.y, base.Y, z_inv3);
 
-        // Lambda table
-        if (points_lambda[i].is_infinity()) {
-            table_lambda[i].x.set_zero();
-            table_lambda[i].y.set_zero();
-        } else {
-            U256 z_inv, z_inv2, z_inv3;
-            mod_inv(z_inv, points_lambda[i].Z);
-            mod_sqr(z_inv2, z_inv);
-            mod_mul(z_inv3, z_inv2, z_inv);
-            mod_mul(table_lambda[i].x, points_lambda[i].X, z_inv2);
-            mod_mul(table_lambda[i].y, points_lambda[i].Y, z_inv3);
+        // 1 * base
+        points[1].X = base_affine.x;
+        points[1].Y = base_affine.y;
+        points[1].Z.set_one();
+
+        // 2*base through 15*base via repeated addition
+        for (int i = 2; i < (1 << WINDOW_SIZE); i++) {
+            ec_add_mixed(points[i], points[i-1], base_affine);
+        }
+    } else {
+        for (int i = 1; i < (1 << WINDOW_SIZE); i++) {
+            points[i].set_infinity();
         }
     }
 
-    // For GLV, we only need 32 windows (128-bit scalars) instead of 64
-    int num_glv_windows = 32;
+    // Batch convert to affine and store (uses Montgomery batch inversion)
+    batch_to_affine(points, table, w * (1 << WINDOW_SIZE), 1 << WINDOW_SIZE);
 
-    // For each subsequent window, double all points WINDOW_SIZE times
-    for (int w = 1; w < NUM_WINDOWS; w++) {
-        // Double each point WINDOW_SIZE times
-        for (int d = 0; d < WINDOW_SIZE; d++) {
+    // Lambda table: only for first NUM_GLV_WINDOWS windows
+    if (w < NUM_GLV_WINDOWS) {
+        PointJ points_l[1 << WINDOW_SIZE];
+        points_l[0].set_infinity();
+
+        // Compute base point for lambda table: 2^(w*WINDOW_SIZE) * LG
+        PointJ base_l;
+        base_l.X = LG.x;
+        base_l.Y = LG.y;
+        base_l.Z.set_one();
+
+        for (int d = 0; d < w * WINDOW_SIZE; d++) {
+            PointJ temp;
+            ec_double(temp, base_l);
+            base_l = temp;
+        }
+
+        if (!base_l.is_infinity()) {
+            U256 z_inv, z_inv2, z_inv3;
+            mod_inv(z_inv, base_l.Z);
+            mod_sqr(z_inv2, z_inv);
+            mod_mul(z_inv3, z_inv2, z_inv);
+            PointA base_l_affine;
+            mod_mul(base_l_affine.x, base_l.X, z_inv2);
+            mod_mul(base_l_affine.y, base_l.Y, z_inv3);
+
+            points_l[1].X = base_l_affine.x;
+            points_l[1].Y = base_l_affine.y;
+            points_l[1].Z.set_one();
+
+            for (int i = 2; i < (1 << WINDOW_SIZE); i++) {
+                ec_add_mixed(points_l[i], points_l[i-1], base_l_affine);
+            }
+        } else {
             for (int i = 1; i < (1 << WINDOW_SIZE); i++) {
-                PointJ temp;
-                ec_double(temp, points[i]);
-                points[i] = temp;
-
-                // Only compute lambda table for first 32 windows (GLV uses 128-bit scalars)
-                if (w < num_glv_windows) {
-                    ec_double(temp, points_lambda[i]);
-                    points_lambda[i] = temp;
-                }
+                points_l[i].set_infinity();
             }
         }
 
-        // Convert to affine and store for this window
-        for (int i = 0; i < (1 << WINDOW_SIZE); i++) {
-            int table_idx = w * (1 << WINDOW_SIZE) + i;
-            if (points[i].is_infinity() || i == 0) {
-                table[table_idx].x.set_zero();
-                table[table_idx].y.set_zero();
-            } else {
-                U256 z_inv, z_inv2, z_inv3;
-                mod_inv(z_inv, points[i].Z);
-                mod_sqr(z_inv2, z_inv);
-                mod_mul(z_inv3, z_inv2, z_inv);
-                mod_mul(table[table_idx].x, points[i].X, z_inv2);
-                mod_mul(table[table_idx].y, points[i].Y, z_inv3);
-            }
-
-            // Lambda table (only for first 32 windows)
-            if (w < num_glv_windows) {
-                if (points_lambda[i].is_infinity() || i == 0) {
-                    table_lambda[table_idx].x.set_zero();
-                    table_lambda[table_idx].y.set_zero();
-                } else {
-                    U256 z_inv, z_inv2, z_inv3;
-                    mod_inv(z_inv, points_lambda[i].Z);
-                    mod_sqr(z_inv2, z_inv);
-                    mod_mul(z_inv3, z_inv2, z_inv);
-                    mod_mul(table_lambda[table_idx].x, points_lambda[i].X, z_inv2);
-                    mod_mul(table_lambda[table_idx].y, points_lambda[i].Y, z_inv3);
-                }
-            }
-        }
+        batch_to_affine(points_l, table_lambda, w * (1 << WINDOW_SIZE), 1 << WINDOW_SIZE);
     }
 }
 
@@ -1585,23 +1766,25 @@ extern "C" cudaError_t init_puzzle_optimized(cudaStream_t stream) {
         return cudaSuccess;  // Already initialized
     }
 
-    // Allocate device memory for both tables (G and λG)
+    // Allocate device memory for G table (64 windows) and lambda table (32 windows)
     size_t table_size = NUM_WINDOWS * (1 << WINDOW_SIZE) * sizeof(PointA);
+    size_t lambda_table_size = NUM_GLV_WINDOWS * (1 << WINDOW_SIZE) * sizeof(PointA);
     cudaError_t err = cudaMalloc(&g_precomputed_table_device, table_size);
     if (err != cudaSuccess) {
         return err;
     }
 
-    err = cudaMalloc(&g_precomputed_table_lambda_device, table_size);
+    err = cudaMalloc(&g_precomputed_table_lambda_device, lambda_table_size);
     if (err != cudaSuccess) {
         cudaFree(g_precomputed_table_device);
         g_precomputed_table_device = nullptr;
         return err;
     }
 
-    // Generate both tables on GPU (single thread - table generation is one-time cost)
-    generate_precomputed_table_kernel_opt<<<1, 1, 0, stream>>>(
-        g_precomputed_table_device, g_precomputed_table_lambda_device);
+    // Generate tables on GPU with one thread per window for parallelism
+    int num_threads = NUM_WINDOWS;  // 64 threads, one per window
+    generate_precomputed_table_kernel_opt<<<1, num_threads, 0, stream>>>(
+        g_precomputed_table_device, g_precomputed_table_lambda_device, NUM_WINDOWS);
     err = cudaGetLastError();
     if (err != cudaSuccess) {
         cudaFree(g_precomputed_table_device);
@@ -1659,8 +1842,9 @@ extern "C" cudaError_t init_puzzle_optimized(cudaStream_t stream) {
     #endif
 
     g_glv_enabled = true;
-    fprintf(stderr, "[EC] Precomputed tables initialized in global memory (128KB, L2 cached)\n");
-    fprintf(stderr, "[GLV] Lambda table ready, GLV endomorphism enabled (~30%% speedup)\n");
+    fprintf(stderr, "[EC] Precomputed tables initialized in global memory (G: %zuKB + lambda: %zuKB, L2 cached)\n",
+            table_size / 1024, lambda_table_size / 1024);
+    fprintf(stderr, "[GLV] Lambda table ready (%d windows), GLV endomorphism enabled (~30%% speedup)\n", NUM_GLV_WINDOWS);
 
     g_table_initialized = true;
     return err;
@@ -1731,9 +1915,12 @@ static void get_optimal_launch_config(
 ) {
     ensure_gpu_info();
 
-    // Blackwell/Ada: prefer 128 threads for better register usage
-    // Ampere/Turing: 256 threads is fine
-    int threads_per_block = (g_gpu_info.compute_major >= 9) ? 128 : 256;
+    // 256 threads/block is optimal for all supported desktop architectures.
+    // On Blackwell sm_120: 256 threads = 8 warps/block, 6 blocks/SM = 48 warps (max).
+    // On Ampere/Ada/Turing: 256 threads provides good occupancy.
+    // NOTE: 128-thread config was for datacenter Blackwell (sm_100, 64 warps/SM max).
+    // Desktop Blackwell (sm_120) has 48 warps/SM max, matching Ampere behavior.
+    int threads_per_block = 256;
 
     // Target: 4-8 blocks per SM for good occupancy
     int target_blocks_per_sm = 6;

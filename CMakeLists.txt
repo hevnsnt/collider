@@ -23,7 +23,7 @@ if(WIN32 AND NOT DEFINED CMAKE_TOOLCHAIN_FILE)
         FetchContent_Declare(
             vcpkg
             GIT_REPOSITORY https://github.com/microsoft/vcpkg.git
-            GIT_TAG 2024.01.12
+            GIT_TAG 2025.01.13
             GIT_SHALLOW TRUE
             SOURCE_DIR ${CMAKE_SOURCE_DIR}/vcpkg
         )
@@ -54,10 +54,10 @@ if(APPLE)
     project(collider LANGUAGES C CXX OBJCXX)
 elseif(WIN32)
     set(COLLIDER_PLATFORM_WINDOWS TRUE)
-    project(collider LANGUAGES C CXX CUDA)
+    project(collider LANGUAGES C CXX)
 else()
     set(COLLIDER_PLATFORM_LINUX TRUE)
-    project(collider LANGUAGES C CXX CUDA)
+    project(collider LANGUAGES C CXX)
 endif()
 
 set(CMAKE_CXX_STANDARD 20)
@@ -77,6 +77,7 @@ option(COLLIDER_BUILD_TOOLS "Build CLI tools" ON)
 # Backend Detection
 # ============================================================================
 set(COLLIDER_BACKEND "CPU")  # Default
+set(ARCH "x86_64")           # Default; overridden on Apple Silicon
 
 if(APPLE AND COLLIDER_USE_METAL)
     # macOS: Use Metal
@@ -107,13 +108,16 @@ elseif(COLLIDER_USE_CUDA)
         set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
         # Detect GPU architecture
-        # RTX 5090 (Blackwell): SM 10.0
-        # RTX 4090 (Ada): SM 8.9
+        # RTX PRO 6000 / RTX 5090 (Blackwell Desktop): SM 12.0
+        # RTX 4090 (Ada Lovelace): SM 8.9
         # RTX 3060/3070/3080/3090 (Ampere): SM 8.6
-        # We compile for all to support various cards
+        # RTX 2060/2070/2080 (Turing): SM 7.5
+        # NOTE: SM 10.0 is datacenter Blackwell (B100/B200), NOT desktop
         if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-            # Check if we can detect the GPU
-            set(CMAKE_CUDA_ARCHITECTURES "86;89;100")
+            # Consumer GPU architectures only:
+            # 75 = Turing (RTX 2060-2080), 86 = Ampere (RTX 3060-3090)
+            # 89 = Ada Lovelace (RTX 4090), 120 = Blackwell Desktop (RTX 5090/PRO 6000)
+            set(CMAKE_CUDA_ARCHITECTURES "75;86;89;120")
             message(STATUS "Compiling for CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
         endif()
 
@@ -127,17 +131,14 @@ elseif(COLLIDER_USE_CUDA)
 
         # CUDA optimization flags - aggressive optimization for compute-bound kernels
         set(CMAKE_CUDA_FLAGS_RELEASE "-O3 --use_fast_math -DNDEBUG")
-        # Additional CUDA optimizations for high-performance computing
-        set(CMAKE_CUDA_FLAGS_RELEASE "${CMAKE_CUDA_FLAGS_RELEASE} --extra-device-vectorization")
-        set(CMAKE_CUDA_FLAGS_RELEASE "${CMAKE_CUDA_FLAGS_RELEASE} --restrict")
-        set(CMAKE_CUDA_FLAGS_RELEASE "${CMAKE_CUDA_FLAGS_RELEASE} --fmad=true")
-        # Lineinfo for profiling (minimal overhead, enables nsys/ncu profiling)
-        set(CMAKE_CUDA_FLAGS_RELEASE "${CMAKE_CUDA_FLAGS_RELEASE} -lineinfo")
+        # --use_fast_math implies --fmad=true, --prec-div=false, --prec-sqrt=false
+        # Safe for this workload: all cryptographic operations are integer-based
+        set(CMAKE_CUDA_FLAGS_RELEASE "${CMAKE_CUDA_FLAGS_RELEASE} --extra-device-vectorization --restrict -lineinfo")
         # Suppress deprecated GPU architecture warnings (for older GPUs like GTX 9xx)
         set(CMAKE_CUDA_FLAGS_RELEASE "${CMAKE_CUDA_FLAGS_RELEASE} -Wno-deprecated-gpu-targets")
 
         # Debug/Profile build for detailed profiling
-        set(CMAKE_CUDA_FLAGS_RELWITHDEBINFO "-O2 -g -G -lineinfo --use_fast_math")
+        set(CMAKE_CUDA_FLAGS_RELWITHDEBINFO "-O2 -g -lineinfo --use_fast_math")
 
         if(WIN32)
             add_compile_definitions(COLLIDER_PLATFORM_WINDOWS=1)
@@ -168,7 +169,8 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release")
     if(APPLE)
         set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
         if(ARCH STREQUAL "arm64")
-            set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -mcpu=apple-m1")
+            # Use native CPU architecture for optimal performance on any Apple Silicon
+            set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -mcpu=native")
         endif()
     elseif(MSVC)
         set(CMAKE_CXX_FLAGS_RELEASE "/O2 /DNDEBUG /arch:AVX2 /GL /EHsc")
@@ -255,6 +257,7 @@ FetchContent_Declare(
     xxhash
     GIT_REPOSITORY https://github.com/Cyan4973/xxHash.git
     GIT_TAG v0.8.2
+    GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(xxhash)
 # xxHash is header-only, just need include path
@@ -267,9 +270,8 @@ if(APPLE AND COLLIDER_BACKEND STREQUAL "METAL")
 endif()
 
 # ============================================================================
-# Include Directories
+# Include Directories (applied per-target below via target_include_directories)
 # ============================================================================
-include_directories(${CMAKE_SOURCE_DIR}/src)
 
 # ============================================================================
 # Platform Abstraction Library
@@ -288,6 +290,7 @@ endif()
 
 if(COLLIDER_BACKEND STREQUAL "METAL")
     add_library(collider_platform STATIC ${PLATFORM_SOURCES})
+    target_include_directories(collider_platform PUBLIC ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(collider_platform
         ${METAL_LIBRARY}
         ${FOUNDATION_LIBRARY}
@@ -298,6 +301,7 @@ if(COLLIDER_BACKEND STREQUAL "METAL")
     )
 elseif(COLLIDER_BACKEND STREQUAL "CUDA")
     add_library(collider_platform STATIC ${PLATFORM_SOURCES})
+    target_include_directories(collider_platform PUBLIC ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(collider_platform
         CUDA::cudart
         Threads::Threads
@@ -310,6 +314,7 @@ elseif(COLLIDER_BACKEND STREQUAL "CUDA")
     )
 else()
     add_library(collider_platform STATIC ${PLATFORM_SOURCES})
+    target_include_directories(collider_platform PUBLIC ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(collider_platform
         Threads::Threads
     )
@@ -317,35 +322,17 @@ endif()
 
 # ============================================================================
 # Core Library (CPU-side intelligence layer)
+# Free edition has no core sources; INTERFACE library propagates dependencies
 # ============================================================================
-set(CORE_SOURCES
+add_library(collider_core INTERFACE)
+target_link_libraries(collider_core INTERFACE
+    collider_platform
+    Threads::Threads
 )
-
-# Check if source files exist
-foreach(SRC ${CORE_SOURCES})
-    if(NOT EXISTS "${CMAKE_SOURCE_DIR}/${SRC}")
-        list(REMOVE_ITEM CORE_SOURCES ${SRC})
-    endif()
-endforeach()
-
-if(CORE_SOURCES)
-    add_library(collider_core STATIC ${CORE_SOURCES})
-    target_link_libraries(collider_core
-        collider_platform
-        Threads::Threads
-    )
-    target_include_directories(collider_core PUBLIC ${XXHASH_INCLUDE_DIR})
-    
-else()
-    # Create empty library if no sources exist yet
-    add_library(collider_core INTERFACE)
-    target_link_libraries(collider_core INTERFACE
-        collider_platform
-        Threads::Threads
-    )
-    target_include_directories(collider_core INTERFACE ${XXHASH_INCLUDE_DIR})
-    
-endif()
+target_include_directories(collider_core INTERFACE
+    ${CMAKE_SOURCE_DIR}/src
+    ${XXHASH_INCLUDE_DIR}
+)
 
 # ============================================================================
 # Pool Client Library (Network-based distributed solving)
@@ -427,6 +414,7 @@ if(COLLIDER_BACKEND STREQUAL "CUDA")
 
     if(EXISTING_GPU_SOURCES)
         add_library(collider_gpu STATIC ${EXISTING_GPU_SOURCES})
+        target_include_directories(collider_gpu PRIVATE ${CMAKE_SOURCE_DIR}/src)
         target_link_libraries(collider_gpu
             CUDA::cudart
         )
@@ -472,6 +460,7 @@ if(COLLIDER_BUILD_TOOLS)
         add_executable(test_banner
             src/tools/test_banner.cpp
         )
+        target_include_directories(test_banner PRIVATE ${CMAKE_SOURCE_DIR}/src)
         target_link_libraries(test_banner
             Threads::Threads
         )
@@ -518,6 +507,7 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/src/main.cpp")
     # Free Edition Executable
     # ========================================================================
     add_executable(collider ${SHARED_SOURCES})
+    target_include_directories(collider PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_compile_definitions(collider PRIVATE COLLIDER_FREE=1)
     target_link_libraries(collider ${MAIN_LIBS})
     
@@ -550,6 +540,7 @@ if(COLLIDER_BUILD_TESTS)
     # Platform tests
     if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_platform.cpp")
         add_executable(test_platform tests/test_platform.cpp)
+        target_include_directories(test_platform PRIVATE ${CMAKE_SOURCE_DIR}/src)
         target_link_libraries(test_platform collider_platform Threads::Threads)
         if(COLLIDER_BACKEND STREQUAL "CUDA")
             target_link_libraries(test_platform CUDA::cudart)
@@ -562,6 +553,7 @@ if(COLLIDER_BUILD_TESTS)
     # Hash function verification tests
     if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_hash_vectors.cpp")
         add_executable(test_hash_vectors tests/test_hash_vectors.cpp)
+        target_include_directories(test_hash_vectors PRIVATE ${CMAKE_SOURCE_DIR}/src)
         target_link_libraries(test_hash_vectors Threads::Threads)
         add_test(NAME HashVectors COMMAND test_hash_vectors)
     endif()

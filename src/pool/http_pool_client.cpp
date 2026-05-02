@@ -96,6 +96,8 @@ void HTTPPoolClient::disconnect() {
     if (poll_thread_.joinable()) {
         poll_thread_.join();
     }
+
+    close_persistent_socket();
 }
 
 bool HTTPPoolClient::is_connected() const {
@@ -123,11 +125,19 @@ bool HTTPPoolClient::authenticate(const std::string& worker_name, const std::str
     // Extract token from response (simple parsing)
     size_t token_pos = response.find("\"token\"");
     if (token_pos != std::string::npos) {
-        size_t start = response.find("\"", token_pos + 7) + 1;
-        size_t end = response.find("\"", start);
-        if (start != std::string::npos && end != std::string::npos) {
-            auth_token_ = response.substr(start, end - start);
+        size_t quote1 = response.find("\"", token_pos + 7);
+        if (quote1 != std::string::npos) {
+            size_t start = quote1 + 1;
+            size_t end = response.find("\"", start);
+            if (end != std::string::npos) {
+                auth_token_ = response.substr(start, end - start);
+            }
         }
+    }
+
+    if (auth_token_.empty()) {
+        std::cerr << "[HTTPPool] Authentication failed: no token in response" << std::endl;
+        return false;
     }
 
     std::cout << "[HTTPPool] Authenticated as " << worker_name << std::endl;
@@ -261,10 +271,30 @@ std::string HTTPPoolClient::http_post(const std::string& endpoint, const std::st
     return make_request("POST", endpoint, body);
 }
 
-std::string HTTPPoolClient::make_request(const std::string& method,
-                                         const std::string& endpoint,
-                                         const std::string& body) {
-    // Resolve hostname
+bool HTTPPoolClient::is_socket_alive(socket_t sock) {
+    if (sock == INVALID_SOCK) return false;
+
+    // Check if socket is still connected using a zero-byte peek
+    char buf;
+#ifdef _WIN32
+    int result = recv(sock, &buf, 1, MSG_PEEK);
+    if (result == SOCK_ERROR) {
+        int err = WSAGetLastError();
+        // WSAEWOULDBLOCK means socket is alive but no data ready
+        return (err == WSAEWOULDBLOCK || err == WSAETIMEDOUT);
+    }
+#else
+    int result = recv(sock, &buf, 1, MSG_PEEK | MSG_DONTWAIT);
+    if (result == -1) {
+        // EAGAIN/EWOULDBLOCK means socket is alive but no data ready
+        return (errno == EAGAIN || errno == EWOULDBLOCK);
+    }
+#endif
+    // result == 0 means peer closed connection
+    return (result > 0);
+}
+
+socket_t HTTPPoolClient::connect_to_server() {
     struct addrinfo hints, *result;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_INET;
@@ -272,14 +302,13 @@ std::string HTTPPoolClient::make_request(const std::string& method,
 
     std::string port_str = std::to_string(port_);
     if (getaddrinfo(host_.c_str(), port_str.c_str(), &hints, &result) != 0) {
-        return "";
+        return INVALID_SOCK;
     }
 
-    // Create socket
     socket_t sock = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
     if (sock == INVALID_SOCK) {
         freeaddrinfo(result);
-        return "";
+        return INVALID_SOCK;
     }
 
     // Set timeout
@@ -295,21 +324,54 @@ std::string HTTPPoolClient::make_request(const std::string& method,
     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 #endif
 
-    // Connect
     if (::connect(sock, result->ai_addr, (int)result->ai_addrlen) == SOCK_ERROR) {
         freeaddrinfo(result);
         closesocket(sock);
-        return "";
+        return INVALID_SOCK;
     }
     freeaddrinfo(result);
+    return sock;
+}
 
-    // Build HTTP request
+void HTTPPoolClient::close_persistent_socket() {
+    std::lock_guard<std::mutex> lock(socket_mutex_);
+    if (persistent_socket_ != INVALID_SOCK) {
+        closesocket(persistent_socket_);
+        persistent_socket_ = INVALID_SOCK;
+    }
+}
+
+std::string HTTPPoolClient::make_request(const std::string& method,
+                                         const std::string& endpoint,
+                                         const std::string& body) {
+    std::lock_guard<std::mutex> lock(socket_mutex_);
+
+    // Check if persistent connection is still alive and not timed out
+    auto now = std::chrono::steady_clock::now();
+    bool need_reconnect = (persistent_socket_ == INVALID_SOCK);
+    if (!need_reconnect) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_request_time_).count();
+        if (elapsed > KEEPALIVE_TIMEOUT_SEC || !is_socket_alive(persistent_socket_)) {
+            closesocket(persistent_socket_);
+            persistent_socket_ = INVALID_SOCK;
+            need_reconnect = true;
+        }
+    }
+
+    if (need_reconnect) {
+        persistent_socket_ = connect_to_server();
+        if (persistent_socket_ == INVALID_SOCK) {
+            return "";
+        }
+    }
+
+    // Build HTTP request with keep-alive
     std::stringstream request;
     request << method << " " << config_.base_url << endpoint << " HTTP/1.1\r\n";
     request << "Host: " << host_ << "\r\n";
-    request << "User-Agent: collider-pro/1.0\r\n";
+    request << "User-Agent: collider/1.0\r\n";
     request << "Accept: application/json\r\n";
-    request << "Connection: close\r\n";
+    request << "Connection: keep-alive\r\n";
 
     if (!auth_token_.empty()) {
         request << "Authorization: Bearer " << auth_token_ << "\r\n";
@@ -329,21 +391,80 @@ std::string HTTPPoolClient::make_request(const std::string& method,
     std::string request_str = request.str();
 
     // Send request
-    if (send(sock, request_str.c_str(), (int)request_str.size(), 0) == SOCK_ERROR) {
-        closesocket(sock);
-        return "";
+    if (send(persistent_socket_, request_str.c_str(), (int)request_str.size(), 0) == SOCK_ERROR) {
+        // Connection broken, close and retry once
+        closesocket(persistent_socket_);
+        persistent_socket_ = connect_to_server();
+        if (persistent_socket_ == INVALID_SOCK) {
+            return "";
+        }
+        if (send(persistent_socket_, request_str.c_str(), (int)request_str.size(), 0) == SOCK_ERROR) {
+            closesocket(persistent_socket_);
+            persistent_socket_ = INVALID_SOCK;
+            return "";
+        }
     }
 
-    // Receive response
+    last_request_time_ = std::chrono::steady_clock::now();
+
+    // Receive response headers first, then body based on Content-Length
     std::string response;
     char buffer[4096];
     int received;
-    while ((received = recv(sock, buffer, sizeof(buffer) - 1, 0)) > 0) {
+    while ((received = recv(persistent_socket_, buffer, sizeof(buffer) - 1, 0)) > 0) {
         buffer[received] = '\0';
         response += buffer;
+
+        // Check if we have received complete headers + body
+        size_t header_end = response.find("\r\n\r\n");
+        if (header_end != std::string::npos) {
+            // Check for Content-Length to know when body is complete
+            size_t cl_pos = response.find("Content-Length:");
+            if (cl_pos == std::string::npos) {
+                cl_pos = response.find("content-length:");
+            }
+            if (cl_pos != std::string::npos) {
+                size_t cl_start = cl_pos + 15;
+                while (cl_start < response.size() && response[cl_start] == ' ') cl_start++;
+                size_t cl_end = response.find("\r\n", cl_start);
+                if (cl_end != std::string::npos) {
+                    size_t content_length = std::stoull(response.substr(cl_start, cl_end - cl_start));
+                    size_t body_received = response.size() - (header_end + 4);
+                    if (body_received >= content_length) {
+                        break;  // Complete response received
+                    }
+                }
+            } else {
+                // No Content-Length, check for Connection: close or chunked
+                // For keep-alive without Content-Length, we cannot determine end
+                // Fall back to checking for connection close
+                std::string conn_header;
+                size_t conn_pos = response.find("Connection:");
+                if (conn_pos == std::string::npos) {
+                    conn_pos = response.find("connection:");
+                }
+                if (conn_pos != std::string::npos) {
+                    size_t conn_start = conn_pos + 11;
+                    size_t conn_end = response.find("\r\n", conn_start);
+                    if (conn_end != std::string::npos) {
+                        conn_header = response.substr(conn_start, conn_end - conn_start);
+                    }
+                }
+                if (conn_header.find("close") != std::string::npos) {
+                    // Server will close connection, read until EOF
+                    continue;
+                }
+                // No content-length and keep-alive: assume empty body
+                break;
+            }
+        }
     }
 
-    closesocket(sock);
+    // If recv returned 0 or error, the connection was closed by server
+    if (received <= 0) {
+        closesocket(persistent_socket_);
+        persistent_socket_ = INVALID_SOCK;
+    }
 
     // Extract body from response
     size_t body_start = response.find("\r\n\r\n");

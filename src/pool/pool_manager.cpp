@@ -67,9 +67,12 @@ bool PoolManager::connect() {
     });
 
     client_->set_work_callback([this](const WorkAssignment& work) {
-        std::lock_guard<std::mutex> lock(work_mutex_);
-        current_work_ = work;
-        has_work_ = true;
+        {
+            std::lock_guard<std::mutex> lock(work_mutex_);
+            current_work_ = work;
+            has_work_ = true;
+        }
+        work_cv_.notify_all();
         std::cout << "[PoolManager] Received new work: " << work.puzzle_name
                   << " (DP bits: " << work.dp_bits << ")" << std::endl;
     });
@@ -145,7 +148,12 @@ void PoolManager::submit_dp(const DistinguishedPoint& dp) {
         return;
     }
 
-    client_->submit_dp(dp);
+    {
+        std::lock_guard<std::mutex> lock(client_mutex_);
+        if (client_) {
+            client_->submit_dp(dp);
+        }
+    }
     submitted_count_++;
 }
 
@@ -216,8 +224,11 @@ bool parse_pool_url(const std::string& url, PoolConfig& config) {
     // http://host:port/path - HTTP without TLS
     // https://host:port/path - HTTP with TLS
     // host:port (defaults to JLP without TLS)
+    // jlp://[::1]:port      - IPv6 literal
+    // [::1]:port             - IPv6 literal without scheme
 
-    std::regex url_regex(R"(^(?:([a-z]+)://)?([^:/]+)(?::(\d+))?(/.*)?$)");
+    // Regex handles both IPv4/hostname and IPv6 bracket-literal addresses
+    std::regex url_regex(R"(^(?:([a-z]+)://)?(?:\[([^\]]+)\]|([^:/\[]+))(?::(\d+))?(/.*)?$)");
     std::smatch match;
 
     if (!std::regex_match(url, match, url_regex)) {
@@ -225,9 +236,10 @@ bool parse_pool_url(const std::string& url, PoolConfig& config) {
     }
 
     std::string scheme = match[1].str();
-    config.host = match[2].str();
-    std::string port_str = match[3].str();
-    std::string path = match[4].str();
+    // IPv6 in brackets (group 2) or hostname/IPv4 (group 3)
+    config.host = match[2].str().empty() ? match[3].str() : match[2].str();
+    std::string port_str = match[4].str();
+    std::string path = match[5].str();
 
     // Determine type and TLS from scheme
     config.use_tls = false;
@@ -247,9 +259,14 @@ bool parse_pool_url(const std::string& url, PoolConfig& config) {
         return false;
     }
 
-    // Set port
+    // Set port with validation
     if (!port_str.empty()) {
-        config.port = static_cast<uint16_t>(std::stoi(port_str));
+        int port_val = std::stoi(port_str);
+        if (port_val <= 0 || port_val > 65535) {
+            std::cerr << "[PoolManager] Invalid port number: " << port_val << std::endl;
+            return false;
+        }
+        config.port = static_cast<uint16_t>(port_val);
     } else {
         config.port = PoolConfig::default_port(config.type);
     }

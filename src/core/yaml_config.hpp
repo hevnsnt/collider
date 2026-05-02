@@ -308,12 +308,20 @@ void apply_config_to_args(Arguments& args, const AppConfig& config, bool cli_has
         args.puzzle_checkpoint = config.checkpoint;
     }
 
-    // Apply boolean settings from config (CLI overrides by being explicit)
-    // These are trickier since we can't tell if CLI explicitly set false vs default
-    args.smart_select = config.smart_select;
-    args.puzzle_kangaroo = config.kangaroo;
-    args.puzzle_random = config.random_search;
-    args.puzzle_auto_next = config.auto_next;
+    // Apply boolean settings from config only if CLI didn't explicitly set them.
+    // The cli_explicit_flags set tracks which flags were explicitly provided on the command line.
+    if (args.cli_explicit_flags.find("smart-select") == args.cli_explicit_flags.end()) {
+        args.smart_select = config.smart_select;
+    }
+    if (args.cli_explicit_flags.find("kangaroo") == args.cli_explicit_flags.end()) {
+        args.puzzle_kangaroo = config.kangaroo;
+    }
+    if (args.cli_explicit_flags.find("random") == args.cli_explicit_flags.end()) {
+        args.puzzle_random = config.random_search;
+    }
+    if (args.cli_explicit_flags.find("auto-next") == args.cli_explicit_flags.end()) {
+        args.puzzle_auto_next = config.auto_next;
+    }
 
 
 
@@ -344,6 +352,8 @@ void apply_config_to_args(Arguments& args, const AppConfig& config, bool cli_has
  * Strategy:
  *  - If ./config.yml exists, update/add the pool.worker line in-place.
  *  - Otherwise, create ./config.yml with a minimal pool section.
+ *
+ * TODO: Move to yaml_config.cpp to reduce header bloat.
  */
 inline bool save_worker_config(const std::string& worker) {
     const std::string config_path = "./config.yml";
@@ -443,6 +453,8 @@ inline bool save_worker_config(const std::string& worker) {
 
 /**
  * Save pool URL and worker address to config file.
+ *
+ * TODO: Move to yaml_config.cpp to reduce header bloat.
  */
 inline bool save_pool_config(const std::string& url, const std::string& worker) {
     const std::string config_path = "./config.yml";

@@ -112,6 +112,16 @@ private:
     std::thread poll_thread_;
     void poll_loop();
 
+    // Persistent connection for HTTP keep-alive
+    socket_t persistent_socket_ = -1;
+    std::chrono::steady_clock::time_point last_request_time_;
+    std::mutex socket_mutex_;
+    static constexpr int KEEPALIVE_TIMEOUT_SEC = 30;
+
+    bool is_socket_alive(socket_t sock);
+    socket_t connect_to_server();
+    void close_persistent_socket();
+
     // HTTP helpers
     std::string http_get(const std::string& endpoint);
     std::string http_post(const std::string& endpoint, const std::string& body);

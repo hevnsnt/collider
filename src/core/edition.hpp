@@ -34,14 +34,6 @@
 // Feature Check Macros
 // ============================================================================
 
-#define COLLIDER_REQUIRE_PRO(feature_name) \
-    do { \
-        if (!COLLIDER_HAS_##feature_name) { \
-            std::cerr << "[*] " #feature_name " requires collider pro — collisionprotocol.com/pro\n"; \
-            return 1; \
-        } \
-    } while(0)
-
 #define COLLIDER_FEATURE_AVAILABLE(feature_name) (COLLIDER_HAS_##feature_name)
 
 // ============================================================================

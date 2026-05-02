@@ -67,56 +67,21 @@ __device__ __forceinline__ uint32_t gamma1(uint32_t x) {
 }
 
 /**
- * SHA256 hash of a single message.
+ * Compress a single 64-byte block into the SHA256 state.
  *
- * @param message Input message bytes
- * @param len Message length (max 55 bytes for single block)
- * @param hash Output 32-byte hash
+ * @param H   Running hash state (8 x uint32_t), updated in-place
+ * @param block  64-byte input block
  */
-__device__ void sha256_hash(
-    const uint8_t* message,
-    size_t len,
-    uint8_t* hash
-) {
+__device__ void sha256_compress_block(uint32_t H[8], const uint8_t block[64]) {
     uint32_t W[64];
-    uint32_t H[8];
-
-    // Initialize hash values
-    #pragma unroll
-    for (int i = 0; i < 8; i++) {
-        H[i] = SHA256_H0[i];
-    }
-
-    // Prepare message block with padding
-    // For simplicity, assume single block (len <= 55)
-    uint8_t block[64] = {0};
-
-    // Copy message
-    for (size_t i = 0; i < len && i < 55; i++) {
-        block[i] = message[i];
-    }
-
-    // Append 1 bit
-    block[len] = 0x80;
-
-    // Append length in bits (big-endian)
-    uint64_t bit_len = len * 8;
-    block[56] = (bit_len >> 56) & 0xff;
-    block[57] = (bit_len >> 48) & 0xff;
-    block[58] = (bit_len >> 40) & 0xff;
-    block[59] = (bit_len >> 32) & 0xff;
-    block[60] = (bit_len >> 24) & 0xff;
-    block[61] = (bit_len >> 16) & 0xff;
-    block[62] = (bit_len >> 8) & 0xff;
-    block[63] = bit_len & 0xff;
 
     // Parse block into 16 32-bit words (big-endian)
     #pragma unroll
     for (int i = 0; i < 16; i++) {
-        W[i] = (block[i*4] << 24) |
-               (block[i*4 + 1] << 16) |
-               (block[i*4 + 2] << 8) |
-               block[i*4 + 3];
+        W[i] = ((uint32_t)block[i*4] << 24) |
+               ((uint32_t)block[i*4 + 1] << 16) |
+               ((uint32_t)block[i*4 + 2] << 8) |
+               (uint32_t)block[i*4 + 3];
     }
 
     // Extend to 64 words
@@ -146,9 +111,83 @@ __device__ void sha256_hash(
         a = t1 + t2;
     }
 
-    // Add to hash
+    // Add compressed chunk to running hash
     H[0] += a; H[1] += b; H[2] += c; H[3] += d;
     H[4] += e; H[5] += f; H[6] += g; H[7] += h;
+}
+
+/**
+ * SHA256 hash of a single message (arbitrary length).
+ *
+ * Handles multi-block processing for messages of any size, including
+ * messages > 55 bytes that require two (or more) padding blocks.
+ *
+ * @param message Input message bytes
+ * @param len Message length in bytes (no limit)
+ * @param hash Output 32-byte hash
+ */
+__device__ void sha256_hash(
+    const uint8_t* message,
+    size_t len,
+    uint8_t* hash
+) {
+    uint32_t H[8];
+
+    // Initialize hash values
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        H[i] = SHA256_H0[i];
+    }
+
+    // Process full 64-byte blocks from the message
+    size_t offset = 0;
+    size_t remaining = len;
+
+    while (remaining >= 64) {
+        uint8_t block[64];
+        for (int i = 0; i < 64; i++) {
+            block[i] = message[offset + i];
+        }
+        sha256_compress_block(H, block);
+        offset += 64;
+        remaining -= 64;
+    }
+
+    // Final block(s) with padding
+    uint8_t block[64];
+    for (int i = 0; i < 64; i++) {
+        block[i] = 0;
+    }
+
+    // Copy remaining message bytes into final block
+    for (size_t i = 0; i < remaining; i++) {
+        block[i] = message[offset + i];
+    }
+
+    // Append the 0x80 padding marker
+    block[remaining] = 0x80;
+
+    if (remaining >= 56) {
+        // Not enough room for the 8-byte length field in this block.
+        // Compress this block and start a fresh one for the length.
+        sha256_compress_block(H, block);
+        for (int i = 0; i < 64; i++) {
+            block[i] = 0;
+        }
+    }
+
+    // Append total message length in bits as big-endian 64-bit integer
+    uint64_t bit_len = (uint64_t)len * 8;
+    block[56] = (uint8_t)(bit_len >> 56);
+    block[57] = (uint8_t)(bit_len >> 48);
+    block[58] = (uint8_t)(bit_len >> 40);
+    block[59] = (uint8_t)(bit_len >> 32);
+    block[60] = (uint8_t)(bit_len >> 24);
+    block[61] = (uint8_t)(bit_len >> 16);
+    block[62] = (uint8_t)(bit_len >> 8);
+    block[63] = (uint8_t)(bit_len);
+
+    sha256_compress_block(H, block);
 
     // Output hash (big-endian)
     #pragma unroll
@@ -189,89 +228,7 @@ __global__ void sha256_batch_kernel(
     sha256_hash(msg, len, out);
 }
 
-/**
- * Multi-block SHA256 for longer messages.
- * Handles messages > 55 bytes.
- */
-__device__ void sha256_hash_long(
-    const uint8_t* message,
-    size_t len,
-    uint8_t* hash
-) {
-    uint32_t H[8];
-
-    // Initialize hash values
-    #pragma unroll
-    for (int i = 0; i < 8; i++) {
-        H[i] = SHA256_H0[i];
-    }
-
-    size_t num_blocks = (len + 9 + 63) / 64;
-    uint8_t block[64];
-
-    for (size_t blk = 0; blk < num_blocks; blk++) {
-        // Prepare block
-        size_t block_start = blk * 64;
-
-        for (int i = 0; i < 64; i++) {
-            size_t pos = block_start + i;
-
-            if (pos < len) {
-                block[i] = message[pos];
-            } else if (pos == len) {
-                block[i] = 0x80;
-            } else if (blk == num_blocks - 1 && i >= 56) {
-                // Length padding in last block
-                uint64_t bit_len = len * 8;
-                int shift = (63 - i) * 8;
-                block[i] = (bit_len >> shift) & 0xff;
-            } else {
-                block[i] = 0;
-            }
-        }
-
-        // Process block
-        uint32_t W[64];
-
-        #pragma unroll
-        for (int i = 0; i < 16; i++) {
-            W[i] = (block[i*4] << 24) |
-                   (block[i*4 + 1] << 16) |
-                   (block[i*4 + 2] << 8) |
-                   block[i*4 + 3];
-        }
-
-        #pragma unroll
-        for (int i = 16; i < 64; i++) {
-            W[i] = gamma1(W[i-2]) + W[i-7] + gamma0(W[i-15]) + W[i-16];
-        }
-
-        uint32_t a = H[0], b = H[1], c = H[2], d = H[3];
-        uint32_t e = H[4], f = H[5], g = H[6], h = H[7];
-
-        // OPTIMIZED: Partial unroll (8 iterations) for reduced register pressure
-        #pragma unroll 8
-        for (int i = 0; i < 64; i++) {
-            uint32_t t1 = h + sigma1(e) + ch(e, f, g) + K[i] + W[i];
-            uint32_t t2 = sigma0(a) + maj(a, b, c);
-
-            h = g; g = f; f = e; e = d + t1;
-            d = c; c = b; b = a; a = t1 + t2;
-        }
-
-        H[0] += a; H[1] += b; H[2] += c; H[3] += d;
-        H[4] += e; H[5] += f; H[6] += g; H[7] += h;
-    }
-
-    // Output
-    #pragma unroll
-    for (int i = 0; i < 8; i++) {
-        hash[i*4]     = (H[i] >> 24) & 0xff;
-        hash[i*4 + 1] = (H[i] >> 16) & 0xff;
-        hash[i*4 + 2] = (H[i] >> 8) & 0xff;
-        hash[i*4 + 3] = H[i] & 0xff;
-    }
-}
+// sha256_hash_long removed: sha256_hash now handles messages of any length.
 
 /**
  * SHA256 kernel for fixed-size 33-byte inputs (compressed public keys).
@@ -302,14 +259,15 @@ __global__ void sha256_pubkey33_kernel(
 
     // First 8 words from pubkey (32 bytes) - big-endian conversion
     // Note: Cannot use vectorized uint32_t loads due to idx*33 misalignment
+    // Cast to uint32_t before shifting to prevent sign extension for bytes >= 0x80
     #pragma unroll
     for (int i = 0; i < 8; i++) {
-        W[i] = (pubkey[i*4] << 24) | (pubkey[i*4 + 1] << 16) |
-               (pubkey[i*4 + 2] << 8) | pubkey[i*4 + 3];
+        W[i] = ((uint32_t)pubkey[i*4] << 24) | ((uint32_t)pubkey[i*4 + 1] << 16) |
+               ((uint32_t)pubkey[i*4 + 2] << 8) | (uint32_t)pubkey[i*4 + 3];
     }
 
     // Word 8: last byte of pubkey + 0x80 + zeros
-    W[8] = (pubkey[32] << 24) | (0x80 << 16);
+    W[8] = ((uint32_t)pubkey[32] << 24) | (0x80u << 16);
 
     // Words 9-13: zeros
     W[9] = 0; W[10] = 0; W[11] = 0; W[12] = 0; W[13] = 0;
@@ -351,7 +309,10 @@ __global__ void sha256_pubkey33_kernel(
 
 /**
  * SHA256 kernel for fixed-size 65-byte inputs (uncompressed public keys).
- * Two-block processing.
+ * Specialized two-block processing -- avoids the generic byte-by-byte loop.
+ *
+ * Block 1: bytes 0-63 (16 words from pubkey)
+ * Block 2: byte 64 + 0x80 padding + zeros + length (65*8=520 bits)
  */
 __global__ void sha256_pubkey65_kernel(
     const uint8_t* __restrict__ pubkeys,
@@ -364,8 +325,71 @@ __global__ void sha256_pubkey65_kernel(
     const uint8_t* pubkey = pubkeys + idx * 65;
     uint8_t* out = hashes + idx * 32;
 
-    // Use the long message hash for 65 bytes
-    sha256_hash_long(pubkey, 65, out);
+    uint32_t H[8];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) H[i] = SHA256_H0[i];
+
+    uint32_t W[64];
+
+    // Block 1: first 64 bytes (words 0-15)
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        W[i] = ((uint32_t)pubkey[i*4] << 24) | ((uint32_t)pubkey[i*4+1] << 16) |
+               ((uint32_t)pubkey[i*4+2] << 8) | (uint32_t)pubkey[i*4+3];
+    }
+
+    #pragma unroll
+    for (int i = 16; i < 64; i++) {
+        W[i] = gamma1(W[i-2]) + W[i-7] + gamma0(W[i-15]) + W[i-16];
+    }
+
+    uint32_t a = H[0], b = H[1], c = H[2], d = H[3];
+    uint32_t e = H[4], f = H[5], g = H[6], h = H[7];
+
+    #pragma unroll 8
+    for (int i = 0; i < 64; i++) {
+        uint32_t t1 = h + sigma1(e) + ch(e, f, g) + K[i] + W[i];
+        uint32_t t2 = sigma0(a) + maj(a, b, c);
+        h = g; g = f; f = e; e = d + t1;
+        d = c; c = b; b = a; a = t1 + t2;
+    }
+
+    H[0] += a; H[1] += b; H[2] += c; H[3] += d;
+    H[4] += e; H[5] += f; H[6] += g; H[7] += h;
+
+    // Block 2: byte 64 + 0x80 padding + zeros + length
+    W[0] = ((uint32_t)pubkey[64] << 24) | (0x80u << 16);
+    #pragma unroll
+    for (int i = 1; i < 14; i++) W[i] = 0;
+    W[14] = 0;
+    W[15] = 520;  // 65 * 8 bits
+
+    #pragma unroll
+    for (int i = 16; i < 64; i++) {
+        W[i] = gamma1(W[i-2]) + W[i-7] + gamma0(W[i-15]) + W[i-16];
+    }
+
+    a = H[0]; b = H[1]; c = H[2]; d = H[3];
+    e = H[4]; f = H[5]; g = H[6]; h = H[7];
+
+    #pragma unroll 8
+    for (int i = 0; i < 64; i++) {
+        uint32_t t1 = h + sigma1(e) + ch(e, f, g) + K[i] + W[i];
+        uint32_t t2 = sigma0(a) + maj(a, b, c);
+        h = g; g = f; f = e; e = d + t1;
+        d = c; c = b; b = a; a = t1 + t2;
+    }
+
+    H[0] += a; H[1] += b; H[2] += c; H[3] += d;
+    H[4] += e; H[5] += f; H[6] += g; H[7] += h;
+
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        out[i*4]     = (H[i] >> 24) & 0xff;
+        out[i*4 + 1] = (H[i] >> 16) & 0xff;
+        out[i*4 + 2] = (H[i] >> 8) & 0xff;
+        out[i*4 + 3] = H[i] & 0xff;
+    }
 }
 
 // Host wrapper functions

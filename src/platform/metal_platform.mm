@@ -24,6 +24,7 @@
 #import <dispatch/dispatch.h>
 #include <unordered_map>
 #include <iostream>
+#include <cstdio>
 
 namespace collider {
 namespace platform {
@@ -150,10 +151,13 @@ public:
             info.total_memory = device.recommendedMaxWorkingSetSize;
             info.available_memory = info.total_memory;  // Unified, always "available"
 
-            // Apple Silicon detection
+            // Apple Silicon detection -- all CUDA arch flags false
             info.is_apple_silicon = true;
-            info.is_blackwell = false;
+            info.is_turing = false;
             info.is_ampere = false;
+            info.is_ada = false;
+            info.is_hopper = false;
+            info.is_blackwell = false;
 
             // Compute capabilities
             info.supports_fp16 = true;  // All Apple Silicon supports FP16
@@ -431,7 +435,12 @@ IPlatform& get_platform() {
     static MetalPlatform platform;
     static bool initialized = false;
     if (!initialized) {
-        platform.initialize();
+        auto result = platform.initialize();
+        if (!result.ok()) {
+            fprintf(stderr, "[!] Metal initialization failed: %s\n",
+                    result.message.c_str());
+            // Platform remains uninitialized. Callers must check is_initialized().
+        }
         initialized = true;
     }
     return platform;

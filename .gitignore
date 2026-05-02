@@ -1,5 +1,7 @@
 # Build directories
 build/
+build-verify/
+build_verify/
 Release/
 Debug/
 x64/
@@ -59,6 +61,7 @@ Thumbs.db
 # Backup files
 *~
 *.bak
+*.backup
 *.swp
 *.tmp
 

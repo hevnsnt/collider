@@ -26,7 +26,7 @@ struct PoolConfig {
     uint32_t timeout_ms;
     bool debug_mode = false; // Show debug output
     bool use_tls = false;    // Use TLS encryption
-    bool verify_cert = false; // Verify TLS certificate (false for self-signed)
+    bool verify_cert = true;  // Verify TLS certificate
 
     // Default port by type
     static uint16_t default_port(const std::string& type) {
@@ -81,6 +81,7 @@ public:
 private:
     PoolConfig config_;
     std::unique_ptr<PoolClient> client_;
+    mutable std::mutex client_mutex_;  // Protects client_ access from callbacks
     std::atomic<bool> connected_;
     std::atomic<uint64_t> submitted_count_;
     std::chrono::steady_clock::time_point start_time_;
@@ -88,7 +89,8 @@ private:
 
     // Current work
     WorkAssignment current_work_;
-    std::mutex work_mutex_;
+    mutable std::mutex work_mutex_;
+    std::condition_variable work_cv_;
     bool has_work_;
 };
 

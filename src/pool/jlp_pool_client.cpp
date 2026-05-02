@@ -5,6 +5,7 @@
 #include <iostream>
 #include <chrono>
 #include <algorithm>
+#include <mutex>
 
 namespace collider {
 namespace pool {
@@ -12,15 +13,14 @@ namespace pool {
 bool JLPPoolClient::sockets_initialized_ = false;
 
 #ifdef COLLIDER_HAS_OPENSSL
-static bool ssl_initialized = false;
+static std::once_flag ssl_init_flag;
 
 bool JLPPoolClient::init_tls() {
-    if (!ssl_initialized) {
+    std::call_once(ssl_init_flag, []() {
         SSL_library_init();
         SSL_load_error_strings();
         OpenSSL_add_all_algorithms();
-        ssl_initialized = true;
-    }
+    });
 
     // Create SSL context
     ssl_ctx_ = SSL_CTX_new(TLS_client_method());
@@ -223,15 +223,15 @@ bool JLPPoolClient::connect(const std::string& host, uint16_t port) {
 }
 
 void JLPPoolClient::disconnect() {
+    // Signal threads to stop first (before closing socket)
     running_ = false;
     connected_ = false;
 
     // Wake up sender thread
     dp_cv_.notify_all();
 
+    // Close socket to unblock any blocking reads in receiver thread
     if (socket_ != INVALID_SOCK) {
-        // Note: Server protocol has no goodbye message, just close connection
-
 #ifdef COLLIDER_HAS_OPENSSL
         if (use_tls_) {
             cleanup_tls();
@@ -242,6 +242,7 @@ void JLPPoolClient::disconnect() {
         socket_ = INVALID_SOCK;
     }
 
+    // Now join threads -- they will see running_==false and exit cleanly
     if (receiver_thread_.joinable()) {
         receiver_thread_.join();
     }
@@ -344,7 +345,7 @@ void JLPPoolClient::set_work_callback(WorkCallback cb) {
 }
 
 bool JLPPoolClient::send_message(JLPMessageType type, const void* data, size_t size) {
-    std::lock_guard<std::mutex> io_lock(ssl_io_mutex_);
+    std::lock_guard<std::timed_mutex> io_lock(ssl_io_mutex_);
     if (!connected_ || socket_ == INVALID_SOCK) {
         return false;
     }
@@ -397,11 +398,10 @@ bool JLPPoolClient::send_message(JLPMessageType type, const void* data, size_t s
 }
 
 bool JLPPoolClient::receive_message(JLPHeader& header, std::vector<uint8_t>& payload) {
-    // Try-lock so sender can interleave writes between reads
-    std::unique_lock<std::mutex> io_lock(ssl_io_mutex_, std::try_to_lock);
+    // Timed lock so sender can interleave writes between reads without starvation
+    std::unique_lock<std::timed_mutex> io_lock(ssl_io_mutex_, std::chrono::milliseconds(100));
     if (!io_lock.owns_lock()) {
         last_receive_was_timeout_ = true;
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
         return false;
     }
     if (!connected_ || socket_ == INVALID_SOCK) {
@@ -452,19 +452,17 @@ bool JLPPoolClient::receive_message(JLPHeader& header, std::vector<uint8_t>& pay
 #ifdef _WIN32
             int err = WSAGetLastError();
             // WSAETIMEDOUT: timeout, WSAEWOULDBLOCK: no data, WSAEINTR: interrupted
-            // WSAECONNRESET: connection reset - treat as timeout to allow retry
-            if (err == WSAETIMEDOUT || err == WSAEWOULDBLOCK || err == WSAEINTR ||
-                err == WSAECONNRESET || err == 0) {
+            if (err == WSAETIMEDOUT || err == WSAEWOULDBLOCK || err == WSAEINTR || err == 0) {
                 last_receive_was_timeout_ = true;
                 return false;
             }
-            // Log unexpected errors for debugging
+            // WSAECONNRESET: peer reset -- fall through to reconnect
             if (debug_mode_) {
                 std::cerr << "[DEBUG] recv() returned " << received << ", WSAGetLastError=" << err << std::endl;
             }
 #else
-            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ETIMEDOUT || 
-                errno == EINTR || errno == ECONNRESET || errno == 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ETIMEDOUT ||
+                errno == EINTR || errno == 0) {
                 last_receive_was_timeout_ = true;
                 return false;
             }
@@ -480,6 +478,33 @@ bool JLPPoolClient::receive_message(JLPHeader& header, std::vector<uint8_t>& pay
         header.magic[2] != 'N' || header.magic[3] != 'G') {
         std::cerr << "[Pool] Invalid message magic" << std::endl;
         return false;
+    }
+
+    // Per-message-type payload size validation to prevent malicious allocations
+    {
+        static constexpr uint32_t MAX_WORK_PAYLOAD = 4096;
+        static constexpr uint32_t MAX_STATUS_PAYLOAD = 1024;
+        static constexpr uint32_t MAX_DEFAULT_PAYLOAD = 8192;
+
+        uint32_t max_size = MAX_DEFAULT_PAYLOAD;
+        JLPMessageType msg_type = static_cast<JLPMessageType>(header.type);
+        switch (msg_type) {
+            case JLPMessageType::WORK_ASN:   max_size = MAX_WORK_PAYLOAD; break;
+            case JLPMessageType::STATS_RSP:  max_size = MAX_STATUS_PAYLOAD; break;
+            case JLPMessageType::AUTH_OK:
+            case JLPMessageType::AUTH_FAIL:
+            case JLPMessageType::DP_ACK:
+            case JLPMessageType::PONG:       max_size = 256; break;
+            case JLPMessageType::SOLUTION:   max_size = 256; break;
+            default: break;
+        }
+        if (header.payload_size > max_size) {
+            std::cerr << "[Pool] Payload size " << header.payload_size
+                      << " exceeds maximum " << max_size
+                      << " for message type 0x" << std::hex << (int)header.type
+                      << std::dec << std::endl;
+            return false;
+        }
     }
 
     // Receive payload
@@ -524,10 +549,11 @@ void JLPPoolClient::receiver_loop() {
 
             while (running_ && auto_reconnect_) {
                 reconnect_attempts_++;
+                uint32_t delay = reconnect_delay_ms_.load();
                 std::cerr << "[Pool] Connection lost, reconnect attempt " << reconnect_attempts_
-                          << " in " << (reconnect_delay_ms_ / 1000.0) << "s..." << std::endl;
+                          << " in " << (delay / 1000.0) << "s..." << std::endl;
 
-                std::this_thread::sleep_for(std::chrono::milliseconds(reconnect_delay_ms_));
+                std::this_thread::sleep_for(std::chrono::milliseconds(delay));
 
                 if (!running_) break;
 
@@ -581,7 +607,7 @@ void JLPPoolClient::receiver_loop() {
                 if (reconnected && authenticate(worker_name_)) {
                     std::cerr << "[Pool] Reconnected successfully after " << reconnect_attempts_
                               << " attempt(s)" << std::endl;
-                    reconnect_delay_ms_ = RECONNECT_BASE_DELAY_MS;
+                    reconnect_delay_ms_.store(RECONNECT_BASE_DELAY_MS);
                     reconnect_attempts_ = 0;
                     break;
                 } else if (reconnected) {
@@ -595,9 +621,9 @@ void JLPPoolClient::receiver_loop() {
                 }
 
                 // Failed - increase backoff (exponential with cap)
-                reconnect_delay_ms_ = static_cast<uint32_t>(
+                reconnect_delay_ms_.store(static_cast<uint32_t>(
                     std::min(static_cast<double>(RECONNECT_MAX_DELAY_MS),
-                             reconnect_delay_ms_ * RECONNECT_BACKOFF_MULTIPLIER));
+                             reconnect_delay_ms_.load() * RECONNECT_BACKOFF_MULTIPLIER)));
             }
         }
     }
@@ -768,12 +794,14 @@ void JLPPoolClient::handle_server_message(const JLPHeader& header,
 }
 
 // DistinguishedPoint serialization
+// Wire format matches JLPDistinguishedPoint: x[32] + d[32] + type[1] + dp_bits[1] = 66 bytes
+// dp_bits is always small (< 256) so we serialize as uint8_t for wire compatibility
 std::vector<uint8_t> DistinguishedPoint::serialize() const {
-    std::vector<uint8_t> data(65 + 8);
+    std::vector<uint8_t> data(66);
     memcpy(data.data(), x, 32);
     memcpy(data.data() + 32, d, 32);
     data[64] = type;
-    memcpy(data.data() + 65, &dp_bits, 8);
+    data[65] = static_cast<uint8_t>(dp_bits);
     return data;
 }
 
@@ -783,8 +811,8 @@ DistinguishedPoint DistinguishedPoint::deserialize(const uint8_t* data, size_t l
         memcpy(dp.x, data, 32);
         memcpy(dp.d, data + 32, 32);
         dp.type = data[64];
-        if (len >= 73) {
-            memcpy(&dp.dp_bits, data + 65, 8);
+        if (len >= 66) {
+            dp.dp_bits = static_cast<uint64_t>(data[65]);
         }
     }
     return dp;
