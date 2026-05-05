@@ -9,9 +9,9 @@
  * Flow on checkout.session.completed:
  *   1. Verify signature using STRIPE_WEBHOOK_SECRET.
  *   2. Generate a unique CLLDR-XXXX-XXXX-XXXX-XXXX license key.
- *   3. Persist to Firestore at licenses/{key}.
- *   4. Email the buyer their key.
- *   5. Return 200.
+ *   3. Persist to Firestore at licenses/{key}. The buyer retrieves the key
+ *      via the dashboard (queries licenses where email == auth.token.email).
+ *   4. Return 200.
  *
  * Idempotency: Stripe retries delivery on non-2xx responses. We dedupe on
  * stripeSessionId to avoid issuing two keys for the same purchase.
@@ -24,7 +24,6 @@ import Stripe from "stripe";
 import { Response } from "express";
 
 import { generateLicenseKey } from "./licenseKey";
-import { sendLicenseEmail } from "./mailer";
 
 const MAX_KEY_GENERATION_ATTEMPTS = 5;
 
@@ -125,18 +124,6 @@ async function handleCheckoutSessionCompleted(
 
   const key = await issueLicense(email, sessionId);
   logger.info("License issued", { key, email, sessionId });
-
-  try {
-    await sendLicenseEmail({ to: email, licenseKey: key });
-  } catch (err) {
-    // Email failure should not block license creation, but we log loudly so
-    // an operator can manually resend. The license is already in Firestore.
-    logger.error("License created but email delivery failed", {
-      key,
-      email,
-      err,
-    });
-  }
 }
 
 export const stripeWebhook = onRequest(

@@ -2,7 +2,10 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
     match /licenses/{key} {
-      allow read: if true;
+      // Cloud Functions use Admin SDK → rules bypassed.
+      // Direct client reads: authenticated user can only read their own license.
+      allow read: if request.auth != null
+                  && request.auth.token.email == resource.data.email;
       allow write: if false;
     }
   }

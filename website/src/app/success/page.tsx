@@ -122,16 +122,16 @@ export default function SuccessPage() {
                 transition={{ delay: 0.7 }}
                 className="flex flex-col sm:flex-row items-center justify-center gap-3"
               >
-                <Link href="/docs">
+                <Link href="/dashboard">
                   <Button size="md">
-                    <BookOpen className="w-4 h-4" />
-                    Read the Docs
                     <ArrowRight className="w-4 h-4" />
+                    Go to Dashboard
                   </Button>
                 </Link>
-                <Link href="/pro#validator">
+                <Link href="/docs">
                   <Button variant="secondary" size="md">
-                    Validate Key
+                    <BookOpen className="w-4 h-4" />
+                    Read the Docs
                   </Button>
                 </Link>
               </motion.div>
