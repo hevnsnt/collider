@@ -10,6 +10,7 @@ import { cn } from "@/lib/utils";
 const navLinks = [
   { href: "/pool", label: "Pool Stats" },
   { href: "/download", label: "Download" },
+  { href: "/pro", label: "Pro", accent: true },
   { href: "/docs", label: "Docs" },
 ];
 
@@ -54,10 +55,20 @@ export function Navbar() {
               <Link
                 key={link.href}
                 href={link.href}
-                className="font-mono text-sm text-foreground-secondary hover:text-cyan transition-colors relative group"
+                className={cn(
+                  "font-mono text-sm transition-colors relative group",
+                  link.accent
+                    ? "text-amber hover:text-amber-dim font-semibold uppercase tracking-wider"
+                    : "text-foreground-secondary hover:text-cyan"
+                )}
               >
                 {link.label}
-                <span className="absolute -bottom-1 left-0 w-0 h-px bg-cyan transition-all group-hover:w-full" />
+                <span
+                  className={cn(
+                    "absolute -bottom-1 left-0 w-0 h-px transition-all group-hover:w-full",
+                    link.accent ? "bg-amber" : "bg-cyan"
+                  )}
+                />
               </Link>
             ))}
           </div>
@@ -112,7 +123,12 @@ export function Navbar() {
                 <Link
                   key={link.href}
                   href={link.href}
-                  className="block font-mono text-foreground-secondary hover:text-cyan transition-colors py-2"
+                  className={cn(
+                    "block font-mono transition-colors py-2",
+                    link.accent
+                      ? "text-amber hover:text-amber-dim font-semibold uppercase tracking-wider"
+                      : "text-foreground-secondary hover:text-cyan"
+                  )}
                   onClick={() => setIsMobileMenuOpen(false)}
                 >
                   {link.label}

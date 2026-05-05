@@ -1,0 +1,25 @@
+# Compiled JavaScript files
+lib/**/*.js
+lib/**/*.js.map
+
+# TypeScript build info
+*.tsbuildinfo
+
+# dependencies
+node_modules/
+
+# Environment variables - NEVER COMMIT
+.env
+.env.local
+.env.*.local
+.runtimeconfig.json
+
+# Firebase
+.firebase/
+firebase-debug.log
+firestore-debug.log
+ui-debug.log
+
+# Logs
+*.log
+npm-debug.log*
