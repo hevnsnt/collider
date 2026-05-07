@@ -1,6 +1,6 @@
 # Usage Guide
 
-This guide covers all thePuzzler commands, modes, and workflows for Bitcoin puzzle solving and brain wallet security research.
+This guide covers all collider commands, modes, and workflows for Bitcoin puzzle solving and brain wallet security research.
 
 ---
 
@@ -27,28 +27,28 @@ This guide covers all thePuzzler commands, modes, and workflows for Bitcoin puzz
 
 ```bash
 # Solve Bitcoin puzzle with auto-selected method
-./thepuzzler --puzzle 135
+./collider --puzzle 135
 
 # Kangaroo solve with specific public key
-./thepuzzler --kangaroo --pubkey 02abc... --range 135 --start 0x400...
+./collider --kangaroo --pubkey 02abc... --range 135 --start 0x400...
 
 # Join a pool for distributed solving (recommended for hard puzzles)
-./thepuzzler --pool jlp://pool.example.com:17403 --worker 1YourBTCAddress
+./collider --pool jlp://pool.example.com:17403 --worker 1YourBTCAddress
 
 # Brain wallet scan with wordlist
-./thepuzzler --bloom addresses.blf --wordlist rockyou.txt
+./collider --bloom addresses.blf --wordlist rockyou.txt
 
 # Benchmark all modes
-./thepuzzler --benchmark --all
+./collider --benchmark --all
 
 # List available GPUs
-./thepuzzler --list-gpus
+./collider --list-gpus
 ```
 
 ### Command Structure
 
 ```
-./thepuzzler [MODE] [OPTIONS]
+./collider [MODE] [OPTIONS]
 ```
 
 | Mode Flag | Description |
@@ -62,7 +62,7 @@ This guide covers all thePuzzler commands, modes, and workflows for Bitcoin puzz
 
 ## Operating Modes
 
-thePuzzler operates in one of four primary modes:
+collider operates in one of four primary modes:
 
 ### 1. Puzzle Mode
 Targets a specific Bitcoin Puzzle Challenge address. Automatically selects optimal algorithm based on whether the public key is known.
@@ -84,16 +84,16 @@ Measures performance across all subsystems. Use to validate your hardware config
 
 ```bash
 # Target specific puzzle (auto-selects algorithm)
-./thepuzzler --puzzle 135
+./collider --puzzle 135
 
 # Target puzzle with explicit algorithm
-./thepuzzler --puzzle 71 --brute-force
-./thepuzzler --puzzle 135 --kangaroo
+./collider --puzzle 71 --brute-force
+./collider --puzzle 135 --kangaroo
 ```
 
 ### Puzzle Selection
 
-thePuzzler automatically analyzes puzzles and recommends the best approach:
+collider automatically analyzes puzzles and recommends the best approach:
 
 | Puzzle Range | Public Key Known | Recommended Method |
 |--------------|------------------|-------------------|
@@ -117,14 +117,14 @@ thePuzzler automatically analyzes puzzles and recommends the best approach:
 
 ### Center-Heavy Scanning
 
-For brute-force puzzles, thePuzzler implements center-heavy zone scanning based on historical key distribution:
+For brute-force puzzles, collider implements center-heavy zone scanning based on historical key distribution:
 
 ```bash
 # Use default center-heavy strategy
-./thepuzzler --puzzle 71
+./collider --puzzle 71
 
 # Customize zone priorities
-./thepuzzler --puzzle 71 --zone-priority "0.6-0.85,0.3-0.5,0.0-0.3,0.85-1.0"
+./collider --puzzle 71 --zone-priority "0.6-0.85,0.3-0.5,0.0-0.3,0.85-1.0"
 ```
 
 Zone analysis of solved puzzles:
@@ -140,13 +140,13 @@ Zone analysis of solved puzzles:
 
 ```bash
 # Start with center-heavy optimization
-./thepuzzler --puzzle 71 \
+./collider --puzzle 71 \
   --puzzle-checkpoint puzzle71.ckpt \
   --output puzzle71_found.txt \
   --verbose
 
 # Resume after interruption
-./thepuzzler --puzzle 71 \
+./collider --puzzle 71 \
   --puzzle-checkpoint puzzle71.ckpt \
   --resume
 ```
@@ -167,13 +167,13 @@ For puzzles without known public keys, brute force is required.
 
 ```bash
 # Solve with public key
-./thepuzzler --kangaroo \
+./collider --kangaroo \
   --pubkey 02abc123def456... \
   --range 135 \
   --start 0x4000000000000000000000000000000000
 
 # Benchmark mode (random keys)
-./thepuzzler --kangaroo --benchmark
+./collider --kangaroo --benchmark
 ```
 
 ### Options
@@ -202,10 +202,10 @@ The `--dp-bits` parameter controls the tradeoff between memory and collision det
 
 ```bash
 # Smaller DP bits for faster collision detection
-./thepuzzler --kangaroo --pubkey 02abc... --range 80 --dp-bits 16
+./collider --kangaroo --pubkey 02abc... --range 80 --dp-bits 16
 
 # Larger DP bits for large-scale solving
-./thepuzzler --kangaroo --pubkey 02abc... --range 135 --dp-bits 24
+./collider --kangaroo --pubkey 02abc... --range 135 --dp-bits 24
 ```
 
 ### Precomputed Tames
@@ -214,10 +214,10 @@ For repeated solving in the same range, precompute tame kangaroos:
 
 ```bash
 # Generate tames (takes time but accelerates future solves)
-./thepuzzler --kangaroo --range 76 --tames tames76.dat --max 0.5
+./collider --kangaroo --range 76 --tames tames76.dat --max 0.5
 
 # Use precomputed tames
-./thepuzzler --kangaroo --pubkey 02abc... --range 76 --tames tames76.dat
+./collider --kangaroo --pubkey 02abc... --range 76 --tames tames76.dat
 ```
 
 ### Opportunistic Bloom Filter Checking
@@ -225,7 +225,7 @@ For repeated solving in the same range, precompute tame kangaroos:
 Enable bloom filter checking during Kangaroo solving to discover funded wallets:
 
 ```bash
-./thepuzzler --kangaroo \
+./collider --kangaroo \
   --pubkey 02abc... \
   --range 135 \
   --bloom addresses.blf \
@@ -279,11 +279,11 @@ Pools aggregate Distinguished Points from thousands of workers. When a DP from a
 
 ```bash
 # Connect to a JLP-compatible pool
-./thepuzzler --pool jlp://pool.example.com:17403 \
+./collider --pool jlp://pool.example.com:17403 \
              --worker 1YourBitcoinAddressForRewards
 
 # Connect to an HTTP-based pool
-./thepuzzler --pool http://api.puzzlepool.io \
+./collider --pool http://api.puzzlepool.io \
              --worker 1YourBitcoinAddress \
              --pool-api-key YOUR_API_KEY
 ```
@@ -299,7 +299,7 @@ Pools aggregate Distinguished Points from thousands of workers. When a DP from a
 
 #### How It Works
 
-1. **Connect**: thePuzzler connects to the pool server
+1. **Connect**: collider connects to the pool server
 2. **Get Work**: Pool assigns target public key and parameters
 3. **Solve**: RCKangaroo runs, submitting DPs to pool
 4. **Reward**: If your DP causes a collision, you receive your share
@@ -338,7 +338,7 @@ Several community pools exist for Bitcoin puzzle solving. Search for:
 - "BTC puzzle collaborative solving"
 - Bitcointalk forums for active pool discussions
 
-**Note**: thePuzzler implements the JLP (JeanLucPons) Kangaroo protocol which is widely used. Most puzzle pools are compatible.
+**Note**: collider implements the JLP (JeanLucPons) Kangaroo protocol which is widely used. Most puzzle pools are compatible.
 
 ---
 
@@ -352,18 +352,18 @@ Brain wallets derive private keys from passphrases:
 passphrase -> SHA256 -> private_key -> EC_multiply -> public_key -> address
 ```
 
-thePuzzler tests billions of passphrases per second against funded addresses.
+collider tests billions of passphrases per second against funded addresses.
 
 ### First-Run Setup Wizard
 
-On your first brainwallet scan, thePuzzler runs an interactive setup wizard to configure your wordlists:
+On your first brainwallet scan, collider runs an interactive setup wizard to configure your wordlists:
 
 ```bash
 # Run setup wizard directly
-./thepuzzler --brainwallet-setup
+./collider --brainwallet-setup
 
 # Or it runs automatically on first brainwallet use
-./thepuzzler --brainwallet --bloom addresses.blf
+./collider --brainwallet --bloom addresses.blf
 ```
 
 **The wizard walks you through:**
@@ -384,22 +384,22 @@ On your first brainwallet scan, thePuzzler runs an interactive setup wizard to c
 
 **Configuration Persistence:**
 
-After setup, configuration is saved to `~/.thepuzzler/`:
+After setup, configuration is saved to `~/.collider/`:
 
 ```
-~/.thepuzzler/
+~/.collider/
 ├── brainwallet_config.txt    # Settings and paths
 └── processed/
     └── combined_wordlist.txt # Deduplicated wordlist
 ```
 
-On subsequent runs, thePuzzler loads your saved configuration automatically.
+On subsequent runs, collider loads your saved configuration automatically.
 
 **Reconfigure:**
 
 ```bash
 # Re-run setup wizard
-./thepuzzler --brainwallet-setup
+./collider --brainwallet-setup
 
 # Or when prompted in interactive mode, answer 'Y' to "Reconfigure wordlists?"
 ```
@@ -408,16 +408,16 @@ On subsequent runs, thePuzzler loads your saved configuration automatically.
 
 ```bash
 # Single wordlist
-./thepuzzler --bloom addresses.blf --wordlist rockyou.txt
+./collider --bloom addresses.blf --wordlist rockyou.txt
 
 # Directory of wordlists
-./thepuzzler --bloom addresses.blf --wordlist-dir processed/
+./collider --bloom addresses.blf --wordlist-dir processed/
 
 # Recursive directory scan
-./thepuzzler --bloom addresses.blf --wordlist-dir data/ --recursive
+./collider --bloom addresses.blf --wordlist-dir data/ --recursive
 
 # Stdin input
-cat passphrases.txt | ./thepuzzler --bloom addresses.blf --wordlist -
+cat passphrases.txt | ./collider --bloom addresses.blf --wordlist -
 ```
 
 ### Options
@@ -438,12 +438,12 @@ cat passphrases.txt | ./thepuzzler --bloom addresses.blf --wordlist -
 
 **1. Direct Wordlist:**
 ```bash
-./thepuzzler --bloom addresses.blf --wordlist passwords.txt
+./collider --bloom addresses.blf --wordlist passwords.txt
 ```
 
 **2. With Mutation Rules:**
 ```bash
-./thepuzzler --bloom addresses.blf \
+./collider --bloom addresses.blf \
   --wordlist rockyou.txt \
   --rules rules/best64.rule
 ```
@@ -451,10 +451,10 @@ cat passphrases.txt | ./thepuzzler --bloom addresses.blf --wordlist -
 **3. PCFG Generation:**
 ```bash
 # Train PCFG on known passwords
-./thepuzzler --train known_passwords.txt --train-output brain_wallet.pcfg
+./collider --train known_passwords.txt --train-output brain_wallet.pcfg
 
 # Generate and test
-./thepuzzler --bloom addresses.blf --pcfg brain_wallet.pcfg
+./collider --bloom addresses.blf --pcfg brain_wallet.pcfg
 ```
 
 #### Why PCFG for Brain Wallets?
@@ -498,7 +498,7 @@ For brain wallets (human-memorable phrases), PCFG dramatically outperforms brute
 **4. Combination Mode:**
 ```bash
 # Multiple wordlists combined
-./thepuzzler --bloom addresses.blf \
+./collider --bloom addresses.blf \
   --wordlist words1.txt \
   --wordlist words2.txt \
   --combination
@@ -506,7 +506,7 @@ For brain wallets (human-memorable phrases), PCFG dramatically outperforms brute
 
 ### Rule Files
 
-thePuzzler supports Hashcat-compatible rules. Example `rules/crypto.rule`:
+collider supports Hashcat-compatible rules. Example `rules/crypto.rule`:
 
 ```
 # Append years
@@ -638,7 +638,7 @@ Saved to: addresses.blf
 
 ### Preprocessing Raw Data
 
-thePuzzler includes a preprocessing script for cleaning wordlists:
+collider includes a preprocessing script for cleaning wordlists:
 
 ```bash
 python3 scripts/preprocess_data.py \
@@ -689,10 +689,10 @@ processed/
 
 ### Automatic Detection
 
-By default, thePuzzler uses all available GPUs:
+By default, collider uses all available GPUs:
 
 ```bash
-./thepuzzler --list-gpus
+./collider --list-gpus
 
 # Output:
 Detected GPUs:
@@ -705,19 +705,19 @@ Detected GPUs:
 
 ```bash
 # Use only GPU 0 and 1
-./thepuzzler --bloom addresses.blf --wordlist rockyou.txt --gpus 0,1
+./collider --bloom addresses.blf --wordlist rockyou.txt --gpus 0,1
 
 # Use GPU 2 only
-./thepuzzler --puzzle 135 --kangaroo --gpus 2
+./collider --puzzle 135 --kangaroo --gpus 2
 ```
 
 ### Heterogeneous GPU Support
 
-thePuzzler automatically balances work across GPUs with different capabilities:
+collider automatically balances work across GPUs with different capabilities:
 
 ```bash
 # Mix RTX 4090 with RTX 3060 (work balanced by performance)
-./thepuzzler --bloom addresses.blf --wordlist-dir processed/ --gpus 0,1,2
+./collider --bloom addresses.blf --wordlist-dir processed/ --gpus 0,1,2
 ```
 
 ### Per-GPU Statistics
@@ -725,7 +725,7 @@ thePuzzler automatically balances work across GPUs with different capabilities:
 Use verbose mode to see per-GPU performance:
 
 ```bash
-./thepuzzler --bloom addresses.blf --wordlist rockyou.txt --verbose
+./collider --bloom addresses.blf --wordlist rockyou.txt --verbose
 
 # Output includes:
 [*] GPU 0: 1,234,567,890 keys/sec (67.7%)
@@ -741,7 +741,7 @@ Use verbose mode to see per-GPU performance:
 
 ```bash
 # Save progress every 100M keys
-./thepuzzler --puzzle 71 \
+./collider --puzzle 71 \
   --puzzle-checkpoint puzzle71.ckpt \
   --checkpoint-interval 100000000
 ```
@@ -749,7 +749,7 @@ Use verbose mode to see per-GPU performance:
 ### Resuming from Checkpoint
 
 ```bash
-./thepuzzler --puzzle 71 \
+./collider --puzzle 71 \
   --puzzle-checkpoint puzzle71.ckpt \
   --resume
 ```
@@ -767,7 +767,7 @@ Checkpoints store:
 For Kangaroo mode, save Distinguished Points:
 
 ```bash
-./thepuzzler --kangaroo \
+./collider --kangaroo \
   --pubkey 02abc... \
   --range 135 \
   --dp-file puzzle135_dps.bin \
@@ -810,13 +810,13 @@ Balance: 6859000000 satoshis (68.59 BTC)
 
 ```bash
 # Normal output
-./thepuzzler --bloom addresses.blf --wordlist rockyou.txt
+./collider --bloom addresses.blf --wordlist rockyou.txt
 
 # Verbose (per-GPU stats, detailed progress)
-./thepuzzler --bloom addresses.blf --wordlist rockyou.txt --verbose
+./collider --bloom addresses.blf --wordlist rockyou.txt --verbose
 
 # Debug (internal timings, memory usage)
-./thepuzzler --bloom addresses.blf --wordlist rockyou.txt --debug
+./collider --bloom addresses.blf --wordlist rockyou.txt --debug
 ```
 
 ---
@@ -833,24 +833,24 @@ Balance: 6859000000 satoshis (68.59 BTC)
 python3 scripts/preprocess_data.py --data-dir data --output-dir processed
 
 # Step 3: Run with all wordlists and rules
-./thepuzzler --bloom addresses.blf \
+./collider --bloom addresses.blf \
   --wordlist-dir processed/ \
   --rules rules/best64.rule \
   --output audit_results.txt \
   --verbose
 
 # Step 4: Verify any hits
-./thepuzzler --verify audit_results.txt
+./collider --verify audit_results.txt
 ```
 
 ### Workflow 2: Puzzle #135 Campaign
 
 ```bash
 # Step 1: Verify public key
-./thepuzzler --puzzle 135 --info
+./collider --puzzle 135 --info
 
 # Step 2: Start Kangaroo solve with checkpointing
-./thepuzzler --puzzle 135 \
+./collider --puzzle 135 \
   --kangaroo \
   --dp-bits 22 \
   --dp-file puzzle135_dps.bin \
@@ -862,7 +862,7 @@ python3 scripts/preprocess_data.py --data-dir data --output-dir processed
 tail -f progress.log
 
 # Step 4: Resume after interruption
-./thepuzzler --puzzle 135 \
+./collider --puzzle 135 \
   --kangaroo \
   --dp-file puzzle135_dps.bin \
   --checkpoint puzzle135.ckpt \
@@ -875,7 +875,7 @@ For large-scale solves across multiple machines:
 
 **Machine 1 (Coordinator):**
 ```bash
-./thepuzzler --kangaroo \
+./collider --kangaroo \
   --pubkey 02abc... \
   --range 135 \
   --distributed-server \
@@ -884,7 +884,7 @@ For large-scale solves across multiple machines:
 
 **Machine 2-N (Workers):**
 ```bash
-./thepuzzler --kangaroo \
+./collider --kangaroo \
   --distributed-worker \
   --server 192.168.1.100:17403
 ```
@@ -897,7 +897,7 @@ For long-running background operation:
 # Run in screen/tmux session
 screen -S puzzler
 
-./thepuzzler --puzzle 71 \
+./collider --puzzle 71 \
   --puzzle-checkpoint puzzle71.ckpt \
   --checkpoint-interval 10000000000 \
   --log progress.log \
@@ -915,10 +915,10 @@ screen -S puzzler
 
 ```bash
 # Larger batches for high-VRAM GPUs
-./thepuzzler --bloom addresses.blf --wordlist rockyou.txt --batch-size 8000000
+./collider --bloom addresses.blf --wordlist rockyou.txt --batch-size 8000000
 
 # Smaller batches for memory-constrained GPUs
-./thepuzzler --bloom addresses.blf --wordlist rockyou.txt --batch-size 1000000
+./collider --bloom addresses.blf --wordlist rockyou.txt --batch-size 1000000
 ```
 
 ### Memory Management
@@ -928,7 +928,7 @@ screen -S puzzler
 watch nvidia-smi
 
 # Reduce VRAM usage if needed
-./thepuzzler --bloom addresses.blf --wordlist rockyou.txt \
+./collider --bloom addresses.blf --wordlist rockyou.txt \
   --batch-size 500000 \
   --no-double-buffer
 ```
@@ -937,10 +937,10 @@ watch nvidia-smi
 
 ```bash
 # Pin to specific CPU cores
-taskset -c 0-7 ./thepuzzler --bloom addresses.blf --wordlist rockyou.txt
+taskset -c 0-7 ./collider --bloom addresses.blf --wordlist rockyou.txt
 
 # NUMA-aware execution
-numactl --cpunodebind=0 --membind=0 ./thepuzzler ...
+numactl --cpunodebind=0 --membind=0 ./collider ...
 ```
 
 ---
