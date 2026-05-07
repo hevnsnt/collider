@@ -53,6 +53,8 @@ PRO_PATHS=(
     # Brain-wallet pipeline (host + GPU)
     "src/generators/"
     "src/license/"
+    "src/rules/"            # gpu_rules.hpp lives here in our tree
+    "src/scrapers/"         # lyrics/quotes scrapers for brain wallet
     "src/gpu/mega_fused_kernel.cu"
     "src/gpu/mega_fused_kernel.hpp"
     "src/gpu/brain_wallet_gpu.cpp"
@@ -66,9 +68,18 @@ PRO_PATHS=(
     "src/gpu/fused_pipeline.cu"
     "src/gpu/pipeline.cu"
 
-    # Brain-wallet rule sets and address scrapers
+    # Brain-wallet rule files + scraper outputs at repo root
     "rules/"
     "scrapers/"
+
+    # Brain-wallet wordlist data + processing tooling
+    "data/"
+    "tools/"
+    "processed/"
+
+    # Commercial website (collisionprotocol.com -- Stripe, NextAuth,
+    # license issuance, Firebase functions). Not part of the CLI tool.
+    "website/"
 
     # Pro-internal documentation
     "docs/PRO-MIGRATION.md"
@@ -79,7 +90,6 @@ PRO_PATHS=(
     "build/"
     "build-*/"
     "build_*/"
-    "data/SecLists"      # huge submodule, not needed for Free build
     "*.pot"
     "*_hits.txt"
     "utxodump.csv"
