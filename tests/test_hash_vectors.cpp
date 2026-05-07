@@ -244,8 +244,9 @@ static const TestVector HASH160_TESTS[] = {
     { "Puzzle 1 pubkey", "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
       "751e76e8199196d454941c45d1b3a323f1433bd6" },
     // Compressed pubkey for private key 2 (puzzle 2)
+    // Hash160 verified independently via openssl/python on 2026-05-04 (was 91b24bf... pre-fix, C-CRIT-4)
     { "Puzzle 2 pubkey", "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
-      "91b24bf9f5288532960ac687abb035127b1d28a5" },
+      "06afd46bcdfd22ef94ac122aa11f241244a37ecc" },
 };
 
 // =============================================================================

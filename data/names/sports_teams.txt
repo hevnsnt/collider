@@ -1,0 +1,156 @@
+yankees
+red sox
+dodgers
+cubs
+giants
+cardinals
+mets
+braves
+astros
+phillies
+padres
+marlins
+rangers
+brewers
+guardians
+tigers
+twins
+royals
+white sox
+orioles
+rays
+blue jays
+mariners
+athletics
+angels
+rockies
+diamondbacks
+nationals
+reds
+pirates
+patriots
+cowboys
+packers
+steelers
+eagles
+49ers
+chiefs
+broncos
+raiders
+seahawks
+ravens
+saints
+bears
+giants
+vikings
+dolphins
+jets
+bills
+titans
+bengals
+browns
+colts
+texans
+jaguars
+chargers
+rams
+cardinals
+falcons
+panthers
+buccaneers
+commanders
+lions
+lakers
+celtics
+warriors
+bulls
+heat
+spurs
+knicks
+nets
+clippers
+rockets
+mavericks
+suns
+sixers
+raptors
+nuggets
+bucks
+blazers
+jazz
+pelicans
+hawks
+pacers
+thunder
+magic
+timberwolves
+grizzlies
+hornets
+pistons
+wizards
+cavaliers
+kings
+real madrid
+barcelona
+manchester united
+manchester city
+liverpool
+chelsea
+arsenal
+tottenham
+bayern munich
+borussia dortmund
+juventus
+ac milan
+inter milan
+paris saint germain
+psg
+ajax
+benfica
+porto
+atletico madrid
+sevilla
+roma
+napoli
+leicester
+everton
+west ham
+newcastle
+leeds
+aston villa
+wolverhampton
+wolves
+celtic
+rangers
+montreal canadiens
+toronto maple leafs
+boston bruins
+chicago blackhawks
+detroit red wings
+new york rangers
+philadelphia flyers
+pittsburgh penguins
+washington capitals
+colorado avalanche
+edmonton oilers
+calgary flames
+vancouver canucks
+tampa bay lightning
+florida panthers
+carolina hurricanes
+dallas stars
+vegas golden knights
+seattle kraken
+anaheim ducks
+los angeles kings
+san jose sharks
+arizona coyotes
+minnesota wild
+winnipeg jets
+st louis blues
+nashville predators
+columbus blue jackets
+new jersey devils
+new york islanders
+buffalo sabres
+ottawa senators

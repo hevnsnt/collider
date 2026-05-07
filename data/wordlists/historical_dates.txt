@@ -1,0 +1,219 @@
+# Historical Dates and Events (common passphrase patterns)
+july4th1776
+july41776
+07041776
+1776
+independence day
+declaration of independence
+december7th1941
+december71941
+12071941
+pearl harbor
+day of infamy
+november221963
+11221963
+jfk assassination
+kennedy assassination
+july201969
+07201969
+apollo11
+moon landing
+one small step
+september112001
+september11
+911
+91101
+9112001
+never forget
+world trade center
+twin towers
+january12000
+y2k
+millennium
+new millennium
+june61944
+dday
+d day
+normandy
+overlord
+august61945
+hiroshima
+little boy
+august91945
+nagasaki
+fat man
+november111918
+armistice day
+end of ww1
+veterans day
+may81945
+ve day
+victory europe
+september21945
+vj day
+victory japan
+october291929
+black tuesday
+stock market crash
+great depression
+april141865
+lincoln assassination
+ford theater
+april121861
+fort sumter
+civil war begins
+april91865
+appomattox
+civil war ends
+october121492
+columbus day
+discovery america
+july141789
+bastille day
+french revolution
+november91989
+berlin wall
+fall of berlin wall
+german reunification
+december251991
+soviet union
+ussr collapse
+june41989
+tiananmen square
+tank man
+april261986
+chernobyl
+nuclear disaster
+march111985
+gorbachev
+perestroika
+glasnost
+august151947
+india independence
+partition
+june281914
+archduke ferdinand
+world war 1 begins
+january301933
+hitler chancellor
+third reich
+september11939
+invasion poland
+world war 2 begins
+june281919
+treaty versailles
+december161773
+boston tea party
+april191775
+lexington concord
+shot heard round world
+october191781
+yorktown
+surrender
+march41789
+constitution
+we the people
+february121809
+lincoln birthday
+february221732
+washington birthday
+january11863
+emancipation proclamation
+august281963
+i have a dream
+march on washington
+april41968
+mlk assassination
+martin luther king
+november191863
+gettysburg address
+four score
+december171903
+wright brothers
+kitty hawk
+first flight
+october41957
+sputnik
+space race
+april121961
+yuri gagarin
+first man space
+february201962
+john glenn
+first american orbit
+may251961
+jfk moon speech
+before decade out
+july161969
+apollo 11 launch
+july241969
+apollo 11 return
+april111970
+apollo 13
+houston we have problem
+january281986
+challenger disaster
+february12003
+columbia disaster
+october141066
+battle hastings
+william conqueror
+june151215
+magna carta
+king john
+july41187
+horns hattin
+crusades
+october311517
+reformation
+martin luther
+95 theses
+july141879
+bastille
+liberty equality fraternity
+august241814
+burning washington
+war 1812
+december161811
+new madrid
+earthquake
+april181906
+san francisco
+great earthquake
+march211965
+selma montgomery
+bloody sunday
+november41979
+iran hostage
+444 days
+august21990
+invasion kuwait
+desert storm
+january171991
+gulf war
+march202003
+invasion iraq
+iraqi freedom
+may12011
+osama bin laden
+operation neptune spear
+december142012
+sandy hook
+newton shooting
+june122016
+pulse nightclub
+orlando shooting
+january62021
+capitol riot
+insurrection
+november32020
+election day
+january202021
+biden inauguration
+march112020
+covid pandemic
+coronavirus
+lockdown
+quarantine
+social distancing
+flatten the curve

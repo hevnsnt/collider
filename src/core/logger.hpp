@@ -7,14 +7,17 @@
 
 #pragma once
 
-#include <string>
-#include <fstream>
+#include <atomic>
 #include <chrono>
-#include <iomanip>
-#include <sstream>
-#include <filesystem>
-#include <mutex>
 #include <cstdint>
+#include <ctime>      // localtime_r / localtime_s (track-f F-17)
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <memory>
+#include <mutex>
+#include <sstream>
+#include <string>
 
 namespace collider {
 
@@ -75,13 +78,18 @@ public:
             // Ignore rotation errors
         }
 
-        // Open log file in append mode
-        log_file_.open(log_path_, std::ios::app);
-        if (!log_file_.is_open()) {
+        // Track-f F-04: log_file_ is now a shared_ptr so background threads
+        // that grab a snapshot at the start of log() keep the underlying
+        // ofstream alive even if the destructor races and tries to tear the
+        // singleton down. The shared_ptr is swapped under mutex_ on shutdown.
+        auto fresh = std::make_shared<std::ofstream>();
+        fresh->open(log_path_, std::ios::app);
+        if (!fresh->is_open()) {
             return false;
         }
+        log_file_ = std::move(fresh);
 
-        initialized_ = true;
+        initialized_.store(true, std::memory_order_release);
 
         // Log startup - write directly to avoid deadlock (we already hold the mutex)
         auto now = std::chrono::system_clock::now();
@@ -89,35 +97,68 @@ public:
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             now.time_since_epoch()) % 1000;
 
+        std::tm tm_buf{};
+#ifdef _WIN32
+        localtime_s(&tm_buf, &time_t);
+#else
+        localtime_r(&time_t, &tm_buf);
+#endif
+
         std::stringstream ss;
-        ss << std::put_time(std::localtime(&time_t), "%Y-%m-%d %H:%M:%S")
+        ss << std::put_time(&tm_buf, "%Y-%m-%d %H:%M:%S")
            << "." << std::setfill('0') << std::setw(3) << ms.count()
            << " [INFO ] === Collider Logger Started ===\n";
 
-        log_file_ << ss.str();
-        log_file_.flush();
+        (*log_file_) << ss.str();
+        log_file_->flush();
 
         return true;
     }
 
     void log(Level level, const std::string& message) {
-        if (!initialized_) return;
-
-        std::lock_guard<std::mutex> lock(mutex_);
+        // Track-f F-04 fix: take the mutex BEFORE inspecting initialized_ /
+        // log_file_, and snapshot log_file_ as a shared_ptr local. That
+        // prevents the destructor from tearing down log_file_ while we are
+        // mid-write. The mutex pairs with the destructor's mutex acquire
+        // before it clears initialized_ and resets log_file_.
+        std::shared_ptr<std::ofstream> file;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!initialized_.load(std::memory_order_acquire)) return;
+            file = log_file_;
+        }
+        if (!file || !file->is_open()) return;
 
         auto now = std::chrono::system_clock::now();
         auto time_t = std::chrono::system_clock::to_time_t(now);
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             now.time_since_epoch()) % 1000;
 
+        // Track-f F-17: localtime_r is the thread-safe variant. The legacy
+        // std::localtime returns a pointer into a single static buffer that
+        // can be torn between concurrent callers (Logger thread + main).
+        std::tm tm_buf{};
+#ifdef _WIN32
+        localtime_s(&tm_buf, &time_t);
+#else
+        localtime_r(&time_t, &tm_buf);
+#endif
+
         std::stringstream ss;
-        ss << std::put_time(std::localtime(&time_t), "%Y-%m-%d %H:%M:%S")
+        ss << std::put_time(&tm_buf, "%Y-%m-%d %H:%M:%S")
            << "." << std::setfill('0') << std::setw(3) << ms.count()
            << " [" << level_str(level) << "] "
            << message << "\n";
 
-        log_file_ << ss.str();
-        log_file_.flush();  // Always flush to ensure crash data is written
+        // Re-take the mutex for the actual stream write so concurrent log()
+        // calls do not interleave their output. The shared_ptr we hold
+        // (`file`) keeps the ofstream alive even if the destructor moved
+        // log_file_ out from under us between the two mutex critical
+        // sections.
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!initialized_.load(std::memory_order_acquire)) return;
+        (*file) << ss.str();
+        file->flush();  // Always flush to ensure crash data is written
     }
 
     void log_startup(int puzzle_number, int gpu_count, const std::string& gpu_names,
@@ -181,9 +222,46 @@ public:
     std::string get_log_path() const { return log_path_; }
 
     ~Logger() {
-        if (initialized_) {
-            log(Level::INFO, "=== Collider Logger Stopped ===");
-            log_file_.close();
+        // Track-f F-04 fix: do the final write WHILE still initialized_, then
+        // atomically clear the flag and release log_file_ under the mutex.
+        // After this destructor returns:
+        //   - any future log() call will see initialized_=false under the
+        //     mutex and return without touching log_file_.
+        //   - any in-flight log() call that already holds a shared_ptr
+        //     snapshot of log_file_ will keep the ofstream alive until it
+        //     drops the snapshot. The actual stream destruction happens at
+        //     the LAST shared_ptr release, not here.
+        if (initialized_.load(std::memory_order_acquire)) {
+            // Direct write under the mutex (avoid recursive log() that would
+            // re-take the mutex and could be slow if a worker is queued).
+            auto now = std::chrono::system_clock::now();
+            auto time_t = std::chrono::system_clock::to_time_t(now);
+            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now.time_since_epoch()) % 1000;
+            std::tm tm_buf{};
+#ifdef _WIN32
+            localtime_s(&tm_buf, &time_t);
+#else
+            localtime_r(&time_t, &tm_buf);
+#endif
+            std::stringstream ss;
+            ss << std::put_time(&tm_buf, "%Y-%m-%d %H:%M:%S")
+               << "." << std::setfill('0') << std::setw(3) << ms.count()
+               << " [INFO ] === Collider Logger Stopped ===\n";
+
+            std::shared_ptr<std::ofstream> file;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                file = log_file_;
+                if (file) {
+                    (*file) << ss.str();
+                    file->flush();
+                }
+                initialized_.store(false, std::memory_order_release);
+                log_file_.reset();  // Release our owning ref. Other threads
+                                    // holding a shared_ptr keep the ofstream
+                                    // alive until they release it.
+            }
         }
     }
 
@@ -207,10 +285,14 @@ private:
         }
     }
 
-    bool initialized_;
+    // Track-f F-04 fix: initialized_ is now atomic so we can read it without
+    // holding the mutex when needed (and so a single store on shutdown is
+    // visible to all threads). log_file_ is shared_ptr so background threads
+    // can hold a stable snapshot across mutex release windows.
+    std::atomic<bool> initialized_;
     std::string log_path_;
-    std::ofstream log_file_;
-    std::mutex mutex_;
+    std::shared_ptr<std::ofstream> log_file_;
+    mutable std::mutex mutex_;
 };
 
 // Convenience macros

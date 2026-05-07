@@ -1,0 +1,354 @@
+# Cryptocurrency Slang and Phrases
+hodl
+hold on for dear life
+diamond hands
+paper hands
+weak hands
+strong hands
+to the moon
+wen moon
+wen lambo
+lambo
+when lambo
+mooning
+pumping
+dumping
+pump and dump
+rug pull
+rugpull
+rugged
+scam
+scammer
+honeypot
+exit scam
+ponzi
+pyramid scheme
+fud
+fear uncertainty doubt
+fomo
+fear of missing out
+jomo
+joy of missing out
+btfd
+buy the fucking dip
+buy the dip
+dip
+correction
+crash
+bear market
+bull market
+bullish
+bearish
+crab market
+sideways
+accumulation
+distribution
+consolidation
+breakout
+breakdown
+support
+resistance
+ath
+all time high
+atl
+all time low
+dead cat bounce
+capitulation
+max pain
+bottom
+top
+local top
+local bottom
+macro top
+macro bottom
+cycle
+halving
+bitcoin halving
+block reward
+mining
+miner
+hash rate
+difficulty
+mempool
+gas
+gas fees
+gwei
+wei
+satoshi
+sats
+stacking sats
+dca
+dollar cost average
+lump sum
+leverage
+margin
+liquidation
+rekt
+getting rekt
+liquidated
+long
+short
+spot
+futures
+perpetuals
+perps
+funding rate
+open interest
+volume
+market cap
+mcap
+fully diluted
+fdv
+circulating supply
+total supply
+max supply
+tokenomics
+vesting
+unlock
+cliff
+linear vesting
+airdrop
+retroactive airdrop
+retro
+points
+farming
+yield farming
+liquidity mining
+staking
+restaking
+liquid staking
+lsd
+lst
+validator
+delegator
+slashing
+apr
+apy
+impermanent loss
+il
+rug
+lp
+liquidity provider
+amm
+automated market maker
+dex
+decentralized exchange
+cex
+centralized exchange
+kyc
+know your customer
+aml
+anti money laundering
+defi
+decentralized finance
+cefi
+centralized finance
+tradfi
+traditional finance
+nft
+non fungible token
+pfp
+profile picture
+jpeg
+right click save
+floor price
+floor
+sweep the floor
+paper floor
+diamond floor
+mint
+minting
+whitelist
+wl
+allowlist
+al
+presale
+public sale
+dutch auction
+free mint
+gas war
+failed transaction
+pending
+stuck transaction
+speed up
+cancel
+nonce
+wallet
+hot wallet
+cold wallet
+hardware wallet
+ledger
+trezor
+seed phrase
+recovery phrase
+mnemonic
+private key
+public key
+address
+ens
+ethereum name service
+unstoppable domains
+web3
+dapp
+decentralized application
+smart contract
+solidity
+vyper
+rust
+move
+evm
+ethereum virtual machine
+layer 1
+layer 2
+l1
+l2
+rollup
+optimistic rollup
+zk rollup
+zero knowledge
+validity proof
+fraud proof
+data availability
+sharding
+scaling
+tps
+transactions per second
+finality
+confirmation
+block time
+epoch
+slot
+beacon chain
+merge
+pos
+proof of stake
+pow
+proof of work
+consensus
+validator set
+stake
+unstake
+bonding
+unbonding
+delegation
+commission
+slashing
+jailing
+governance
+proposal
+vote
+quorum
+veto
+abstain
+treasury
+dao
+decentralized autonomous organization
+multisig
+multi signature
+gnosis safe
+timelock
+proxy
+upgradeable
+immutable
+audit
+bug bounty
+exploit
+hack
+drain
+bridge
+cross chain
+interoperability
+wrapped
+synthetic
+pegged
+depeg
+stablecoin
+algorithmic stablecoin
+collateralized
+overcollateralized
+undercollateralized
+cdp
+collateralized debt position
+liquidation ratio
+health factor
+borrow
+lend
+supply
+withdraw
+repay
+flash loan
+arbitrage
+mev
+maximal extractable value
+front running
+back running
+sandwich attack
+jit
+just in time liquidity
+oracle
+price feed
+twap
+time weighted average price
+vwap
+volume weighted average price
+ngmi
+not gonna make it
+wagmi
+we all gonna make it
+gm
+good morning
+gn
+good night
+ser
+sir
+fren
+friend
+anon
+anonymous
+degen
+degenerate
+ape
+aping
+ape in
+send it
+full send
+yeet
+yolo
+yolo trade
+size
+sizing
+position size
+risk management
+stop loss
+take profit
+trailing stop
+dyor
+do your own research
+nfa
+not financial advice
+alpha
+insider
+whale
+whale watching
+smart money
+dumb money
+retail
+institutional
+accumulation address
+dormant wallet
+on chain
+off chain
+memecoin
+shitcoin
+altcoin
+alt season
+bitcoin dominance
+btc maxi
+eth maxi
+multichain
+omnichain
+chain abstraction
+account abstraction
+passkey
+social recovery
+seedless

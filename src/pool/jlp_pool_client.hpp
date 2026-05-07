@@ -16,9 +16,9 @@
 #include "pool_client.hpp"
 #include <thread>
 #include <mutex>
-#include <shared_mutex>
 #include <queue>
 #include <condition_variable>
+#include <atomic>
 
 // TLS support via OpenSSL
 #ifdef COLLIDER_HAS_OPENSSL
@@ -48,82 +48,105 @@
 namespace collider {
 namespace pool {
 
-// JLP Protocol message types (must match collision-protocol pool server)
-// Server uses: [MAGIC:4][TYPE:1][FLAGS:1][LENGTH:2] = 8 byte header
+// JLP Protocol message types - must match collision-protocol server
 enum class JLPMessageType : uint8_t {
     // Authentication
-    AUTH = 0x01,           // Auth request (96 bytes: worker[64] + password[32])
-    AUTH_OK = 0x02,        // Auth accepted (0 bytes)
-    AUTH_FAIL = 0x03,      // Auth rejected (0 bytes)
+    AUTH      = 0x01,
+    AUTH_OK   = 0x02,
+    AUTH_FAIL = 0x03,
 
-    // Work management
-    WORK_REQ = 0x10,       // Request work (0 bytes)
-    WORK_ASN = 0x11,       // Work assignment (102 bytes)
+    // Work distribution
+    WORK_REQ  = 0x10,
+    WORK_ASN  = 0x11,
 
     // Distinguished points
-    DP_SUBMIT = 0x20,      // Single DP (66 bytes)
-    DP_ACK = 0x21,         // DP acknowledged (4 bytes: count)
-    DP_BATCH = 0x22,       // Batch of DPs (4 + N*66 bytes)
+    DP_SUBMIT = 0x20,
+    DP_ACK    = 0x21,
+    DP_BATCH  = 0x22,
 
     // Statistics
-    STATS_REQ = 0x30,      // Request stats (0 bytes)
-    STATS_RSP = 0x31,      // Stats response (32 bytes)
+    STATS_REQ = 0x30,
+    STATS_RSP = 0x31,
 
     // Solution
-    SOLUTION = 0x40,       // Solution found (32 bytes private key)
+    SOLUTION  = 0x40,
 
     // Keepalive
-    PING = 0x50,           // Keepalive request
-    PONG = 0x51,           // Keepalive response
+    PING      = 0x50,
+    PONG      = 0x51,
 
-    // Error
-    MSG_ERROR = 0xFF       // Error message
+    // Error (named MSG_ERROR to avoid Windows ERROR macro conflict)
+    MSG_ERROR = 0xFF
 };
 
-// JLP Protocol header (8 bytes, matches collision-protocol server)
-// Format: [MAGIC:4][TYPE:1][FLAGS:1][LENGTH:2]
+// JLP Protocol header - MUST match server format exactly:
+// Python: struct.pack('<4sBBH', b'KANG', msg_type, flags, len(payload))
+// [MAGIC:4][TYPE:1][FLAGS:1][LENGTH:2][PAYLOAD]
 #pragma pack(push, 1)
 struct JLPHeader {
-    uint8_t magic[4];        // "KANG"
-    uint8_t type;            // Message type
-    uint8_t flags;           // Flags (always 0)
-    uint16_t payload_size;   // Size of payload following header (little-endian)
+    uint8_t magic[4];        // "KANG" (4 bytes)
+    uint8_t type;            // Message type (1 byte)
+    uint8_t flags;           // Flags, typically 0 (1 byte)
+    uint16_t payload_size;   // Size of payload (2 bytes, little-endian)
+};  // Total: 8 bytes
+
+struct JLPClientHello {
+    char worker_name[64];    // Worker identifier (Bitcoin address)
+    uint32_t gpu_count;      // Number of GPUs
+    uint64_t speed;          // Keys per second capability
 };
 
-// AUTH payload - 96 bytes (must match protocol spec)
-struct JLPAuthPayload {
-    char worker_name[64];    // Worker name/Bitcoin address (null-padded)
-    char password[32];       // Pool password (null-padded)
-    // Total: 96 bytes
+// Work assignment structure - must match collision-protocol/src/jlp_protocol.py ServerConfig
+// Python: struct.pack('<33s32s32sIQ', public_key, range_start, range_end, dp_bits, work_id)
+struct JLPServerConfig {
+    uint8_t public_key[33];  // 33 bytes - Compressed public key
+    uint8_t range_start[32]; // 32 bytes - Range start (big-endian)
+    uint8_t range_end[32];   // 32 bytes - Range end (big-endian)
+    uint32_t dp_bits;        // 4 bytes - DP bits (little-endian)
+    uint64_t work_id;        // 8 bytes - Work identifier (little-endian)
+    // Total: 109 bytes
 };
 
-// Work assignment - 102 bytes (must match protocol spec)
-struct JLPWorkAssignment {
-    uint32_t puzzle_id;      // 4 bytes - Puzzle number
-    uint8_t range_start[32]; // 32 bytes - Search range start (big-endian)
-    uint8_t range_end[32];   // 32 bytes - Search range end (big-endian)
-    uint8_t public_key[33];  // 33 bytes - Target public key (compressed)
-    uint8_t dp_bits;         // 1 byte - Distinguished point bits
-    // Total: 102 bytes
-};
-
-// Distinguished point - 66 bytes (must match protocol spec)
 struct JLPDistinguishedPoint {
-    uint8_t x[32];           // X coordinate (big-endian)
-    uint8_t d[32];           // Distance traveled (big-endian)
-    uint8_t type;            // 0 = tame, 1 = wild
-    uint8_t dp_bits;         // Number of leading zero bits
-    // Total: 66 bytes
+    uint8_t x[32];           // X coordinate
+    uint8_t d[32];           // Distance
+    uint8_t type;            // Tame (0) or Wild (1)
+    uint8_t dp_bits;         // Number of leading-zero bits used (matches server)
 };
-
-// DP batch header
-struct JLPDPBatchHeader {
-    uint32_t count;          // Number of DPs in batch
-};
+// Wire format must be 66 bytes to match collision-protocol/src/jlp_protocol.py
+// DistinguishedPoint.to_bytes() (struct.pack('<32s32sBB', x, d, type, dp_bits)).
+// DP_BATCH payload is then [count:u32 LE][dp1:66][dp2:66]...
+static_assert(sizeof(JLPDistinguishedPoint) == 66,
+              "JLPDistinguishedPoint must be 66 bytes on the wire");
 #pragma pack(pop)
+
+// Connection / authentication state machine.
+// Wave 4 (Track D D-H4): the receiver MUST gate work-affecting messages on
+// AUTH_OK so a malicious or misbehaving server cannot inject WORK_ASN /
+// SOLUTION / DP_ACK / STATS_RSP before the client has authenticated.
+enum class AuthState : uint8_t {
+    DISCONNECTED = 0,  // Not connected (initial / after disconnect)
+    CONNECTING   = 1,  // TCP/TLS handshake in progress
+    AUTH_SENT    = 2,  // AUTH message sent, waiting for AUTH_OK / AUTH_FAIL
+    AUTH_OK      = 3,  // Authentication accepted; full message dispatch enabled
+    AUTH_FAILED  = 4   // Authentication rejected; do not auto-retry indefinitely
+};
 
 class JLPPoolClient : public PoolClient {
 public:
+    // Queue limits to prevent unbounded memory growth
+    static constexpr size_t MAX_DP_QUEUE_SIZE = 100000;  // ~6.5MB of DPs max
+    static constexpr uint8_t SUPPORTED_PROTOCOL_VERSION = 1;
+
+    // Wave 4 (Track D D-H5): bound the number of consecutive reconnect attempts
+    // that hit AUTH_FAIL. Without this, one bad credential keeps hammering the
+    // pool with the same worker name forever, looking like credential stuffing.
+    static constexpr uint32_t MAX_AUTH_FAIL_ATTEMPTS = 3;
+
+    // Wave 4 (Track D D-M5): bound the time we wait for an AUTH_OK / AUTH_FAIL
+    // response after sending the AUTH message.
+    static constexpr uint32_t AUTH_RESPONSE_TIMEOUT_MS = 10000;  // 10s
+
     JLPPoolClient();
     ~JLPPoolClient() override;
 
@@ -132,6 +155,11 @@ public:
     void disconnect() override;
     bool is_connected() const override;
 
+    // Wave 4 D-M5: actually waits for AUTH_OK / AUTH_FAIL / MSG_ERROR or timeout.
+    // Returns false on AUTH_FAIL, MSG_ERROR, or timeout. The `password` parameter
+    // is currently ignored by the JLP wire protocol (no password field in the
+    // ClientHello struct); it is accepted for interface compatibility with
+    // PoolClient but a non-empty value will produce a one-time warning.
     bool authenticate(const std::string& worker_name,
                      const std::string& password = "") override;
 
@@ -157,7 +185,7 @@ public:
 private:
     bool debug_mode_ = false;
     // Network
-    socket_t socket_ = INVALID_SOCK;
+    socket_t socket_;
     std::string host_;
     uint16_t port_;
     uint32_t timeout_ms_;
@@ -166,16 +194,29 @@ private:
     std::atomic<bool> running_;
     std::atomic<bool> last_receive_was_timeout_;  // Track if last recv was timeout vs disconnect
 
+    // Wave 4 D-H4: connection-state machine. atomic so the receiver and main
+    // threads can both read it without taking a lock on the hot dispatch path.
+    std::atomic<AuthState> auth_state_{AuthState::DISCONNECTED};
+
+    // Wave 4 D-M5: condition variable + mutex used by authenticate() to wait
+    // for an AUTH_OK / AUTH_FAIL / MSG_ERROR transition.
+    std::mutex auth_cv_mutex_;
+    std::condition_variable auth_cv_;
+
     // Reconnection with exponential backoff
     static constexpr uint32_t RECONNECT_BASE_DELAY_MS = 1000;    // Start at 1 second
     static constexpr uint32_t RECONNECT_MAX_DELAY_MS = 60000;    // Cap at 60 seconds
     static constexpr double RECONNECT_BACKOFF_MULTIPLIER = 2.0;  // Double each time
-    std::atomic<uint32_t> reconnect_delay_ms_{RECONNECT_BASE_DELAY_MS};
+    uint32_t reconnect_delay_ms_ = RECONNECT_BASE_DELAY_MS;
     uint32_t reconnect_attempts_ = 0;
+
+    // Wave 4 D-H5: count *consecutive* AUTH_FAILs across reconnects so we can
+    // give up instead of hammering the pool forever with bad creds.
+    uint32_t consecutive_auth_failures_ = 0;
 
     // TLS support
     bool use_tls_ = false;
-    bool verify_cert_ = false;  // Skip cert verification for self-signed certs
+    bool verify_cert_ = true;  // Wave 4 D-H2: default to verify (was false / fail-open)
 #ifdef COLLIDER_HAS_OPENSSL
     SSL_CTX* ssl_ctx_ = nullptr;
     SSL* ssl_ = nullptr;
@@ -185,14 +226,33 @@ private:
     int ssl_recv(void* data, size_t size);
 #endif
 
+    // Separate read and write mutexes for concurrent I/O on the SSL object.
+    //
+    // OpenSSL is documented to support one concurrent reader and one
+    // concurrent writer on the same SSL session, provided each direction is
+    // serialized internally. A SINGLE mutex covering both sides deadlocks:
+    // the receiver thread blocks in SSL_read holding the mutex, and any
+    // main-thread send_message() (e.g. WORK_REQ) cannot acquire the mutex
+    // to send -- so the request never goes on the wire and the worker
+    // appears idle to the pool until it times out.
+    //
+    // We therefore split into:
+    //   ssl_write_mutex_  -- serializes sender_loop and main-thread sends
+    //   ssl_read_mutex_   -- serializes only the receiver_loop (defensive;
+    //                        only one thread reads in this design)
+    // Renegotiation / shutdown / SSL_clear must be done with both threads
+    // joined (see disconnect()) -- those are NOT covered by these mutexes.
+    std::mutex ssl_write_mutex_;
+    std::mutex ssl_read_mutex_;
+
     // Worker info
     std::string worker_name_;
-    std::string password_;
     uint32_t gpu_count_;
     uint64_t speed_;
 
     // Current work
     WorkAssignment current_work_;
+    bool work_received_ = false;  // true once WORK_ASN arrives (work_id==0 is a valid chunk)
     std::mutex work_mutex_;
 
     // Statistics
@@ -214,15 +274,16 @@ private:
     std::thread sender_thread_;
     void sender_loop();
 
-    // SSL I/O mutex - prevents concurrent SSL operations that corrupt TLS state
-    // Receiver uses try_lock_for with 100ms timeout so sender isn't starved
-    std::timed_mutex ssl_io_mutex_;
-
     // Protocol helpers
     bool send_message(JLPMessageType type, const void* data, size_t size);
     bool receive_message(JLPHeader& header, std::vector<uint8_t>& payload);
     bool send_hello();
     void handle_server_message(const JLPHeader& header, const std::vector<uint8_t>& payload);
+
+    // Wave 4 B-LOW-6 helper: safely (re)assign a std::thread by joining the
+    // existing one if joinable. Plain `t = std::thread(...)` on a joinable
+    // thread invokes std::terminate per [thread.thread.assign]/p2.
+    static void replace_thread(std::thread& t, std::thread new_thread);
 
     // Platform init
     static bool init_sockets();

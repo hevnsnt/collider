@@ -1,5 +1,5 @@
 /**
- * RCKangaroo Wrapper for collider
+ * RCKangaroo Wrapper for theCollider
  *
  * Integrates RetiredCoder's RCKangaroo (GPLv3) as the Kangaroo solver backend.
  * RCKangaroo achieves ~8 GKeys/s on RTX 4090, ~4 GKeys/s on RTX 3090.
@@ -19,11 +19,19 @@
 #include <vector>
 #include <functional>
 #include <atomic>
-#include "../core/edition.hpp"
 
 namespace collider {
 namespace gpu {
 
+/**
+ * Bloom filter hit - a potential match against the address database
+ */
+struct BloomHit {
+    std::array<uint64_t, 4> private_key;  // 256-bit private key
+    std::array<uint8_t, 20> hash160;      // RIPEMD160(SHA256(pubkey))
+    std::string address;                   // Bitcoin address (if computed)
+    uint64_t ops_at_hit;                   // Operations count when found
+};
 
 /**
  * Result from RCKangaroo solve
@@ -37,6 +45,9 @@ struct RCKangarooResult {
     double k_value;  // K coefficient (target is 1.15)
     uint32_t error_count;
 
+    // Bloom filter results
+    uint64_t bloom_checks;                // Total bloom filter checks performed
+    std::vector<BloomHit> bloom_hits;     // Potential matches (verify externally)
 };
 
 /**
@@ -53,10 +64,15 @@ public:
     bool benchmark_mode = false;
     std::atomic<bool> stop_flag{false};
 
+    // Bloom filter configuration
+    bool bloom_enabled = false;         // Enable bloom filter checking
+    std::string bloom_file;             // Path to .blf bloom filter file
 
     // Progress callback: (ops, dp_count, speed_mkeys) -> continue?
     std::function<bool(uint64_t, uint64_t, int)> progress_callback;
 
+    // Bloom hit callback: (hit) -> called when bloom filter match found
+    std::function<void(const BloomHit&)> bloom_hit_callback;
 
     // DP callback for pool mode: (x[32], d[32], type) -> called for each new DP
     // Used to submit DPs to pool server
@@ -127,28 +143,18 @@ public:
      */
     int get_speed() const;
 
+    /**
+     * Load bloom filter from .blf file for opportunistic address checking
+     * @param filename Path to .blf bloom filter file
+     * @return true if loaded successfully
+     */
+    bool load_bloom_filter(const std::string& filename);
 
     /**
-     * Get count of invalid DPs detected (failed reconstruction)
+     * Get bloom filter statistics
+     * @return Number of bloom filter checks performed so far
      */
-    uint64_t get_invalid_dp_count() const;
-
-    /**
-     * Open log file for invalid DPs (for diagnostics)
-     * @param filename Path to log file
-     * @return true if opened successfully
-     */
-    bool open_invalid_dp_log(const std::string& filename);
-
-    /**
-     * Close invalid DP log file
-     */
-    void close_invalid_dp_log();
-
-    /**
-     * Reset invalid DP counter
-     */
-    void reset_invalid_dp_count();
+    uint64_t get_bloom_checks() const;
 
 private:
     struct Impl;

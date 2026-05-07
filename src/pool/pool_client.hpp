@@ -1,5 +1,5 @@
 // pool_client.hpp - Abstract pool client interface for distributed Kangaroo solving
-// collider - GPU-accelerated Bitcoin puzzle solver
+// theCollider - GPU-accelerated Bitcoin puzzle solver
 
 #pragma once
 
@@ -27,23 +27,35 @@ struct DistinguishedPoint {
 
 // Work assignment from pool
 struct WorkAssignment {
-    uint8_t public_key[33] = {};  // Compressed public key (target)
-    uint8_t range_start[32] = {}; // Start of search range
-    uint8_t range_end[32] = {};   // End of search range
-    uint32_t dp_bits = 0;         // Distinguished point bits
-    uint64_t work_id = 0;         // Unique work identifier
-    std::string puzzle_name;      // e.g., "Puzzle #135"
+    uint8_t public_key[33];  // Compressed public key (target)
+    uint8_t range_start[32]; // Start of search range
+    uint8_t range_end[32];   // End of search range
+    uint32_t dp_bits;        // Distinguished point bits
+    uint64_t work_id;        // Unique work identifier
+    std::string puzzle_name; // e.g., "Puzzle #135"
 };
 
-// Pool statistics
+// Pool statistics. Wire format from server STATS_RSP (36 bytes, '<QIIffQI'):
+//   total_dps:u64, total_workers:u32, active_workers:u32,
+//   dps_per_second:f32, your_share:f32, your_dps:u64, uptime_seconds:u32
+//
+// `your_dps` is server-aggregated across ALL connections sharing the same
+// worker name (= Bitcoin payout address) -- so a user running on Mac +
+// Windows + Linux with the same address sees a unified per-worker total
+// rather than per-machine subtotals.
 struct PoolStats {
-    uint64_t total_dps = 0;           // Total DPs in pool
-    uint64_t your_dps = 0;            // Your contributed DPs
-    double your_share = 0;            // Your percentage of work
-    uint64_t connected_workers = 0;   // Number of connected workers
-    double pool_speed = 0;            // Pool total speed (keys/s)
-    uint64_t rejected_dps = 0;        // DPs rejected by server
-    std::string status;               // Pool status message
+    uint64_t total_dps;           // Total DPs in pool (all workers, all time)
+    uint32_t total_workers;       // Total registered workers (all-time)
+    uint32_t active_workers;      // Currently connected workers
+    float    dps_per_second;      // Aggregate pool DP rate
+    float    your_share;          // Server-computed share fraction (0.0 - 1.0)
+    uint64_t your_dps;            // YOUR aggregate DPs across all machines
+    uint32_t uptime_seconds;      // Pool server uptime
+    // Legacy aliases kept for code that still reads them; populated from
+    // the wire fields above by handle_server_message.
+    uint64_t connected_workers = 0;  // == active_workers
+    uint64_t pool_speed = 0;         // keys/s, computed from dps_per_second * 2^dp_bits
+    std::string status;
 };
 
 // Pool client interface
@@ -86,9 +98,12 @@ public:
 std::unique_ptr<PoolClient> create_pool_client(const std::string& type);
 
 // Pool client types
-constexpr const char* POOL_TYPE_JLP = "jlp";      // JeanLucPons compatible
-constexpr const char* POOL_TYPE_HTTP = "http";    // REST API based
-constexpr const char* POOL_TYPE_WS = "websocket"; // WebSocket based
+// Wave 4 security review: only POOL_TYPE_JLP is supported. POOL_TYPE_HTTP is kept
+// solely so pool_manager can detect and reject legacy http:// configs with a
+// migration message. POOL_TYPE_WS was never implemented.
+constexpr const char* POOL_TYPE_JLP = "jlp";              // JeanLucPons compatible (only supported)
+constexpr const char* POOL_TYPE_HTTP = "http";            // DEPRECATED: rejected at parse time (D-C1)
+constexpr const char* POOL_TYPE_WS = "websocket";         // DEPRECATED: never implemented
 
 } // namespace pool
 } // namespace collider

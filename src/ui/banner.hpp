@@ -1,5 +1,5 @@
 /**
- * Collider - Clean ANSI Banner with Shine Wipe Effect
+ * TheCollider - Clean ANSI Banner with Shine Wipe Effect
  *
  * Simple, context-aware display with animated shine.
  */
@@ -14,7 +14,6 @@
 #include <cstdlib>
 #include <sstream>
 #include <iomanip>
-#include "../core/edition.hpp"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -28,6 +27,7 @@ namespace ui {
  */
 enum class OperationMode {
     PUZZLE_SEARCH,      // Bitcoin puzzle challenge
+    BRAIN_WALLET,       // Brain wallet recovery with bloom filter
     BENCHMARK,          // Performance benchmark
     UNKNOWN
 };
@@ -52,6 +52,8 @@ struct BannerStats {
     std::string gpu_names = "";
     std::string backend = "CPU";           // "CUDA", "Metal", "CPU"
     uint64_t estimated_speed = 0;
+    std::string bloom_file = "";
+    uint64_t bloom_entries = 0;
     std::string version = "1.0.0";
 
     // Puzzle-specific
@@ -274,28 +276,31 @@ private:
         out << "\n";
 
         if (config_.enable_color) out << ansi::CYAN;
-        out << "  +--------------------------------------------------------------+\n";
+        out << "  +---------------------------------------------------------------+\n";
 
-        // Mode-specific header with edition info
+        // Mode-specific header
         out << "  |";
         if (config_.enable_color) out << ansi::BRIGHT_WHITE;
 
         std::string mode_text;
         switch (config_.mode) {
             case OperationMode::PUZZLE_SEARCH:
-                mode_text = "  COLLISION PROTOCOL POOL";
+                mode_text = "  BITCOIN PUZZLE CHALLENGE";
+                break;
+            case OperationMode::BRAIN_WALLET:
+                mode_text = "  BRAIN WALLET RECOVERY";
                 break;
             case OperationMode::BENCHMARK:
                 mode_text = "  PERFORMANCE BENCHMARK";
                 break;
             default:
-                mode_text = "  POOL EDITION - READY";
+                mode_text = "  SYSTEM STATUS";
                 break;
         }
         out << std::left << std::setw(62) << mode_text;
         if (config_.enable_color) out << ansi::CYAN;
         out << "|\n";
-        out << "  +--------------------------------------------------------------+\n";
+        out << "  +---------------------------------------------------------------+\n";
 
         // Hardware line - show what's actually being used
         out << "  |  ";
@@ -312,9 +317,7 @@ private:
         } else {
             hw_info = "CPU (reference mode)";
         }
-        // Truncate if too long for the box (50 chars max)
-        if (hw_info.length() > 50) hw_info = hw_info.substr(0, 47) + "...";
-        out << std::left << std::setw(50) << hw_info << "|\n";
+        out << std::left << std::setw(48) << hw_info << "|\n";
 
         // Speed estimate
         if (stats.estimated_speed > 0) {
@@ -322,7 +325,7 @@ private:
             if (config_.enable_color) out << ansi::BRIGHT_YELLOW;
             out << "Speed";
             if (config_.enable_color) out << ansi::RESET << ansi::CYAN;
-            out << ":    " << std::left << std::setw(50) << format_speed(stats.estimated_speed) << "|\n";
+            out << ":    " << std::left << std::setw(48) << format_speed(stats.estimated_speed) << "|\n";
         }
 
         // Mode-specific info
@@ -338,10 +341,21 @@ private:
                 puzzle_info << ", " << std::fixed << std::setprecision(1) << stats.puzzle_reward << " BTC";
             }
             puzzle_info << ")";
-            out << ":   " << std::left << std::setw(50) << puzzle_info.str() << "|\n";
+            out << ":   " << std::left << std::setw(48) << puzzle_info.str() << "|\n";
+        } else if (config_.mode == OperationMode::BRAIN_WALLET && !stats.bloom_file.empty()) {
+            out << "  |  ";
+            if (config_.enable_color) out << ansi::BRIGHT_MAGENTA;
+            out << "Bloom";
+            if (config_.enable_color) out << ansi::RESET << ansi::CYAN;
+
+            std::string bloom_info = stats.bloom_file;
+            if (stats.bloom_entries > 0) {
+                bloom_info += " (" + std::to_string(stats.bloom_entries / 1'000'000) + "M)";
+            }
+            out << ":    " << std::left << std::setw(48) << bloom_info << "|\n";
         }
 
-        out << "  +--------------------------------------------------------------+\n";
+        out << "  +---------------------------------------------------------------+\n";
 
         if (config_.enable_color) out << ansi::RESET;
 
@@ -426,7 +440,7 @@ inline void display_banner(const BannerStats& stats = BannerStats{},
  */
 class ProfessionalUI {
 public:
-    static constexpr int DEFAULT_WIDTH = 64;
+    static constexpr int DEFAULT_WIDTH = 66;
 
     /**
      * Render a box with title and optional subtitle.

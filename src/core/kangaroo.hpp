@@ -352,6 +352,11 @@ public:
     // Progress callback: (tame_steps, wild_steps, dp_count, keys_per_sec) -> continue?
     std::function<bool(uint64_t, uint64_t, uint64_t, double)> progress_callback;
 
+    // DP callback: fired each time a distinguished point is found, before local collision check.
+    // Use this in pool mode to submit DPs to the server.
+    // Signature: (x_coord, distance, is_tame)
+    std::function<void(const cpu::uint256_t&, const cpu::uint256_t&, bool)> dp_callback;
+
     /**
      * Set number of threads for parallel execution
      */
@@ -513,44 +518,11 @@ private:
     }
 
     /**
-     * Check if point has distinguished property (leading zeros in X)
-     * 
-     * Server expects X coordinate with N leading zero bits (high-order bits).
-     * For little-endian uint256_t, d[3] contains the most significant 64 bits.
+     * Check if point has distinguished property (trailing zeros in X)
      */
     bool is_distinguished(const cpu::uint256_t& x) const {
-        // Count leading zeros from most significant limb down
-        int leading_zeros = 0;
-        
-        // Check d[3] (most significant 64 bits)
-        if (x.d[3] == 0) {
-            leading_zeros += 64;
-            
-            // Check d[2]
-            if (x.d[2] == 0) {
-                leading_zeros += 64;
-                
-                // Check d[1]
-                if (x.d[1] == 0) {
-                    leading_zeros += 64;
-                    
-                    // Check d[0] (least significant)
-                    if (x.d[0] == 0) {
-                        return true;  // All zeros (should never happen)
-                    } else {
-                        leading_zeros += KANGAROO_CLZ64(x.d[0]);
-                    }
-                } else {
-                    leading_zeros += KANGAROO_CLZ64(x.d[1]);
-                }
-            } else {
-                leading_zeros += KANGAROO_CLZ64(x.d[2]);
-            }
-        } else {
-            leading_zeros = KANGAROO_CLZ64(x.d[3]);
-        }
-        
-        return leading_zeros >= static_cast<int>(dp_bits);
+        uint64_t mask = (1ULL << dp_bits) - 1;
+        return (x.d[0] & mask) == 0;
     }
 
     /**
@@ -712,6 +684,8 @@ private:
                 dp.distance = tame.distance;
                 dp.is_tame = true;
 
+                if (dp_callback) dp_callback(dp.x, dp.distance, true);
+
                 cpu::uint256_t result_key;
                 if (dp_table_.insert_and_check(dp, result_key)) {
                     std::lock_guard<std::mutex> lock(solution_mutex_);
@@ -734,6 +708,8 @@ private:
                 dp.x = wild_x;
                 dp.distance = wild.distance;
                 dp.is_tame = false;
+
+                if (dp_callback) dp_callback(dp.x, dp.distance, false);
 
                 cpu::uint256_t result_key;
                 if (dp_table_.insert_and_check(dp, result_key)) {

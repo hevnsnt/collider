@@ -1,76 +1,123 @@
 # Build directories
 build/
-build-verify/
-build_verify/
-Release/
-Debug/
-x64/
+build-*/
+build_*/
+cmake-build-*/
+out/
 
-# Object files
-*.o
-*.obj
-*.so
-*.a
-*.lib
-*.dll
-*.dylib
-
-# Executables
-collider
-collider.exe
-generate_license
-generate_license.exe
-
-# CUDA compilation files
-*.fatbin
-*.cubin
-*.ptx
+# Local build helper output and ad-hoc batch files
+build_*_out.txt
+do_build_*.bat
 
 # IDE files
+.idea/
 .vscode/
-.vs/
-*.vcxproj.user
-*.sln.docstates
+*.swp
+*.swo
+*~
+.DS_Store
 
-# CMake files
+# Compiled objects
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+
+# Executables
+*.exe
+superflayer
+collider
+thepuzzler
+thecollider
+
+# CUDA compiled
+*.cubin
+*.fatbin
+*.ptx
+
+# CMake generated
 CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake
 Makefile
-*.cmake
+compile_commands.json
 
-# License keys and security files
-# IMPORTANT: Never commit these files!
-license_private_key.bin
-license_public_key.bin
-*.key
-license_*.key
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+venv/
+.env
 
-# Test and runtime files
+# Data files (too large for git)
+data/passwords/rockyou.txt
+data/passwords/darkc0de.txt
+data/wordlists/frequency_words.txt
+data/wordlists/wikipedia_frequency.txt
+data/wordlists/german.txt
+data/names/xato_usernames.txt
+processed/*.txt
+
+# Keep structure but ignore large processed files
+!processed/rules/
+!processed/stats.json
+
+# Logs
 *.log
-checkpoints/
 logs/
+
+# Temporary files
+*.tmp
+*.temp
+tmp/
 temp/
 
-# macOS
-.DS_Store
+# Test outputs
+test_results/
+benchmark_results/
 
-# Windows
-Thumbs.db
+# Generated output files (puzzle solutions, findings)
+puzzle_found.txt
+puzzle_solved.txt
+*_found.txt
+*_solved.txt
+findings/
+solutions/
 
-# Backup files
-*~
-*.bak
-*.backup
-*.swp
-*.tmp
+# Bloom filter files
+*.blf
+*.bloom
 
-# vcpkg (auto-downloaded on Windows)
-vcpkg/*.blf
-funded_addresses.blf
+# State/checkpoint files
+*.state
+*.checkpoint
+checkpoints/
+
+# Claude Code / AI assistant files
+.claude/
+
+# vcpkg (auto-downloaded during build)
+vcpkg/
+
+# User config (contains personal pool URLs, wallet addresses, local paths)
 config.yml
 config.yaml
-build_docker/
-build_native/
-build_fresh/
-build/
+
+# Temporary build/test scripts and outputs from dev sessions
+_tmp_*.bat
+_build_*_out*.txt
+bash_test.txt
+build_out.txt
+do_build.bat
+run_build.bat
+run_build.ps1
+ksp_direct.txt
+run_ksp_direct.bat
+brainwallet.pot
+brainwallet_hits.txt
+utxodump.csv

@@ -1,8 +1,18 @@
 /**
- * yaml_config.hpp - Simple YAML configuration loader for collider
+ * yaml_config.hpp - Simple YAML configuration loader for theCollider
  *
  * Parses a subset of YAML (key: value pairs with sections) without external dependencies.
  * Command-line arguments override config file settings.
+ *
+ * Override precedence (Wave 5 refactor, 2026-05-04):
+ *   1. CLI flags explicitly supplied on argv (tracked via CLIFlags::*_set bits).
+ *   2. config.yml fields whose value differs from the AppConfig default.
+ *   3. Arguments default values.
+ *
+ * The CLIFlags struct is populated INSIDE parse_args at the moment argv supplies
+ * a value -- not inferred post-parse from the resulting Arguments. This eliminates
+ * the entire "value silently overridden" bug class documented in track-e
+ * (e.g. --batch-size 4000000, --random against random_search:false, --puzzle 0).
  */
 
 #pragma once
@@ -15,7 +25,6 @@
 #include <filesystem>
 #include <iostream>
 #include <algorithm>
-#include "edition.hpp"
 
 namespace collider {
 
@@ -40,7 +49,14 @@ struct AppConfig {
     bool auto_next = false;
     std::string checkpoint;
 
+    // Brainwallet configuration
+    bool brainwallet_enabled = false;
+    std::string wordlist;
+    size_t save_interval = 1000000;
+    bool resume = false;
 
+    // Bloom filter
+    std::string bloom_file;
 
     // GPU configuration
     std::vector<int> gpu_devices;
@@ -52,7 +68,9 @@ struct AppConfig {
     bool debug = false;
     int benchmark_seconds = 30;
 
-    // Paths
+    // Paths (NOTE: not yet consumed by apply_config_to_args; see track-e finding 7).
+    // Documented as a known gap rather than silently dropped: leaving them parsed
+    // so future code can opt in. Removing them would break user configs.
     std::string data_dir = "./processed";
     std::string checkpoint_dir = "./checkpoints";
     std::string log_dir = "./logs";
@@ -192,16 +210,12 @@ struct AppConfig {
 private:
     void parse_value(const std::string& section, const std::string& key, const std::string& value) {
         if (section == "pool") {
-            // Worker is available in both editions
-            if (key == "worker") pool_worker = value;
-            // Free edition: override pool URL to hardcoded value
-            else if (key == "url") {
-                std::cout << "[*] Config: Ignoring pool.url (Free edition uses hardcoded pool)\n";
-                pool_url = COLLIDER_FREE_POOL_URL;
-            }
+            if (key == "url") pool_url = value;
+            else if (key == "worker") pool_worker = value;
+            else if (key == "password") pool_password = value;
+            else if (key == "api_key") pool_api_key = value;
         }
         else if (section == "puzzle") {
-#if COLLIDER_HAS_SOLO
             if (key == "number") puzzle_number = std::stoi(value);
             else if (key == "smart_select") smart_select = parse_bool(value);
             else if (key == "min_bits") min_bits = std::stoi(value);
@@ -211,18 +225,15 @@ private:
             else if (key == "random_search") random_search = parse_bool(value);
             else if (key == "auto_next") auto_next = parse_bool(value);
             else if (key == "checkpoint") checkpoint = value;
-#else
-            // Free edition: ignore puzzle configuration
-            std::cout << "[*] Solo puzzle solver requires collider pro — collisionprotocol.com/pro\n";
-#endif
         }
         else if (section == "brainwallet") {
-            // Free edition: ignore brainwallet configuration  
-            std::cout << "[*] Brain wallet requires collider pro — collisionprotocol.com/pro\n";
+            if (key == "enabled") brainwallet_enabled = parse_bool(value);
+            else if (key == "wordlist") wordlist = value;
+            else if (key == "save_interval") save_interval = std::stoull(value);
+            else if (key == "resume") resume = parse_bool(value);
         }
         else if (section == "bloom") {
-            // Free edition: ignore bloom configuration
-            std::cout << "[*] Bloom filters require collider pro — collisionprotocol.com/pro\n";
+            if (key == "file") bloom_file = value;
         }
         else if (section == "gpu") {
             if (key == "devices") gpu_devices = parse_int_list(value);
@@ -275,276 +286,176 @@ private:
 };
 
 /**
+ * CLI flags tracking struct -- one bit per Arguments field.
+ *
+ * Each *_set bit is set INSIDE parse_args at the moment argv supplies the value.
+ * apply_config_to_args() consults these bits before overriding -- if the bit is
+ * true, config never overrides the CLI value, regardless of whether the CLI value
+ * happens to equal the Arguments default.
+ *
+ * This eliminates the bug class where sentinel-based detection (e.g.
+ * "args.batch_size == 4_000_000 means user did not set it") wrongly treated an
+ * explicit CLI value equal to the default as "unset".
+ */
+struct CLIFlags {
+    // Pool / mode
+    bool pool_url_set = false;          // --pool / -p
+    bool pool_worker_set = false;       // --worker / -w
+    bool pool_password_set = false;     // --pool-password
+    bool pool_api_key_set = false;      // --pool-api-key
+    bool brainwallet_set = false;       // --brainwallet
+
+    // Puzzle
+    bool puzzle_number_set = false;     // --puzzle N (with value)
+    bool puzzle_min_bits_set = false;   // --puzzle-min-bits
+    bool puzzle_max_bits_set = false;   // --puzzle-max-bits
+    bool dp_bits_set = false;           // --dp-bits
+    bool puzzle_checkpoint_set = false; // --puzzle-checkpoint
+    bool puzzle_random_set = false;     // --random or --sequential
+    bool puzzle_auto_next_set = false;  // --auto-next
+    bool puzzle_kangaroo_set = false;   // --kangaroo
+    bool smart_select_set = false;      // --no-smart
+
+    // Brainwallet / search
+    bool resume_set = false;            // --resume
+    bool save_interval_set = false;     // --save-interval
+
+    // Bloom filter / GPU
+    bool bloom_file_set = false;        // --bloom
+    bool gpu_ids_set = false;           // --gpus / -g
+    bool batch_size_set = false;        // --batch-size
+    bool force_calibrate_set = false;   // --force-calibrate
+
+    // Settings
+    bool verbose_set = false;           // --verbose / -v
+    bool debug_set = false;             // --debug
+    bool benchmark_seconds_set = false; // --benchmark-time
+};
+
+/**
  * Apply config file settings to Arguments struct.
- * Only applies settings where command-line wasn't explicitly set.
+ * For every field, config only overrides when the CLI did not explicitly set it
+ * (per the matching CLIFlags::*_set bit). The previous "default-value-as-sentinel"
+ * pattern is removed.
  */
 template<typename Arguments>
-void apply_config_to_args(Arguments& args, const AppConfig& config, bool cli_has_pool_url, bool cli_has_worker) {
-    // Pool settings (only if not set via CLI)
-    if (!cli_has_pool_url && !config.pool_url.empty()) {
+void apply_config_to_args(Arguments& args, const AppConfig& config, const CLIFlags& cli) {
+    // ------------------------------------------------------------------------
+    // Pool / mode
+    // ------------------------------------------------------------------------
+    if (!cli.pool_url_set && !config.pool_url.empty()) {
         args.pool_url = config.pool_url;
-        args.pool_mode = true;
+        // Auto-enable pool mode when config supplies a URL, but only when the
+        // user did not request brainwallet mode (CLI or config) and did not
+        // already set pool_mode via CLI.
+        if (!cli.brainwallet_set && !args.brainwallet_mode && !args.pool_mode) {
+            args.pool_mode = true;
+        }
     }
-    if (!cli_has_worker && !config.pool_worker.empty()) {
+    if (!cli.pool_worker_set && !config.pool_worker.empty()) {
         args.pool_worker = config.pool_worker;
     }
-    if (args.pool_password.empty() && !config.pool_password.empty()) {
+    if (!cli.pool_password_set && !config.pool_password.empty()) {
         args.pool_password = config.pool_password;
     }
-    if (args.pool_api_key.empty() && !config.pool_api_key.empty()) {
+    if (!cli.pool_api_key_set && !config.pool_api_key.empty()) {
         args.pool_api_key = config.pool_api_key;
     }
 
-    // Puzzle settings (only non-default CLI values take precedence)
-    if (args.puzzle_number == 0 && config.puzzle_number > 0) {
+    // ------------------------------------------------------------------------
+    // Puzzle
+    // ------------------------------------------------------------------------
+    if (!cli.puzzle_number_set && config.puzzle_number > 0) {
         args.puzzle_number = config.puzzle_number;
     }
-    if (config.min_bits > 0) args.puzzle_min_bits = config.min_bits;
-    if (config.max_bits < 160) args.puzzle_max_bits = config.max_bits;
-    if (args.dp_bits < 0 && config.dp_bits >= 0) {
+    if (!cli.puzzle_min_bits_set && config.min_bits > 0) {
+        args.puzzle_min_bits = config.min_bits;
+    }
+    if (!cli.puzzle_max_bits_set && config.max_bits < 160) {
+        args.puzzle_max_bits = config.max_bits;
+    }
+    if (!cli.dp_bits_set && config.dp_bits >= 0) {
         args.dp_bits = config.dp_bits;
     }
-    if (!config.checkpoint.empty() && args.puzzle_checkpoint.empty()) {
+    if (!cli.puzzle_checkpoint_set && !config.checkpoint.empty()) {
         args.puzzle_checkpoint = config.checkpoint;
     }
 
-    // Apply boolean settings from config only if CLI didn't explicitly set them.
-    // The cli_explicit_flags set tracks which flags were explicitly provided on the command line.
-    if (args.cli_explicit_flags.find("smart-select") == args.cli_explicit_flags.end()) {
+    // Boolean settings: config wins only if CLI did not set a *_set bit.
+    if (!cli.smart_select_set) {
         args.smart_select = config.smart_select;
     }
-    if (args.cli_explicit_flags.find("kangaroo") == args.cli_explicit_flags.end()) {
+    if (!cli.puzzle_kangaroo_set) {
         args.puzzle_kangaroo = config.kangaroo;
     }
-    if (args.cli_explicit_flags.find("random") == args.cli_explicit_flags.end()) {
+    if (!cli.puzzle_random_set) {
         args.puzzle_random = config.random_search;
     }
-    if (args.cli_explicit_flags.find("auto-next") == args.cli_explicit_flags.end()) {
+    if (!cli.puzzle_auto_next_set) {
         args.puzzle_auto_next = config.auto_next;
     }
 
+    // ------------------------------------------------------------------------
+    // Brainwallet / search state
+    // ------------------------------------------------------------------------
+    // Brainwallet enable: only honour config when CLI did not explicitly
+    // request --brainwallet AND CLI did not set --pool / pool_mode. This
+    // closes the "config silently turns brainwallet on under --pool" hole
+    // documented as Critical in track-e (Scenario B).
+    if (!cli.brainwallet_set && !cli.pool_url_set && !args.pool_mode &&
+        config.brainwallet_enabled) {
+        args.brainwallet_mode = true;
+    }
+    if (args.wordlist_file.empty() && !config.wordlist.empty()) {
+        args.wordlist_file = config.wordlist;
+    }
+    if (!cli.save_interval_set && config.save_interval != 1000000) {
+        args.save_interval = config.save_interval;
+    }
+    if (!cli.resume_set && config.resume) {
+        args.resume = true;
+    }
 
-
-    // GPU settings
-    if (args.gpu_ids.empty() && !config.gpu_devices.empty()) {
+    // ------------------------------------------------------------------------
+    // Bloom filter / GPU
+    // ------------------------------------------------------------------------
+    // Bloom-filter opportunistic address checking is a Pro feature
+    // (collisionprotocol.com/pro). The free build silently ignores any
+    // bloom file from config.yml and emits a one-time hint if one was
+    // supplied, instead of loading 142 MB of address data into the GPU.
+    if (!cli.bloom_file_set && !config.bloom_file.empty()) {
+#ifdef COLLIDER_PRO
+        args.bloom_file = config.bloom_file;
+#else
+        std::cerr << "[Pro] Ignoring bloom filter '" << config.bloom_file
+                  << "' from config -- opportunistic address scanning is a "
+                     "Pro feature. https://collisionprotocol.com/pro"
+                  << std::endl;
+#endif
+    }
+    if (!cli.gpu_ids_set && !config.gpu_devices.empty()) {
         args.gpu_ids = config.gpu_devices;
     }
-    if (args.batch_size == 4'000'000 && config.batch_size > 0) {  // 4M is default
+    if (!cli.batch_size_set && config.batch_size > 0) {
         args.batch_size = config.batch_size;
     }
-    if (config.force_calibrate) {
+    if (!cli.force_calibrate_set && config.force_calibrate) {
         args.calibrate = true;
         args.force_calibrate = true;
     }
 
+    // ------------------------------------------------------------------------
     // Settings
-    if (config.verbose) args.verbose = true;
-    if (config.debug) args.debug = true;
-    if (config.benchmark_seconds != 30) {
+    // ------------------------------------------------------------------------
+    if (!cli.verbose_set && config.verbose) {
+        args.verbose = true;
+    }
+    if (!cli.debug_set && config.debug) {
+        args.debug = true;
+    }
+    if (!cli.benchmark_seconds_set && config.benchmark_seconds != 30) {
         args.benchmark_seconds = config.benchmark_seconds;
     }
-}
-
-/**
- * Save the pool worker address to a config file so the user
- * does not need to re-enter it on every launch.
- *
- * Strategy:
- *  - If ./config.yml exists, update/add the pool.worker line in-place.
- *  - Otherwise, create ./config.yml with a minimal pool section.
- *
- * TODO: Move to yaml_config.cpp to reduce header bloat.
- */
-inline bool save_worker_config(const std::string& worker) {
-    const std::string config_path = "./config.yml";
-
-    // If config.yml already exists, update or insert pool.worker
-    if (std::filesystem::exists(config_path)) {
-        std::ifstream in(config_path);
-        if (!in.is_open()) return false;
-
-        std::vector<std::string> lines;
-        std::string line;
-        bool in_pool_section = false;
-        bool worker_found = false;
-
-        while (std::getline(in, line)) {
-            // Detect section headers (no leading whitespace, ends with ':')
-            std::string trimmed = line;
-            size_t first = trimmed.find_first_not_of(" \t");
-            bool is_top_level = (first == 0 || first == std::string::npos);
-
-            if (is_top_level && !trimmed.empty() && trimmed.back() == ':' &&
-                trimmed.find(':') == trimmed.size() - 1) {
-                std::string section = trimmed.substr(0, trimmed.size() - 1);
-                // trim
-                while (!section.empty() && (section.back() == ' ' || section.back() == '\t'))
-                    section.pop_back();
-                in_pool_section = (section == "pool");
-            }
-
-            // Replace existing worker line in pool section
-            if (in_pool_section && first != std::string::npos && first > 0) {
-                std::string content = trimmed.substr(first);
-                if (content.rfind("worker:", 0) == 0) {
-                    lines.push_back("  worker: \"" + worker + "\"");
-                    worker_found = true;
-                    continue;
-                }
-            }
-
-            lines.push_back(line);
-        }
-        in.close();
-
-        // If pool section exists but no worker line, append it after the section header
-        if (!worker_found) {
-            std::vector<std::string> updated;
-            bool inserted = false;
-            in_pool_section = false;
-
-            for (const auto& l : lines) {
-                updated.push_back(l);
-                if (!inserted) {
-                    std::string t = l;
-                    size_t f = t.find_first_not_of(" \t");
-                    if (f == 0 && t == "pool:") {
-                        in_pool_section = true;
-                    } else if (in_pool_section) {
-                        // Insert worker right after pool: header
-                        updated.push_back("  worker: \"" + worker + "\"");
-                        inserted = true;
-                    }
-                }
-            }
-
-            // If no pool section at all, append one
-            if (!inserted) {
-                updated.push_back("");
-                updated.push_back("pool:");
-                updated.push_back("  worker: \"" + worker + "\"");
-            }
-
-            lines = updated;
-        }
-
-        std::ofstream out(config_path);
-        if (!out.is_open()) return false;
-        for (size_t i = 0; i < lines.size(); i++) {
-            out << lines[i];
-            if (i + 1 < lines.size()) out << "\n";
-        }
-        out << "\n";
-        return true;
-    }
-
-    // No config.yml exists - create a new one
-    std::ofstream out(config_path);
-    if (!out.is_open()) return false;
-
-    out << "# collider configuration\n";
-    out << "# See example-config.yml for all options\n";
-    out << "\n";
-    out << "pool:\n";
-    out << "  worker: \"" << worker << "\"\n";
-
-    return true;
-}
-
-/**
- * Save pool URL and worker address to config file.
- *
- * TODO: Move to yaml_config.cpp to reduce header bloat.
- */
-inline bool save_pool_config(const std::string& url, const std::string& worker) {
-    const std::string config_path = "./config.yml";
-
-    if (std::filesystem::exists(config_path)) {
-        // Read existing config and update pool section
-        std::ifstream in(config_path);
-        if (!in.is_open()) return false;
-
-        std::vector<std::string> lines;
-        std::string line;
-        bool in_pool = false;
-        bool url_found = false, worker_found = false;
-
-        while (std::getline(in, line)) {
-            std::string trimmed = line;
-            size_t first = trimmed.find_first_not_of(" \t");
-            bool is_top = (first == 0 || first == std::string::npos);
-
-            if (is_top && !trimmed.empty() && trimmed.back() == ':' &&
-                trimmed.find(':') == trimmed.size() - 1) {
-                std::string sec = trimmed.substr(0, trimmed.size() - 1);
-                while (!sec.empty() && (sec.back() == ' ' || sec.back() == '\t')) sec.pop_back();
-                in_pool = (sec == "pool");
-            }
-
-            if (in_pool && first != std::string::npos && first > 0) {
-                std::string content = trimmed.substr(first);
-                if (content.rfind("url:", 0) == 0 && !url.empty()) {
-                    lines.push_back("  url: \"" + url + "\"");
-                    url_found = true;
-                    continue;
-                }
-                if (content.rfind("worker:", 0) == 0 && !worker.empty()) {
-                    lines.push_back("  worker: \"" + worker + "\"");
-                    worker_found = true;
-                    continue;
-                }
-            }
-            lines.push_back(line);
-        }
-        in.close();
-
-        // If pool section exists but missing fields, insert them
-        if (!url_found || !worker_found) {
-            std::vector<std::string> updated;
-            bool inserted = false;
-            in_pool = false;
-            for (const auto& l : lines) {
-                updated.push_back(l);
-                if (!inserted) {
-                    size_t f = l.find_first_not_of(" \t");
-                    if (f == 0 && l == "pool:") {
-                        in_pool = true;
-                    } else if (in_pool) {
-                        if (!url_found && !url.empty())
-                            updated.push_back("  url: \"" + url + "\"");
-                        if (!worker_found && !worker.empty())
-                            updated.push_back("  worker: \"" + worker + "\"");
-                        inserted = true;
-                    }
-                }
-            }
-            if (!inserted) {
-                updated.push_back("");
-                updated.push_back("pool:");
-                if (!url.empty()) updated.push_back("  url: \"" + url + "\"");
-                if (!worker.empty()) updated.push_back("  worker: \"" + worker + "\"");
-            }
-            lines = updated;
-        }
-
-        std::ofstream out(config_path);
-        if (!out.is_open()) return false;
-        for (size_t i = 0; i < lines.size(); i++) {
-            out << lines[i];
-            if (i + 1 < lines.size()) out << "\n";
-        }
-        out << "\n";
-        return true;
-    }
-
-    // Create new config
-    std::ofstream out(config_path);
-    if (!out.is_open()) return false;
-    out << "# collider configuration\n\n";
-    out << "pool:\n";
-    if (!url.empty()) out << "  url: \"" << url << "\"\n";
-    if (!worker.empty()) out << "  worker: \"" << worker << "\"\n";
-    return true;
 }
 
 }  // namespace collider

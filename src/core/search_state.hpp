@@ -24,12 +24,10 @@
 
 #ifdef _WIN32
 #include <io.h>
-#include <windows.h>
 #define fsync _commit
 #define fileno _fileno
 #else
 #include <unistd.h>
-#include <fcntl.h>
 #endif
 
 namespace collider {
@@ -92,14 +90,8 @@ public:
     static std::string get_timestamp() {
         auto now = std::chrono::system_clock::now();
         auto time = std::chrono::system_clock::to_time_t(now);
-        struct tm tm_buf;
-#ifdef _WIN32
-        localtime_s(&tm_buf, &time);
-#else
-        localtime_r(&time, &tm_buf);
-#endif
         std::ostringstream ss;
-        ss << std::put_time(&tm_buf, "%Y-%m-%d %H:%M:%S");
+        ss << std::put_time(std::localtime(&time), "%Y-%m-%d %H:%M:%S");
         return ss.str();
     }
 
@@ -153,12 +145,7 @@ public:
 
         // For puzzles 65-128, position_hi should fit in (bit_length - 64) bits
         if (bit_length > 64 && bit_length <= 128) {
-            uint64_t max_hi;
-            if (bit_length >= 128) {
-                max_hi = UINT64_MAX;
-            } else {
-                max_hi = (1ULL << (bit_length - 64)) - 1;
-            }
+            uint64_t max_hi = (1ULL << (bit_length - 64)) - 1;
             if (state.position_hi > max_hi) {
                 return "Position_hi exceeds puzzle range";
             }
@@ -214,11 +201,9 @@ public:
         }
 
         // Sync to disk before rename (extra safety on some filesystems)
-        // NOTE: Must open with write access ("r+") for fsync to flush to disk.
-        // Opening read-only ("r") makes fsync a no-op on most filesystems.
 #ifndef _WIN32
         {
-            FILE* f = fopen(temp_path.c_str(), "r+");
+            FILE* f = fopen(temp_path.c_str(), "r");
             if (f) {
                 fsync(fileno(f));
                 fclose(f);
@@ -227,33 +212,19 @@ public:
 #endif
 
         // Atomic rename: temp -> final
-#ifdef _WIN32
-        // Atomic rename with overwrite on NTFS
-        if (!MoveFileExA(temp_path.c_str(), path.c_str(),
-                         MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-            // Fallback if MoveFileEx fails
-            std::error_code ec;
-            std::filesystem::remove(path, ec);
-            std::filesystem::rename(temp_path, path, ec);
-            if (ec) {
-                std::cerr << "[WARN] State save failed: " << ec.message() << std::endl;
+        // On POSIX, rename() is atomic. On Windows, we try rename first.
+        try {
+            std::filesystem::rename(temp_path, path);
+        } catch (const std::exception& e) {
+            // On Windows, might fail if target exists - try remove then rename
+            std::filesystem::remove(path);
+            try {
+                std::filesystem::rename(temp_path, path);
+            } catch (const std::exception& e2) {
+                std::cerr << "[!] Failed to save state file: " << e2.what() << "\n";
+                return false;
             }
         }
-#else
-        std::filesystem::rename(temp_path, path);
-#endif
-
-#ifndef _WIN32
-        // Fsync the directory for crash safety
-        {
-            std::string dir = get_state_dir();
-            int dir_fd = open(dir.c_str(), O_RDONLY);
-            if (dir_fd >= 0) {
-                fsync(dir_fd);
-                close(dir_fd);
-            }
-        }
-#endif
 
         return true;
     }

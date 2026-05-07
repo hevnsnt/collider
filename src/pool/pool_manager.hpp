@@ -5,7 +5,9 @@
 
 #include "pool_client.hpp"
 #include "jlp_pool_client.hpp"
-#include "http_pool_client.hpp"
+// http_pool_client.hpp removed: HTTP pool path was deleted in Wave 4 due to D-C1
+// (silent https:// to plaintext downgrade leaking credentials). JLP+TLS (jlps://) is
+// the only supported pool transport going forward.
 #include <memory>
 #include <atomic>
 #include <thread>
@@ -15,23 +17,24 @@ namespace collider {
 namespace pool {
 
 // Pool connection configuration
+// NOTE: HTTP pool support was REMOVED in Wave 4 (Track D security audit).
+// `type` must be "jlp" only. http:// / https:// URLs are rejected at parse time.
 struct PoolConfig {
-    std::string type;        // "jlp", "http", "websocket"
+    std::string type;        // "jlp" (only supported value; "http"/"websocket" deprecated and rejected)
     std::string host;
     uint16_t port;
     std::string worker_name; // Bitcoin address
-    std::string password;    // Optional
-    std::string api_key;     // For HTTP pools
+    std::string password;    // Optional (currently unused by JLP protocol; reserved)
+    std::string api_key;     // (DEPRECATED) was for HTTP pools; no longer used
     bool auto_reconnect;
     uint32_t timeout_ms;
     bool debug_mode = false; // Show debug output
-    bool use_tls = false;    // Use TLS encryption
-    bool verify_cert = true;  // Verify TLS certificate
+    bool use_tls = false;    // Use TLS encryption (jlps://)
+    bool verify_cert = true; // Verify TLS certificate (default true; opt-out only via explicit flag)
 
-    // Default port by type
+    // Default port by type. Only JLP is supported; HTTP path was deleted.
     static uint16_t default_port(const std::string& type) {
         if (type == POOL_TYPE_JLP) return 17403;
-        if (type == POOL_TYPE_HTTP) return 80;
         return 17403;
     }
 };
@@ -81,7 +84,6 @@ public:
 private:
     PoolConfig config_;
     std::unique_ptr<PoolClient> client_;
-    mutable std::mutex client_mutex_;  // Protects client_ access from callbacks
     std::atomic<bool> connected_;
     std::atomic<uint64_t> submitted_count_;
     std::chrono::steady_clock::time_point start_time_;
@@ -89,8 +91,7 @@ private:
 
     // Current work
     WorkAssignment current_work_;
-    mutable std::mutex work_mutex_;
-    std::condition_variable work_cv_;
+    std::mutex work_mutex_;
     bool has_work_;
 };
 

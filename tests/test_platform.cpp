@@ -191,11 +191,13 @@ void test_adaptive_config() {
 
         std::cout << "\n  Device " << i << " configuration:\n";
         std::cout << "    Batch size: " << config.candidates_per_batch << "\n";
+        std::cout << "    Bloom filter: " << (config.bloom_filter_size / 1024 / 1024) << " MB\n";
         std::cout << "    Buffers: " << config.num_buffers << "\n";
         std::cout << "    Threads/block: " << config.threads_per_block << "\n";
 
         // Verify reasonable values
         assert(config.candidates_per_batch > 0);
+        assert(config.bloom_filter_size > 0);
         assert(config.num_buffers >= 2);
     }
 
@@ -203,7 +205,7 @@ void test_adaptive_config() {
 }
 
 int main() {
-    std::cout << "=== Collider Platform Tests ===\n\n";
+    std::cout << "=== Superflayer Platform Tests ===\n\n";
 
     try {
         test_initialization();

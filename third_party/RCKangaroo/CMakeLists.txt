@@ -19,7 +19,7 @@ add_library(rckangaroo STATIC ${RCKANGAROO_SOURCES})
 set_target_properties(rckangaroo PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
-    CUDA_RUNTIME_LIBRARY ${CMAKE_CUDA_RUNTIME_LIBRARY}
+    CUDA_RUNTIME_LIBRARY Shared
     POSITION_INDEPENDENT_CODE ON
 )
 
@@ -38,7 +38,7 @@ if(MSVC)
     )
 else()
     target_compile_options(rckangaroo PRIVATE
-        $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wno-unused-function -Wno-unknown-pragmas -Wno-comment -Wno-sign-compare -Wno-unused-variable -Wno-unused-result>
+        $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wno-unused-function>
     )
 endif()
 

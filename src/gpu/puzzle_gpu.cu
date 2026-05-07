@@ -226,20 +226,16 @@ uint64_t GPUPuzzleSolver::calibrate_batch_size(int iterations_per_test) {
     printf("[GPU %d] Calibrating batch size for %s (%d SMs)...\n",
            device_id_, props.name, props.multiProcessorCount);
 
-    // Test batch sizes from 1M to 2B (large VRAM GPUs test higher)
+    // Test batch sizes from 1M to 128M
     const uint64_t test_sizes[] = {
-        1'000'000,      // 1M
-        2'000'000,      // 2M
-        4'000'000,      // 4M
-        8'000'000,      // 8M
-        16'000'000,     // 16M
-        32'000'000,     // 32M
-        64'000'000,     // 64M
-        128'000'000,    // 128M
-        256'000'000,    // 256M
-        512'000'000,    // 512M
-        1'000'000'000,  // 1B
-        2'000'000'000   // 2B
+        1'000'000,    // 1M
+        2'000'000,    // 2M
+        4'000'000,    // 4M
+        8'000'000,    // 8M
+        16'000'000,   // 16M
+        32'000'000,   // 32M
+        64'000'000,   // 64M
+        128'000'000   // 128M
     };
     const int num_sizes = sizeof(test_sizes) / sizeof(test_sizes[0]);
 
@@ -253,19 +249,12 @@ uint64_t GPUPuzzleSolver::calibrate_batch_size(int iterations_per_test) {
     for (int s = 0; s < num_sizes; s++) {
         uint64_t batch_size = test_sizes[s];
 
-        // Skip sizes that would exceed the VRAM batch budget
+        // Skip sizes that would use too much memory
+        // Each key needs ~32 bytes for EC point, rough estimate
         size_t estimated_mem = batch_size * 32;
-        size_t reserved = (props.totalGlobalMem >= 16ULL * 1024 * 1024 * 1024)
-            ? 4ULL * 1024 * 1024 * 1024
-            : (props.totalGlobalMem >= 8ULL * 1024 * 1024 * 1024)
-                ? 2ULL * 1024 * 1024 * 1024
-                : 1ULL * 1024 * 1024 * 1024;
-        size_t batch_budget = (props.totalGlobalMem - reserved) * 80 / 100;
-        if (estimated_mem > batch_budget) {
-            printf("[GPU %d]   Skipping %lluM (would exceed VRAM budget of %llu MB)\n",
-                   device_id_,
-                   (unsigned long long)(batch_size / 1'000'000),
-                   (unsigned long long)(batch_budget / (1024 * 1024)));
+        if (estimated_mem > props.totalGlobalMem / 2) {
+            printf("[GPU %d]   Skipping %lluM (would exceed memory)\n",
+                   device_id_, (unsigned long long)(batch_size / 1'000'000));
             continue;
         }
 

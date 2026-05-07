@@ -1,0 +1,227 @@
+# Minecraft Terms and References
+minecraft
+creeper
+aww man
+so we back in the mine
+steve
+alex
+herobrine
+notch
+mojang
+microsoft
+crafting table
+furnace
+enchanting table
+anvil
+brewing stand
+beacon
+end portal
+nether portal
+stronghold
+village
+pillager outpost
+woodland mansion
+ocean monument
+desert temple
+jungle temple
+igloo
+shipwreck
+buried treasure
+mineshaft
+dungeon
+ravine
+cave
+deep dark
+ancient city
+warden
+sculk
+sculk sensor
+sculk shrieker
+sculk catalyst
+diamond
+emerald
+netherite
+gold
+iron
+coal
+redstone
+lapis lazuli
+obsidian
+bedrock
+cobblestone
+stone
+dirt
+grass block
+sand
+gravel
+oak
+birch
+spruce
+dark oak
+jungle
+acacia
+cherry
+mangrove
+bamboo
+crimson
+warped
+nether brick
+end stone
+purpur
+prismarine
+deepslate
+tuff
+dripstone
+copper
+amethyst
+calcite
+smooth basalt
+enderman
+zombie
+skeleton
+spider
+cave spider
+witch
+slime
+phantom
+drowned
+husk
+stray
+wither skeleton
+blaze
+ghast
+magma cube
+piglin
+piglin brute
+hoglin
+zoglin
+zombified piglin
+strider
+ender dragon
+wither
+elder guardian
+guardian
+shulker
+endermite
+silverfish
+ravager
+evoker
+vindicator
+vex
+pillager
+illusioner
+iron golem
+snow golem
+wolf
+cat
+ocelot
+parrot
+fox
+axolotl
+glow squid
+allay
+frog
+tadpole
+sniffer
+camel
+horse
+donkey
+mule
+llama
+trader llama
+wandering trader
+villager
+zombie villager
+nitwit
+armorer
+butcher
+cartographer
+cleric
+farmer
+fisherman
+fletcher
+leatherworker
+librarian
+mason
+shepherd
+toolsmith
+weaponsmith
+enchantment
+sharpness
+smite
+bane of arthropods
+knockback
+fire aspect
+looting
+sweeping edge
+unbreaking
+mending
+curse of vanishing
+curse of binding
+protection
+fire protection
+blast protection
+projectile protection
+feather falling
+respiration
+aqua affinity
+thorns
+depth strider
+frost walker
+soul speed
+swift sneak
+efficiency
+silk touch
+fortune
+infinity
+flame
+punch
+power
+multishot
+piercing
+quick charge
+loyalty
+riptide
+channeling
+impaling
+lure
+luck of the sea
+elytra
+totem of undying
+trident
+crossbow
+shield
+netherite sword
+diamond pickaxe
+diamond axe
+diamond shovel
+diamond hoe
+golden apple
+enchanted golden apple
+notch apple
+god apple
+cake
+pumpkin pie
+suspicious stew
+honey bottle
+milk bucket
+water bucket
+lava bucket
+powder snow bucket
+ender pearl
+eye of ender
+blaze rod
+blaze powder
+nether star
+dragon egg
+dragon breath
+chorus fruit
+shulker shell
+shulker box
+bundle
+firework rocket
+firework star
+spectral arrow
+tipped arrow
+lingering potion
+splash potion

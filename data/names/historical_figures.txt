@@ -1,0 +1,187 @@
+george washington
+abraham lincoln
+thomas jefferson
+benjamin franklin
+alexander hamilton
+john adams
+james madison
+theodore roosevelt
+franklin roosevelt
+john kennedy
+ronald reagan
+barack obama
+donald trump
+joe biden
+winston churchill
+margaret thatcher
+queen elizabeth
+queen victoria
+king henry
+king arthur
+william shakespeare
+charles dickens
+mark twain
+ernest hemingway
+f scott fitzgerald
+jane austen
+emily bronte
+charlotte bronte
+oscar wilde
+edgar allan poe
+hp lovecraft
+jules verne
+hg wells
+isaac asimov
+arthur clarke
+ray bradbury
+philip dick
+george orwell
+aldous huxley
+albert einstein
+isaac newton
+galileo galilei
+nicolaus copernicus
+charles darwin
+nikola tesla
+thomas edison
+alexander bell
+marie curie
+louis pasteur
+sigmund freud
+carl jung
+friedrich nietzsche
+karl marx
+adam smith
+john locke
+thomas hobbes
+rene descartes
+immanuel kant
+socrates
+plato
+aristotle
+alexander the great
+julius caesar
+augustus caesar
+nero
+caligula
+marcus aurelius
+cleopatra
+genghis khan
+kublai khan
+attila the hun
+napoleon bonaparte
+adolf hitler
+joseph stalin
+mao zedong
+vladimir lenin
+fidel castro
+che guevara
+mahatma gandhi
+nelson mandela
+martin luther king
+malcolm x
+rosa parks
+harriet tubman
+frederick douglass
+sojourner truth
+susan anthony
+elizabeth stanton
+mother teresa
+dalai lama
+pope francis
+pope john paul
+joan of arc
+leonardo da vinci
+michelangelo
+raphael
+donatello
+botticelli
+rembrandt
+vermeer
+van gogh
+monet
+renoir
+picasso
+salvador dali
+frida kahlo
+andy warhol
+jackson pollock
+mozart
+beethoven
+bach
+chopin
+tchaikovsky
+vivaldi
+handel
+brahms
+wagner
+debussy
+stravinsky
+elvis presley
+frank sinatra
+dean martin
+sammy davis
+bing crosby
+nat king cole
+louis armstrong
+duke ellington
+miles davis
+john coltrane
+charlie parker
+dizzy gillespie
+billie holiday
+ella fitzgerald
+nina simone
+aretha franklin
+ray charles
+james brown
+bob marley
+jimi hendrix
+janis joplin
+jim morrison
+kurt cobain
+freddie mercury
+david bowie
+john lennon
+paul mccartney
+george harrison
+ringo starr
+mick jagger
+keith richards
+robert plant
+jimmy page
+roger waters
+david gilmour
+angus young
+ozzy osbourne
+james hetfield
+axl rose
+slash
+eddie van halen
+steve jobs
+bill gates
+elon musk
+jeff bezos
+mark zuckerberg
+larry page
+sergey brin
+jack dorsey
+satoshi nakamoto
+vitalik buterin
+alan turing
+tim berners lee
+linus torvalds
+dennis ritchie
+ken thompson
+bjarne stroustrup
+guido van rossum
+james gosling
+brendan eich
+larry wall
+rasmus lerdorf
+yukihiro matsumoto
+richard stallman
+john carmack
+gabe newell
+shigeru miyamoto
+hideo kojima

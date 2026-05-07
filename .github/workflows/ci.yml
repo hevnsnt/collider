@@ -1,0 +1,119 @@
+name: CI Build
+
+# Build-only validation for PRs and pushes to main / full-opto.
+# Mirrors the toolchain matrix in release.yml but skips packaging
+# and artifact upload -- this is a "does it compile + link on each
+# platform" gate, not a release pipeline.
+
+on:
+  pull_request:
+    branches:
+      - main
+      - full-opto
+  push:
+    branches:
+      - main
+      - full-opto
+  workflow_dispatch:
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Linux x64 + CUDA
+  # ---------------------------------------------------------------------------
+  linux-cuda:
+    name: Linux x64 (CUDA)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+
+      - name: Install CUDA Toolkit 12.6
+        uses: Jimver/cuda-toolkit@v0.2.19
+        with:
+          cuda: "12.6.0"
+          method: "network"
+          sub-packages: '["nvcc", "cudart"]'
+
+      - name: Configure (FREE build, COLLIDER_PRO=OFF)
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+            -DCOLLIDER_PRO=OFF \
+            -DCOLLIDER_USE_CUDA=ON \
+            -DCOLLIDER_BUILD_TESTS=OFF \
+            -DCOLLIDER_BUILD_BENCHMARKS=OFF \
+            -DCMAKE_CUDA_ARCHITECTURES="75;80;86;89"
+
+      - name: Build
+        run: cmake --build build --config ${{ env.BUILD_TYPE }} -j4
+
+  # ---------------------------------------------------------------------------
+  # Windows x64 + CUDA
+  # ---------------------------------------------------------------------------
+  windows-cuda:
+    name: Windows x64 (CUDA)
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CUDA Toolkit 12.6
+        uses: Jimver/cuda-toolkit@v0.2.19
+        with:
+          cuda: "12.6.0"
+          method: "network"
+          sub-packages: '["nvcc", "cudart", "visual_studio_integration"]'
+
+      - name: Setup MSVC x64 environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install Ninja
+        run: choco install ninja -y
+
+      - name: Configure (FREE build, COLLIDER_PRO=OFF)
+        env:
+          VCPKG_ROOT: 'C:\vcpkg'
+        run: |
+          cmake -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} `
+            -DCOLLIDER_PRO=OFF `
+            -DCOLLIDER_USE_CUDA=ON `
+            -DCOLLIDER_BUILD_TESTS=OFF `
+            -DCOLLIDER_BUILD_BENCHMARKS=OFF `
+            -DCMAKE_CUDA_ARCHITECTURES="75;80;86;89"
+
+      - name: Build
+        run: cmake --build build --config ${{ env.BUILD_TYPE }} -j4
+
+  # ---------------------------------------------------------------------------
+  # macOS arm64 + Metal
+  # ---------------------------------------------------------------------------
+  macos-metal:
+    name: macOS arm64 (Metal)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tooling
+        run: brew install cmake ninja
+
+      - name: Configure (FREE build, COLLIDER_PRO=OFF, Metal backend)
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+            -DCOLLIDER_PRO=OFF \
+            -DCOLLIDER_USE_CUDA=OFF \
+            -DCOLLIDER_USE_METAL=ON \
+            -DCOLLIDER_BUILD_TESTS=OFF \
+            -DCOLLIDER_BUILD_BENCHMARKS=OFF
+
+      - name: Build
+        run: cmake --build build --config ${{ env.BUILD_TYPE }} -j4

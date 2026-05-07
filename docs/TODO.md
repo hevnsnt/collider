@@ -24,12 +24,12 @@
 ## Performance Optimizations
 
 ### Double-Buffering Pipeline
-- [ ] Implement true async double-buffering for brainwallet mode
-- [ ] Overlap GPU compute with CPU passphrase generation
-- [ ] Use CUDA streams and events for pipelining
+- [x] Implement true async double-buffering for brainwallet mode
+- [x] Overlap GPU compute with CPU passphrase generation
+- [ ] Use CUDA streams and events for pipelining (GPU-side double-buffering)
 
 ### Multi-GPU Improvements
-- [ ] Parallelize bloom filter loading across GPUs
+- [x] Parallelize bloom filter loading across GPUs (implemented via threads)
 - [ ] Auto-tune batch size per GPU based on memory/compute ratio
 - [ ] Better load balancing for heterogeneous GPU configurations
 

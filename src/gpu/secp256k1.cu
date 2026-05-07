@@ -4,11 +4,9 @@
  * High-performance elliptic curve operations for brain wallet research.
  * Implements all critical optimizations:
  * - Precomputed table for windowed scalar multiplication (16x speedup)
- * - Schoolbook multiplication with secp256k1 special-form fast reduction
- *   (p = 2^256 - 2^32 - 977, NOT Montgomery form)
+ * - Montgomery arithmetic for field operations
  * - Batch inversion using Montgomery's Trick (85x speedup on inversions)
  * - Optimized Jacobian coordinate arithmetic
- * - PTX inline assembly for carry chain optimization
  *
  * Target: 2.5B+ scalar multiplications per second per RTX 5090
  */
@@ -16,7 +14,6 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 #include <cstdio>
-#include <mutex>
 
 namespace collider {
 namespace gpu {
@@ -49,8 +46,7 @@ static __constant__ uint32_t SECP256K1_GY[8] = {
     0x0E1108A8, 0x5DA4FBFC, 0x26A3C465, 0x483ADA77
 };
 
-// Montgomery constants - NOT USED. Field arithmetic uses schoolbook multiply
-// with secp256k1 special-form reduction. Reserved for potential future use.
+// Montgomery constants - reserved for future Montgomery form optimizations
 // static __constant__ uint32_t MONT_R[8] = {
 //     0x000003D1, 0x00000001, 0x00000000, 0x00000000,
 //     0x00000000, 0x00000000, 0x00000000, 0x00000000
@@ -60,10 +56,6 @@ static __constant__ uint32_t SECP256K1_GY[8] = {
 //     0x00000000, 0x00000000, 0x00000000, 0x00000000
 // };
 // static __constant__ uint32_t MONT_N_PRIME = 0xD2253531;
-
-static constexpr uint32_t SECP256K1_C_LO = 977;  // Low part of c = 2^32 + 977
-
-#define MAX_TSIZE 4096  // Maximum table entries per window for batch inversion arrays
 
 // =============================================================================
 // GLV ENDOMORPHISM CONSTANTS (1.5x speedup for scalar multiplication)
@@ -211,6 +203,39 @@ __device__ __forceinline__ void uint256_load_const(uint256& a, const uint32_t* c
 // =============================================================================
 
 /**
+ * PTX-optimized multiply-add with carry using IADD3 instruction.
+ * IADD3 is a 3-input adder available on Volta+ (SM 7.0+) that's faster
+ * than chained IMAD for carry propagation in multi-precision arithmetic.
+ *
+ * Computes: result = a * b + c + carry_in, returns carry_out
+ */
+__device__ __forceinline__ uint32_t mul_add_carry_ptx(
+    uint32_t a, uint32_t b, uint32_t c, uint32_t carry_in, uint32_t* result_lo
+) {
+    uint32_t lo, hi;
+
+    // Use PTX inline assembly for optimal instruction selection
+    // mad.lo.cc.u32: multiply a*b, add c, with carry out
+    // madc.hi.u32: get high 32 bits with carry in
+    asm volatile (
+        "{\n\t"
+        "  .reg .u32 tmp;\n\t"
+        "  mul.lo.u32 %0, %2, %3;\n\t"       // lo = a * b (low 32 bits)
+        "  mul.hi.u32 %1, %2, %3;\n\t"       // hi = a * b (high 32 bits)
+        "  add.cc.u32 %0, %0, %4;\n\t"       // lo += c with carry
+        "  addc.u32 %1, %1, 0;\n\t"          // hi += carry
+        "  add.cc.u32 %0, %0, %5;\n\t"       // lo += carry_in with carry
+        "  addc.u32 %1, %1, 0;\n\t"          // hi += carry
+        "}\n\t"
+        : "=r"(lo), "=r"(hi)
+        : "r"(a), "r"(b), "r"(c), "r"(carry_in)
+    );
+
+    *result_lo = lo;
+    return hi;
+}
+
+/**
  * PTX-optimized 256x256→512 bit multiplication using IMAD/IADD3.
  * Uses explicit carry chains for better instruction scheduling.
  */
@@ -254,17 +279,25 @@ __device__ void uint256_mul_512_ptx(
             carry = hi;
         }
 
-        // Propagate final carry with overflow protection
-        {
-            uint64_t sum = (uint64_t)result[i+8] + carry;
-            result[i+8] = (uint32_t)sum;
-            uint32_t prop = (uint32_t)(sum >> 32);
-            for (int j = i+9; j < 16 && prop; j++) {
-                sum = (uint64_t)result[j] + prop;
-                result[j] = (uint32_t)sum;
-                prop = (uint32_t)(sum >> 32);
-            }
-        }
+        // Propagate final carry
+        result[i+8] += carry;
+    }
+}
+
+/**
+ * Fast reduction mod p using secp256k1's special prime form.
+ * p = 2^256 - 2^32 - 977 = 2^256 - c where c = 0x1000003D1
+ */
+__device__ __forceinline__ void mod_reduce(uint256& a) {
+    uint256 p;
+    uint256_load_const(p, SECP256K1_P);
+
+    // mod_mul's overflow correction can leave a in roughly [0, 4p), and on
+    // pathological inputs the second-pass extra*c add can push that higher.
+    // Loop until canonical to be safe; the loop body is trivially bounded by
+    // ceil(a/p) which is a small constant (<=4) for any value mod_mul produces.
+    while (uint256_cmp(a, p) >= 0) {
+        uint256_sub(a, a, p);
     }
 }
 
@@ -297,6 +330,19 @@ __device__ __forceinline__ void mod_sub(uint256& result, const uint256& a, const
 }
 
 /**
+ * Modular negation: result = -a mod p = p - a
+ */
+__device__ __forceinline__ void mod_neg(uint256& result, const uint256& a) {
+    if (a.is_zero()) {
+        result.set_zero();
+        return;
+    }
+    uint256 p;
+    uint256_load_const(p, SECP256K1_P);
+    uint256_sub(result, p, a);
+}
+
+/**
  * Modular multiplication using secp256k1 fast reduction.
  * For a*b mod p where a,b < p.
  * OPTIMIZED: Uses PTX inline assembly for carry chain optimization.
@@ -319,19 +365,26 @@ __device__ void mod_mul(uint256& result, const uint256& a, const uint256& b) {
 
     // Compute high * c where c = 2^32 + 977
     // high * c = high * 2^32 + high * 977
+    // Result occupies up to 9 limbs (288 bits) plus a possible 1-bit overflow.
+    // We MUST capture every carry; dropping any of them produces wrong results
+    // for inputs near p (which intermediate values during mod_inv routinely are).
     uint64_t carry = 0;
-    uint32_t high_c[9] = {0};
+    uint32_t high_c[10] = {0};  // 10 limbs (320 bits) to safely hold high*c
 
-    // high * SECP256K1_C_LO (977)
+    // high * 977
     #pragma unroll
     for (int i = 0; i < 8; i++) {
-        uint64_t term = (uint64_t)prod[i+8] * (uint64_t)SECP256K1_C_LO + carry;
+        uint64_t term = (uint64_t)prod[i+8] * 977ULL + carry;
         high_c[i] = (uint32_t)term;
         carry = term >> 32;
     }
     high_c[8] = (uint32_t)carry;
+    // (high_c[9] stays 0 here; high * 977 fits in 9 limbs since 977 < 2^10.)
 
     // Add high * 2^32 (shift high by 1 limb and add)
+    // CRITICAL: capture the carry-out of the i=8 step into high_c[9].
+    // For random inputs near p, prod[15] can be close to 2^32-1, so the
+    // i=8 addition can overflow and produce a carry that MUST be retained.
     carry = 0;
     #pragma unroll
     for (int i = 1; i < 9; i++) {
@@ -339,6 +392,7 @@ __device__ void mod_mul(uint256& result, const uint256& a, const uint256& b) {
         high_c[i] = (uint32_t)term;
         carry = term >> 32;
     }
+    high_c[9] = (uint32_t)carry;  // Bug fix (2026-05-04): was previously dropped.
 
     // Now add low + high_c[0..7]
     uint256 correction;
@@ -349,193 +403,73 @@ __device__ void mod_mul(uint256& result, const uint256& a, const uint256& b) {
 
     uint32_t c1 = uint256_add(result, low, correction);
 
-    // Handle any overflow from high_c[8] and c1
-    uint64_t extra = (uint64_t)high_c[8] + c1;
+    // Handle any overflow from high_c[8..9] and c1.
+    // Combine into a 64-bit `extra` representing the overflow above 2^256.
+    // We then need to add extra * c (mod p) back into result.
+    // extra * c = extra * 2^32 + extra * 977.
+    // For random inputs near p, extra fits comfortably in 64 bits:
+    //   high_c[9] <= 1, high_c[8] <= ~977 + 1, c1 <= 1, so extra <= ~2^32+979.
+    uint64_t extra = ((uint64_t)high_c[9] << 32)
+                   + (uint64_t)high_c[8]
+                   + (uint64_t)c1;
     if (extra) {
-        // extra * c mod p where c = 2^32 + SECP256K1_C_LO (977)
-        uint32_t e0 = (uint32_t)(extra * (uint64_t)SECP256K1_C_LO);
-        uint32_t e1 = (uint32_t)(extra);
+        // Compute extra * c = extra * 2^32 + extra * 977 as up to 96 bits.
+        // We need to add that into the low 256 bits of `result` and propagate
+        // any carry through ALL eight limbs. Capturing every carry is critical.
+        uint64_t e_x_977 = extra * 977ULL;            // up to ~ 2^42
+        // bits  0..31 of extra*977 land at result[0]
+        // bits 32..63 of extra*977 land at result[1] (added with extra's low32 below)
+        uint32_t add0 = (uint32_t)(e_x_977);
+        uint32_t add1 = (uint32_t)(e_x_977 >> 32);
+        // bits  0..31 of extra (= extra * 2^32 low) land at result[1]
+        // bits 32..63 of extra land at result[2]
+        uint32_t shf1 = (uint32_t)(extra);
+        uint32_t shf2 = (uint32_t)(extra >> 32);
 
-        carry = (uint64_t)result.limbs[0] + e0;
-        result.limbs[0] = (uint32_t)carry;
-        carry = (carry >> 32) + (uint64_t)result.limbs[1] + e1;
-        result.limbs[1] = (uint32_t)carry;
-        carry >>= 32;
+        // 96-bit addend [add0, add1+shf1, shf2] added at limbs [0,1,2]
+        uint64_t s0 = (uint64_t)result.limbs[0] + add0;
+        result.limbs[0] = (uint32_t)s0;
+        uint64_t s1 = (uint64_t)result.limbs[1] + add1 + shf1 + (s0 >> 32);
+        result.limbs[1] = (uint32_t)s1;
+        uint64_t s2 = (uint64_t)result.limbs[2] + shf2 + (s1 >> 32);
+        result.limbs[2] = (uint32_t)s2;
+        carry = s2 >> 32;
 
-        for (int i = 2; i < 8 && carry; i++) {
-            carry = (uint64_t)result.limbs[i] + carry;
-            result.limbs[i] = (uint32_t)carry;
-            carry >>= 32;
+        // Propagate the remaining carry through the upper limbs.
+        #pragma unroll
+        for (int i = 3; i < 8; i++) {
+            uint64_t s = (uint64_t)result.limbs[i] + carry;
+            result.limbs[i] = (uint32_t)s;
+            carry = s >> 32;
+        }
+
+        // If a carry escapes the top limb, fold it back as one more `c`.
+        // (This is rare but must be handled to keep result bounded for the
+        // canonical reduction below.)
+        if (carry) {
+            uint64_t ec = carry * 0x1000003D1ULL;  // c = 2^32 + 977
+            uint64_t s = (uint64_t)result.limbs[0] + (uint32_t)ec;
+            result.limbs[0] = (uint32_t)s;
+            uint64_t hi = (ec >> 32) + (s >> 32);
+            for (int i = 1; i < 8; i++) {
+                uint64_t s2 = (uint64_t)result.limbs[i] + (uint32_t)hi;
+                result.limbs[i] = (uint32_t)s2;
+                hi = (hi >> 32) + (s2 >> 32);
+                if (hi == 0) break;
+            }
         }
     }
 
-    // Note: carry from reduction is bounded; conditional subtractions below handle any residual >= P
-
-    // Final conditional subtraction if result >= P
-    {
-        uint256 p;
-        uint256_load_const(p, SECP256K1_P);
-        if (uint256_cmp(result, p) >= 0) {
-            uint256_sub(result, result, p);
-        }
-        if (uint256_cmp(result, p) >= 0) {
-            uint256_sub(result, result, p);
-        }
-    }
+    // Final canonical reduction (loops while result >= p; bounded by a small
+    // constant in practice).
+    mod_reduce(result);
 }
 
 /**
- * Dedicated modular squaring exploiting symmetry of cross-terms.
- * For 8 limbs: 8 diagonal + 28 cross-term multiplies instead of 64.
- * ~30-40% faster than mod_mul(a, a).
+ * Modular squaring (slightly optimized over general multiplication)
  */
-__device__ void mod_sqr(uint256& result, const uint256& a) {
-    uint32_t prod[16];
-
-    // Initialize 512-bit product to zero
-    #pragma unroll
-    for (int i = 0; i < 16; i++) {
-        prod[i] = 0;
-    }
-
-    // Step 1: Compute cross-terms a[i]*a[j] for i < j, accumulate once
-    #pragma unroll
-    for (int i = 0; i < 8; i++) {
-        uint32_t carry = 0;
-        #pragma unroll
-        for (int j = i + 1; j < 8; j++) {
-            uint32_t lo, hi;
-            // a[i] * a[j] + prod[i+j] + carry
-            asm volatile (
-                "{\n\t"
-                "  .reg .u32 t0, t1;\n\t"
-                "  mul.lo.u32 t0, %2, %3;\n\t"
-                "  mul.hi.u32 t1, %2, %3;\n\t"
-                "  add.cc.u32 t0, t0, %4;\n\t"
-                "  addc.u32 t1, t1, 0;\n\t"
-                "  add.cc.u32 %0, t0, %5;\n\t"
-                "  addc.u32 %1, t1, 0;\n\t"
-                "}\n\t"
-                : "=r"(lo), "=r"(hi)
-                : "r"(a.limbs[i]), "r"(a.limbs[j]), "r"(prod[i+j]), "r"(carry)
-            );
-            prod[i+j] = lo;
-            carry = hi;
-        }
-        uint64_t sum64 = (uint64_t)prod[i+8] + carry;
-        prod[i+8] = (uint32_t)sum64;
-        uint32_t prop = (uint32_t)(sum64 >> 32);
-        for (int j = i+9; j < 16 && prop; j++) {
-            sum64 = (uint64_t)prod[j] + prop;
-            prod[j] = (uint32_t)sum64;
-            prop = (uint32_t)(sum64 >> 32);
-        }
-    }
-
-    // Step 2: Double the cross-terms (shift entire 512-bit result left by 1 bit)
-    uint32_t top_bit = 0;
-    #pragma unroll
-    for (int i = 0; i < 16; i++) {
-        uint32_t new_top = prod[i] >> 31;
-        prod[i] = (prod[i] << 1) | top_bit;
-        top_bit = new_top;
-    }
-
-    // Step 3: Add diagonal terms a[i]*a[i] at positions [2i, 2i+1]
-    uint64_t dcarry = 0;
-    #pragma unroll
-    for (int i = 0; i < 8; i++) {
-        uint32_t lo, hi;
-        asm volatile (
-            "mul.lo.u32 %0, %2, %2;\n\t"
-            "mul.hi.u32 %1, %2, %2;\n\t"
-            : "=r"(lo), "=r"(hi)
-            : "r"(a.limbs[i])
-        );
-
-        uint64_t sum = (uint64_t)prod[2*i] + lo + dcarry;
-        prod[2*i] = (uint32_t)sum;
-        dcarry = sum >> 32;
-
-        sum = (uint64_t)prod[2*i + 1] + hi + dcarry;
-        prod[2*i + 1] = (uint32_t)sum;
-        dcarry = sum >> 32;
-    }
-
-    // Step 4: secp256k1 fast reduction (identical to mod_mul)
-    // p = 2^256 - c, where c = 2^32 + 977
-
-    uint256 low;
-    #pragma unroll
-    for (int i = 0; i < 8; i++) {
-        low.limbs[i] = prod[i];
-    }
-
-    // Compute high * c where c = 2^32 + 977
-    // high * c = high * 2^32 + high * 977
-    uint64_t carry = 0;
-    uint32_t high_c[9] = {0};
-
-    // high * SECP256K1_C_LO (977)
-    #pragma unroll
-    for (int i = 0; i < 8; i++) {
-        uint64_t term = (uint64_t)prod[i+8] * (uint64_t)SECP256K1_C_LO + carry;
-        high_c[i] = (uint32_t)term;
-        carry = term >> 32;
-    }
-    high_c[8] = (uint32_t)carry;
-
-    // Add high * 2^32 (shift high by 1 limb and add)
-    carry = 0;
-    #pragma unroll
-    for (int i = 1; i < 9; i++) {
-        uint64_t term = (uint64_t)high_c[i] + prod[i+7] + carry;
-        high_c[i] = (uint32_t)term;
-        carry = term >> 32;
-    }
-
-    // Now add low + high_c[0..7]
-    uint256 correction;
-    #pragma unroll
-    for (int i = 0; i < 8; i++) {
-        correction.limbs[i] = high_c[i];
-    }
-
-    uint32_t c1 = uint256_add(result, low, correction);
-
-    // Handle any overflow from high_c[8] and c1
-    uint64_t extra = (uint64_t)high_c[8] + c1;
-    if (extra) {
-        // extra * c mod p where c = 2^32 + SECP256K1_C_LO (977)
-        uint32_t e0 = (uint32_t)(extra * (uint64_t)SECP256K1_C_LO);
-        uint32_t e1 = (uint32_t)(extra);
-
-        carry = (uint64_t)result.limbs[0] + e0;
-        result.limbs[0] = (uint32_t)carry;
-        carry = (carry >> 32) + (uint64_t)result.limbs[1] + e1;
-        result.limbs[1] = (uint32_t)carry;
-        carry >>= 32;
-
-        for (int i = 2; i < 8 && carry; i++) {
-            carry = (uint64_t)result.limbs[i] + carry;
-            result.limbs[i] = (uint32_t)carry;
-            carry >>= 32;
-        }
-    }
-
-    // Note: carry from reduction is bounded; conditional subtractions below handle any residual >= P
-
-    // Final conditional subtraction if result >= P
-    {
-        uint256 p;
-        uint256_load_const(p, SECP256K1_P);
-        if (uint256_cmp(result, p) >= 0) {
-            uint256_sub(result, result, p);
-        }
-        if (uint256_cmp(result, p) >= 0) {
-            uint256_sub(result, result, p);
-        }
-    }
+__device__ __forceinline__ void mod_sqr(uint256& result, const uint256& a) {
+    mod_mul(result, a, a);  // Could optimize further with squaring-specific code
 }
 
 /**
@@ -549,108 +483,69 @@ __device__ void mod_sqr(uint256& result, const uint256& a) {
  *
  * Based on the libsecp256k1 addition chain which is near-optimal.
  */
-__device__ void mod_inv(uint256& result, const uint256& a) {
-    uint256 x2, x3, x6, x9, x11, x22, x44, x88, x176, x220, x223, t1;
+__device__ void mod_inv(uint256& r, const uint256& a) {
+    // Wave 1 / C-CRIT-2 fix (2026-05-04 v3):
+    // Right-to-left binary exponentiation of a^(p-2) mod p using the literal
+    // p-2 constant in 8 x uint32 little-endian limbs. Algorithm matches the
+    // working puzzle_optimized.cu mod_inv (which uses 4 x uint64 limbs).
+    //
+    // History:
+    //   v1 (broken): hand-coded addition chain produced wrong exponent.
+    //   v2 (broken): correct binary exponent walk but mod_mul above silently
+    //                dropped a carry from the high*c reduction, corrupting
+    //                ~all multiplications during the long ~248-mul exp chain.
+    //   v3 (fixed):  same exponent walk as v2; mod_mul above is now carry-safe.
+    //                With a correct mod_mul, this walk is correct by inspection.
+    //
+    // p     = 0xFFFFFFFF FFFFFFFF FFFFFFFF FFFFFFFF
+    //         FFFFFFFF FFFFFFFF FFFFFFFE FFFFFC2F (big-endian)
+    // p - 2 = 0xFFFFFFFF FFFFFFFF FFFFFFFF FFFFFFFF
+    //         FFFFFFFF FFFFFFFF FFFFFFFE FFFFFC2D (big-endian)
+    //
+    // In 8 x uint32 LITTLE-endian limbs (limbs[0] = least significant 32 bits):
+    //   limbs[0] = 0xFFFFFC2D, limbs[1] = 0xFFFFFFFE, limbs[2..7] = 0xFFFFFFFF.
+    //
+    // The outer i loop walks limbs LSB->MSB. The inner bit loop walks bits
+    // 0->31 within each limb. So overall we process bit 0 first, bit 255 last,
+    // squaring `base` after each bit (so `base` = a^(2^k) at iteration k) and
+    // accumulating into `result` whenever the corresponding bit of p-2 is 1.
+    //
+    // Total work: 256 squarings + popcount(p-2) = 248 multiplications.
+    //
+    // Aliasing safety: each mod_mul writes to a fresh `tmp`/`tmp2` local,
+    // then we assign back. mod_mul as implemented does NOT require this, but
+    // belt-and-suspenders for a function called ~500 times per inversion.
+    const uint32_t p_minus_2[8] = {
+        0xFFFFFC2Du, 0xFFFFFFFEu, 0xFFFFFFFFu, 0xFFFFFFFFu,
+        0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu
+    };
 
-    // Start building up powers using addition chain
-    // x2 = a^(2^2 - 1) = a^3  (xN convention: N-bit all-ones run)
-    mod_sqr(x2, a);           // a^2
-    mod_mul(x2, x2, a);       // a^3
-
-    // x3 = a^(2^3 - 1) = a^7
-    mod_sqr(x3, x2);          // a^6
-    mod_mul(x3, x3, a);       // a^7
-
-    // x6 = a^(2^6 - 1) = a^63
-    mod_sqr(t1, x3);          // a^14
-    mod_sqr(t1, t1);          // a^28
-    mod_sqr(t1, t1);          // a^56
-    mod_mul(x6, t1, x3);      // a^63
-
-    // x9 = a^(2^9 - 1) = a^511
-    mod_sqr(t1, x6);          // a^126
-    mod_sqr(t1, t1);          // a^252
-    mod_sqr(t1, t1);          // a^504
-    mod_mul(x9, t1, x3);      // a^511
-
-    // x11 = a^(2^11 - 1) = a^2047
-    mod_sqr(t1, x9);          // a^1022
-    mod_sqr(t1, t1);          // a^2044
-    mod_mul(x11, t1, x2);     // a^2047
-
-    // x22 = a^(2^22 - 1)
-    mod_sqr(t1, x11);
+    uint256 result;
+    result.limbs[0] = 1u;
     #pragma unroll
-    for (int i = 0; i < 10; i++) {
-        mod_sqr(t1, t1);      // a^(2^22 - 2^11)
+    for (int i = 1; i < 8; i++) result.limbs[i] = 0u;
+
+    uint256 base = a;
+
+    // Force nvcc not to unroll either loop. Unrolling 256 mod_mul calls would
+    // explode register pressure and instruction cache; #pragma unroll 1 keeps
+    // the loop tight with predictable scheduling.
+    #pragma unroll 1
+    for (int i = 0; i < 8; i++) {
+        uint32_t bits = p_minus_2[i];
+        #pragma unroll 1
+        for (int bit = 0; bit < 32; bit++) {
+            if ((bits >> bit) & 1u) {
+                uint256 tmp;
+                mod_mul(tmp, result, base);
+                result = tmp;
+            }
+            uint256 tmp2;
+            mod_mul(tmp2, base, base);
+            base = tmp2;
+        }
     }
-    mod_mul(x22, t1, x11);    // a^(2^22 - 1)
-
-    // x44 = a^(2^44 - 1)
-    mod_sqr(t1, x22);
-    #pragma unroll
-    for (int i = 0; i < 21; i++) {
-        mod_sqr(t1, t1);      // a^(2^44 - 2^22)
-    }
-    mod_mul(x44, t1, x22);    // a^(2^44 - 1)
-
-    // x88 = a^(2^88 - 1)
-    mod_sqr(t1, x44);
-    #pragma unroll
-    for (int i = 0; i < 43; i++) {
-        mod_sqr(t1, t1);      // a^(2^88 - 2^44)
-    }
-    mod_mul(x88, t1, x44);    // a^(2^88 - 1)
-
-    // x176 = a^(2^176 - 1)
-    mod_sqr(t1, x88);
-    #pragma unroll
-    for (int i = 0; i < 87; i++) {
-        mod_sqr(t1, t1);      // a^(2^176 - 2^88)
-    }
-    mod_mul(x176, t1, x88);   // a^(2^176 - 1)
-
-    // x220 = a^(2^220 - 1)
-    mod_sqr(t1, x176);
-    #pragma unroll
-    for (int i = 0; i < 43; i++) {
-        mod_sqr(t1, t1);      // a^(2^220 - 2^44)
-    }
-    mod_mul(x220, t1, x44);   // a^(2^220 - 1)
-
-    // x223 = a^(2^223 - 1)
-    // From x220, we square 3 times and multiply by x3 = a^7
-    mod_sqr(t1, x220);        // a^(2^221 - 2)
-    mod_sqr(t1, t1);          // a^(2^222 - 4)
-    mod_sqr(t1, t1);          // a^(2^223 - 8)
-    mod_mul(x223, t1, x3);    // a^(2^223 - 1) since x3 = a^7
-
-    // p-2 = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2D
-    // Structure from bit 255 down: 223 ones, 1 zero (bit 32), 22 ones (bits 31..10),
-    // then bits 9..0 = 0000101101
-
-    mod_sqr(t1, x223);
-    #pragma unroll
-    for (int i = 0; i < 22; i++) {
-        mod_sqr(t1, t1);
-    }
-    mod_mul(t1, t1, x22);
-    // t1 = a^(2^246 - 2^22 - 1) -- covers bits 255..10
-
-    // Remaining bits 9..0 = 0000101101
-    mod_sqr(t1, t1);  // bit 9 = 0
-    mod_sqr(t1, t1);  // bit 8 = 0
-    mod_sqr(t1, t1);  // bit 7 = 0
-    mod_sqr(t1, t1);  // bit 6 = 0
-    mod_sqr(t1, t1);  // bit 5 = 1
-    mod_mul(t1, t1, a);
-    mod_sqr(t1, t1);  // bit 4 = 0
-    mod_sqr(t1, t1);  // bits 3,2 = 11
-    mod_sqr(t1, t1);
-    mod_mul(t1, t1, x2);
-    mod_sqr(t1, t1);  // bit 1 = 0
-    mod_sqr(t1, t1);  // bit 0 = 1
-    mod_mul(result, t1, a);
+    r = result;
 }
 
 // =============================================================================
@@ -833,99 +728,107 @@ __device__ void glv_endomorphism_jacobian(ECPointJacobian& result, const ECPoint
     result.Z = P.Z;
 }
 
-// NOTE: GLV scalar multiplication lives in puzzle_optimized.cu which has the
-// correct Babai's algorithm decomposition using precomputed lattice vectors.
-// The glv_endomorphism() function above is the only GLV utility needed here.
+/**
+ * 128-bit structure for GLV decomposition results
+ */
+struct uint128 {
+    uint32_t limbs[4];
 
-// =============================================================================
-// PRECOMPUTED TABLE FOR SCALAR MULTIPLICATION (SCALABLE)
-// =============================================================================
+    __device__ __forceinline__ bool is_zero() const {
+        return (limbs[0] | limbs[1] | limbs[2] | limbs[3]) == 0;
+    }
 
-// Runtime-configurable EC table parameters.
-// Window size is selected at init based on available VRAM:
-//   <8 GB  -> 5-bit (32 pts/window, 52 windows, ~106 KB)
-//   8-16   -> 6-bit (64 pts/window, 43 windows, ~176 KB)
-//   16-48  -> 8-bit (256 pts/window, 32 windows, ~524 KB)
-//   48-64  -> 10-bit (1024 pts/window, 26 windows, ~1.7 MB)
-//   64+    -> 12-bit (4096 pts/window, 22 windows, ~5.5 MB)
-
-struct ECTableConfig {
-    int window_bits;    // 5, 6, 8, 10, or 12
-    int table_size;     // 1 << window_bits (points per window)
-    int num_windows;    // ceil(256 / window_bits)
-    size_t total_bytes; // num_windows * table_size * sizeof(PrecomputedPoint)
+    __device__ __forceinline__ int get_bit(int idx) const {
+        return (limbs[idx / 32] >> (idx % 32)) & 1;
+    }
 };
 
-// Host-side config (static linkage, set once during init)
-static ECTableConfig g_ec_config = {5, 32, 52, 52ULL * 32 * sizeof(PrecomputedPoint)};
+/**
+ * GLV scalar decomposition: k = k1 + k2 * lambda (mod n)
+ * Splits a 256-bit scalar into two ~128-bit scalars for faster multiplication.
+ * Uses the extended Euclidean algorithm basis from libsecp256k1.
+ */
+// Wave 1 / C-CRIT-3 (2026-05-04): the prior glv_decompose, ec_mul_glv, and
+// ec_add_glv_affine were removed.
+//
+// Reason: glv_decompose was not a real GLV decomposition. It split k at the
+// 128-bit boundary (k1 = low128(k), k2 = high128(k)) instead of solving the
+// lattice problem k = k1 + k2*lambda (mod n). Since 2^128 != lambda (mod n),
+// the resulting k1*G + k2*(lambda*G) != k*G for almost any k. ec_mul_glv was
+// therefore a silent landmine: anyone wiring it up for the "30% speedup"
+// would have computed wrong pubkeys.
+//
+// Currently no caller uses these (ec_mul_optimized -> ec_mul_windowed). The
+// GLV constants in this file remain available for a future correct
+// implementation. To re-enable GLV, port libsecp256k1's
+// secp256k1_scalar_split_lambda (lattice-reduction-based decomposition).
+//
+// glv_endomorphism (point P -> (beta*x, y)) and glv_endomorphism_jacobian
+// remain; they are mathematically correct and harmless if invoked.
 
-// Device-side config (copied to device via cudaMemcpyToSymbol before table gen)
-__device__ ECTableConfig d_ec_config;
+// =============================================================================
+// PRECOMPUTED TABLE FOR SCALAR MULTIPLICATION
+// =============================================================================
 
-static ECTableConfig make_ec_config(int window_bits) {
-    ECTableConfig cfg;
-    cfg.window_bits = window_bits;
-    cfg.table_size  = 1 << window_bits;
-    cfg.num_windows = (256 + window_bits - 1) / window_bits;
-    cfg.total_bytes = (size_t)cfg.num_windows * cfg.table_size * sizeof(PrecomputedPoint);
-    return cfg;
-}
+// Window size for precomputation (w=5 means 32 points per window)
+// OPTIMIZED: 5-bit windows reduce main loop iterations from 64 to 52 (18% fewer)
+// Trade-off: Table grows from 64KB to 103KB, still fits easily in L2 cache
+#define EC_WINDOW_SIZE 5
+#define EC_TABLE_SIZE (1 << EC_WINDOW_SIZE)  // 32 points
+#define EC_NUM_WINDOWS ((256 + EC_WINDOW_SIZE - 1) / EC_WINDOW_SIZE)  // 52 windows
 
-static int select_window_bits(size_t usable_vram) {
-    constexpr size_t GB = 1024ULL * 1024 * 1024;
-    if (usable_vram >= 64 * GB) return 12;
-    if (usable_vram >= 48 * GB) return 10;
-    if (usable_vram >= 16 * GB) return 8;
-    if (usable_vram >=  8 * GB) return 6;
-    return 5;
-}
-
-// Global precomputed table pointer (device memory, L2 cache persistence)
+// Global precomputed table: G, 2G, 3G, ..., 31G, then 32G, 64G, etc.
+// Actually, we store: [0, G, 2G, 3G, ..., 31G] for each window
+// Table[w][i] = i * 2^(w*5) * G
 __device__ PrecomputedPoint* d_precomputed_table;
+// NOTE: Removed __constant__ c_precomputed_table - exceeds 64KB constant memory limit
+// Using g_precomputed_table (device memory) with L2 cache persistence instead
 
 /**
  * Scalar multiplication using windowed method with precomputed table.
  * Much faster than naive double-and-add.
- * Reads window parameters from d_ec_config (set at init time).
+ *
+ * Wave 1 / C-CRIT-1 fix (2026-05-05): the precomputed table layout is
+ *   table[w * EC_TABLE_SIZE + v] = v * 2^(w * EC_WINDOW_SIZE) * G
+ * (see generate_precomputed_table_kernel above, which doubles the accumulating
+ * points EC_WINDOW_SIZE times between windows). The per-window power of two is
+ * therefore already baked into every table entry, so the caller just sums
+ * table[w][window_val_w] across windows -- NO extra inter-window doubling.
+ *
+ * The previous version doubled R by EC_WINDOW_SIZE between iterations, which
+ * multiplied every already-completed window's contribution by another 2^5
+ * each pass. With 52 windows this drove the running point completely off the
+ * scalar; the bug was masked by test_ec_mul_known_answers (k=1,2,3,7) because
+ * those scalars have only window 0 non-zero, and the overshoot is a no-op when
+ * the accumulator is still infinity. Any multi-window scalar (e.g. a SHA256
+ * brain-wallet hash) lit up the bug -- producing wrong public keys downstream.
+ *
+ * The same defect was fixed in fused_pipeline.cu's ec_mul_windowed in commit
+ * 81f3f58/5fac796; this is the matching fix for the standalone library copy.
  */
 __device__ void ec_mul_windowed(
     ECPointAffine& result,
     const uint256& scalar,
     const PrecomputedPoint* table
 ) {
-    const int wbits   = d_ec_config.window_bits;
-    const int tsize   = d_ec_config.table_size;
-    const int nwin    = d_ec_config.num_windows;
-    const uint32_t mask = (uint32_t)tsize - 1;  // bitmask for window extraction
-
     ECPointJacobian R;
     R.set_infinity();
 
-    // Accumulate positional table entries: T[w][v] = v * 2^(w*wbits) * G
-    for (int w = nwin - 1; w >= 0; w--) {
-        // Extract window value from scalar using bit-shift (handles limb spanning)
-        int bit_start = w * wbits;
-        int limb_idx  = bit_start / 32;
-        int bit_off   = bit_start % 32;
+    // Each table entry already carries its window's power of 2; just add them.
+    for (int w = 0; w < EC_NUM_WINDOWS; w++) {
+        int bit_start = w * EC_WINDOW_SIZE;
+        uint32_t window_val = 0;
 
-        uint32_t window_val;
-        if (bit_off + wbits <= 32) {
-            // Window fits within a single limb
-            window_val = (scalar.limbs[limb_idx] >> bit_off) & mask;
-        } else {
-            // Window spans two limbs
-            uint32_t lo = scalar.limbs[limb_idx] >> bit_off;
-            uint32_t hi = (limb_idx + 1 < 8) ? scalar.limbs[limb_idx + 1] : 0;
-            window_val = (lo | (hi << (32 - bit_off))) & mask;
+        #pragma unroll
+        for (int i = 0; i < EC_WINDOW_SIZE && (bit_start + i) < 256; i++) {
+            int limb = (bit_start + i) / 32;
+            int bit = (bit_start + i) % 32;
+            window_val |= ((scalar.limbs[limb] >> bit) & 1) << i;
         }
 
-        // Clamp: if this is the last (most significant) window, bits beyond 256
-        // are zero, so window_val is already correct via the limb reads.
-
-        // Add table[w][window_val] if window_val != 0
         if (window_val != 0) {
             ECPointAffine Q;
-            int table_idx = w * tsize + window_val;
+            int table_idx = w * EC_TABLE_SIZE + window_val;
             Q.x = table[table_idx].x;
             Q.y = table[table_idx].y;
 
@@ -1014,27 +917,23 @@ __device__ void batch_invert(
 /**
  * Batch Jacobian to Affine conversion using batch inversion.
  * Converts multiple Jacobian points to Affine with only one mod_inv.
- *
- * NOTE: scratch must have space for 3*n uint256 values to avoid aliasing.
- * Layout: z_vals[0..n-1], z_inv[0..n-1], products[0..n-1]
  */
 __device__ void batch_jacobian_to_affine(
     ECPointAffine* affine,
     const ECPointJacobian* jacobian,
     int n,
-    uint256* scratch  // Size 3*n (was 2*n -- increased to fix aliasing)
+    uint256* scratch  // Size 2*n
 ) {
     uint256* z_vals = scratch;
     uint256* z_inv = scratch + n;
-    uint256* products = scratch + 2 * n;  // Separate scratch for prefix products
 
     // Extract Z coordinates
     for (int i = 0; i < n; i++) {
         z_vals[i] = jacobian[i].Z;
     }
 
-    // Batch invert Z values using separate products array to avoid aliasing
-    batch_invert(z_inv, z_vals, n, products);
+    // Batch invert Z values
+    batch_invert(z_inv, z_vals, n, z_vals);  // Reuse z_vals as scratch
 
     // Convert each point
     for (int i = 0; i < n; i++) {
@@ -1081,38 +980,12 @@ __global__ void ec_mul_batch_kernel(
  * Batch EC multiplication with PARALLEL batch inversion.
  * Processes BATCH_INV_SIZE keys together to share one inversion.
  * OPTIMIZED: All threads participate in batch conversion, not just thread 0.
- *
- * Shared memory budget at BATCH_INV_SIZE=128:
- *   products[128]     = 128*32 =  4096 bytes
- *   z_inv[128]        = 128*32 =  4096 bytes
- *   jac_points[128]   = 128*96 = 12288 bytes
- *   affine_points[128]= 128*64 =  8192 bytes
- *   Total             =          28672 bytes (~28KB, fits in 48KB default)
- *
- * Previous value of 32 yielded only 32 threads/block (~3% occupancy).
- * 128 threads/block gives 4 warps, a reasonable occupancy improvement.
- * 256 would need ~56KB shared memory, exceeding the 48KB default limit.
  */
-// NOTE: BATCH_INV_SIZE=128 here vs 256 in puzzle_optimized.cu. The value here
-// is constrained by shared memory (128 needs ~28KB, 256 would need ~56KB
-// exceeding the 48KB default). puzzle_optimized.cu uses a different layout.
-#define BATCH_INV_SIZE 128
+#define BATCH_INV_SIZE 32
 
 /**
  * Parallel batch inversion using cooperative threading.
  * All threads participate to amortize the single modular inversion.
- *
- * Threading model:
- *   Steps 1 & 5: All threads participate (parallel Z extraction and affine conversion)
- *   Steps 2-4: Thread 0 only (prefix product scan, single inversion, back-substitution)
- *
- * The prefix product scan and back-substitution are inherently sequential due to
- * data dependencies in Montgomery's trick. The primary parallelism benefit comes
- * from Step 5 where all threads convert their points simultaneously, amortizing
- * the cost of the single mod_inv across all threads.
- *
- * NOTE: Each thread's original Z value is preserved in jacobian[].Z (read-only),
- * so overwriting products[] during the forward pass does not cause aliasing issues.
  */
 __device__ void parallel_batch_jacobian_to_affine(
     ECPointAffine* affine,
@@ -1122,14 +995,13 @@ __device__ void parallel_batch_jacobian_to_affine(
     uint256* z_inv,         // Shared memory: size n
     int thread_idx
 ) {
-    // Step 1: Each thread stores its Z coordinate (parallel)
+    // Step 1: Each thread stores its Z coordinate
     if (thread_idx < n) {
         products[thread_idx] = jacobian[thread_idx].Z;
     }
     __syncthreads();
 
-    // Step 2: Thread 0 computes cumulative products (inherently sequential --
-    // each products[i] depends on products[i-1])
+    // Step 2: Thread 0 computes cumulative products (inherently sequential)
     if (thread_idx == 0) {
         for (int i = 1; i < n; i++) {
             uint256 temp;
@@ -1147,15 +1019,13 @@ __device__ void parallel_batch_jacobian_to_affine(
     }
     __syncthreads();
 
-    // Step 4: Thread 0 computes individual inverses via back-substitution
-    // (inherently sequential -- each step depends on the previous running_inv)
-    // Original Z values are read from jacobian[i].Z, not from products[]
+    // Step 4: Thread 0 computes individual inverses (can't easily parallelize)
     if (thread_idx == 0) {
         uint256 running_inv = inv_all;
         for (int i = n - 1; i > 0; i--) {
             // z_inv[i] = running_inv * products[i-1]
             mod_mul(z_inv[i], running_inv, products[i-1]);
-            // running_inv = running_inv * original_z[i] (from jacobian, not products)
+            // running_inv = running_inv * original_z[i]
             mod_mul(running_inv, running_inv, jacobian[i].Z);
         }
         z_inv[0] = running_inv;
@@ -1214,28 +1084,29 @@ __global__ void ec_mul_batch_optimized_kernel(
 
         // Use windowed method if table available
         if (table != nullptr) {
-            const int wbits = d_ec_config.window_bits;
-            const int tsize = d_ec_config.table_size;
-            const int nwin  = d_ec_config.num_windows;
-            const uint32_t wmask = (uint32_t)tsize - 1;
+            for (int w = EC_NUM_WINDOWS - 1; w >= 0; w--) {
+                if (w < EC_NUM_WINDOWS - 1) {
+                    #pragma unroll
+                    for (int i = 0; i < EC_WINDOW_SIZE; i++) {
+                        ECPointJacobian temp;
+                        ec_double_jacobian(temp, R);
+                        R = temp;
+                    }
+                }
 
-            for (int w = nwin - 1; w >= 0; w--) {
-                int bit_start = w * wbits;
-                int limb_idx  = bit_start / 32;
-                int bit_off   = bit_start % 32;
+                int bit_start = w * EC_WINDOW_SIZE;
+                uint32_t window_val = 0;
 
-                uint32_t window_val;
-                if (bit_off + wbits <= 32) {
-                    window_val = (scalar.limbs[limb_idx] >> bit_off) & wmask;
-                } else {
-                    uint32_t lo = scalar.limbs[limb_idx] >> bit_off;
-                    uint32_t hi = (limb_idx + 1 < 8) ? scalar.limbs[limb_idx + 1] : 0;
-                    window_val = (lo | (hi << (32 - bit_off))) & wmask;
+                #pragma unroll
+                for (int i = 0; i < EC_WINDOW_SIZE && (bit_start + i) < 256; i++) {
+                    int limb = (bit_start + i) / 32;
+                    int bit = (bit_start + i) % 32;
+                    window_val |= ((scalar.limbs[limb] >> bit) & 1) << i;
                 }
 
                 if (window_val != 0) {
                     ECPointAffine Q;
-                    int table_idx = w * tsize + window_val;
+                    int table_idx = w * EC_TABLE_SIZE + window_val;
                     Q.x = table[table_idx].x;
                     Q.y = table[table_idx].y;
 
@@ -1282,91 +1153,52 @@ __global__ void ec_mul_batch_optimized_kernel(
 
 /**
  * Generate precomputed table for windowed multiplication.
- * Each block generates one window's table entries sequentially.
- * Uses Montgomery batch inversion to avoid per-point mod_inv calls.
- *
- * Launch: <<<num_windows, 1>>>  (1 thread per block, inter-window parallelism)
- * Reads config from d_ec_config.
+ * Call once at initialization.
+ * OPTIMIZED: 5-bit windows with 32 points per window.
  */
 __global__ void generate_precomputed_table_kernel(
     PrecomputedPoint* table
 ) {
-    const int wbits = d_ec_config.window_bits;
-    const int tsize = d_ec_config.table_size;
-    const int w     = blockIdx.x;   // which window this block generates
-
-    // table[w * tsize + i] = i * 2^(w * wbits) * G
+    // This kernel generates the table on GPU
+    // table[w * EC_TABLE_SIZE + i] = i * 2^(w*EC_WINDOW_SIZE) * G
 
     ECPointAffine G;
     uint256_load_const(G.x, SECP256K1_GX);
     uint256_load_const(G.y, SECP256K1_GY);
 
-    ECPointJacobian base_jac;
-    base_jac.X = G.x;
-    base_jac.Y = G.y;
-    base_jac.Z.set_one();
+    // Compute 1G, 2G, 3G, ..., 31G (EC_TABLE_SIZE-1 points)
+    ECPointJacobian points[EC_TABLE_SIZE];
+    points[0].set_infinity();  // 0 * G
 
-    // Double (w * wbits) times to get 2^(w*wbits) * G
-    int total_doubles = w * wbits;
-    for (int d = 0; d < total_doubles; d++) {
-        ECPointJacobian temp;
-        ec_double_jacobian(temp, base_jac);
-        base_jac = temp;
+    points[1].X = G.x;
+    points[1].Y = G.y;
+    points[1].Z.set_one();
+
+    for (int i = 2; i < EC_TABLE_SIZE; i++) {
+        ec_add_mixed(points[i], points[i-1], G);
     }
 
-    // Convert base to affine for mixed additions
-    ECPointAffine base_pt;
-    jacobian_to_affine(base_pt, base_jac);
-
-    // Accumulate all multiples in Jacobian form
-    // Local memory arrays (spill to L2 -- acceptable for one-time init)
-    ECPointJacobian jac_points[MAX_TSIZE];
-    jac_points[0].set_infinity();
-    jac_points[1].X = base_pt.x;
-    jac_points[1].Y = base_pt.y;
-    jac_points[1].Z.set_one();
-
-    for (int i = 2; i < tsize; i++) {
-        ec_add_mixed(jac_points[i], jac_points[i-1], base_pt);
+    // Store window 0
+    for (int i = 0; i < EC_TABLE_SIZE; i++) {
+        jacobian_to_affine(*(ECPointAffine*)&table[i], points[i]);
     }
 
-    // Montgomery batch inversion of Z coordinates
-    // Forward pass: compute running products of Z values
-    uint256 products[MAX_TSIZE];
-    products[0] = jac_points[1].Z;  // skip infinity at index 0
-    for (int i = 1; i < tsize - 1; i++) {
-        mod_mul(products[i], products[i-1], jac_points[i+1].Z);
+    // For each subsequent window, multiply by 2^EC_WINDOW_SIZE
+    for (int w = 1; w < EC_NUM_WINDOWS; w++) {
+        // Double EC_WINDOW_SIZE times
+        for (int d = 0; d < EC_WINDOW_SIZE; d++) {
+            for (int i = 1; i < EC_TABLE_SIZE; i++) {
+                ECPointJacobian temp;
+                ec_double_jacobian(temp, points[i]);
+                points[i] = temp;
+            }
+        }
+
+        // Store window w
+        for (int i = 0; i < EC_TABLE_SIZE; i++) {
+            jacobian_to_affine(*(ECPointAffine*)&table[w * EC_TABLE_SIZE + i], points[i]);
+        }
     }
-
-    // Single mod_inv of the final product
-    uint256 inv;
-    mod_inv(inv, products[tsize - 2]);
-
-    // Backward pass: recover individual Z^-1 values and convert to affine
-    for (int i = tsize - 1; i > 1; i--) {
-        uint256 z_inv;
-        mod_mul(z_inv, inv, products[i - 2]);
-        mod_mul(inv, inv, jac_points[i].Z);
-
-        uint256 z_inv_sq;
-        mod_sqr(z_inv_sq, z_inv);
-        mod_mul(table[w * tsize + i].x, jac_points[i].X, z_inv_sq);
-        mod_mul(z_inv_sq, z_inv_sq, z_inv);
-        mod_mul(table[w * tsize + i].y, jac_points[i].Y, z_inv_sq);
-    }
-
-    // Handle index 1 (inv now holds Z_1^-1)
-    {
-        uint256 z_inv_sq;
-        mod_sqr(z_inv_sq, inv);
-        mod_mul(table[w * tsize + 1].x, jac_points[1].X, z_inv_sq);
-        mod_mul(z_inv_sq, z_inv_sq, inv);
-        mod_mul(table[w * tsize + 1].y, jac_points[1].Y, z_inv_sq);
-    }
-
-    // Index 0 is the point at infinity
-    table[w * tsize].x.set_zero();
-    table[w * tsize].y.set_zero();
 }
 
 // =============================================================================
@@ -1375,99 +1207,80 @@ __global__ void generate_precomputed_table_kernel(
 
 extern "C" {
 
-static PrecomputedPoint* g_precomputed_table = nullptr;
-static std::once_flag g_table_init_flag;
+// Per-GPU precomputed tables (support up to 16 GPUs)
+#define MAX_GPU_DEVICES 16
+static PrecomputedPoint* g_precomputed_tables[MAX_GPU_DEVICES] = {nullptr};
 
-cudaError_t secp256k1_init_table(cudaStream_t stream, int window_bits_override) {
-    cudaError_t err = cudaSuccess;
-    std::call_once(g_table_init_flag, [&]() {
-        // Determine window bits: use override if positive, else auto-detect from VRAM
-        int window_bits;
-        if (window_bits_override > 0) {
-            window_bits = window_bits_override;
-        } else {
-            int device;
-            cudaGetDevice(&device);
-            cudaDeviceProp prop;
-            cudaGetDeviceProperties(&prop, device);
-            constexpr size_t GB = 1024ULL * 1024 * 1024;
-            size_t reserved = (prop.totalGlobalMem >= 16 * GB) ? 4 * GB
-                            : (prop.totalGlobalMem >= 8 * GB)  ? 2 * GB
-                            :                                     1 * GB;
-            window_bits = select_window_bits(prop.totalGlobalMem - reserved);
-        }
+cudaError_t secp256k1_init_table(cudaStream_t stream) {
+    // Get current device ID
+    int device_id = 0;
+    cudaError_t err = cudaGetDevice(&device_id);
+    if (err != cudaSuccess) return err;
 
-        // Build and store config
-        g_ec_config = make_ec_config(window_bits);
+    if (device_id >= MAX_GPU_DEVICES) {
+        fprintf(stderr, "[EC] Device ID %d exceeds max supported devices (%d)\n", device_id, MAX_GPU_DEVICES);
+        return cudaErrorInvalidDevice;
+    }
 
-        fprintf(stderr, "[EC] Precomputed table: %d-bit windows, %d windows, %zu KB\n",
-                g_ec_config.window_bits, g_ec_config.num_windows,
-                g_ec_config.total_bytes / 1024);
+    // Check if already initialized for this device
+    if (g_precomputed_tables[device_id] != nullptr) {
+        return cudaSuccess;  // Already initialized for this device
+    }
 
-        // Copy config to device constant memory
-        err = cudaMemcpyToSymbol(d_ec_config, &g_ec_config, sizeof(ECTableConfig));
-        if (err != cudaSuccess) return;
+    // Allocate table on current device
+    size_t table_size = EC_NUM_WINDOWS * EC_TABLE_SIZE * sizeof(PrecomputedPoint);
+    err = cudaMalloc(&g_precomputed_tables[device_id], table_size);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[EC] GPU %d: Failed to allocate precomputed table: %s\n", device_id, cudaGetErrorString(err));
+        return err;
+    }
 
-        // Allocate table on device
-        err = cudaMalloc(&g_precomputed_table, g_ec_config.total_bytes);
-        if (err != cudaSuccess) return;
+    // Generate table on this device
+    generate_precomputed_table_kernel<<<1, 1, 0, stream>>>(g_precomputed_tables[device_id]);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[EC] GPU %d: Failed to generate table: %s\n", device_id, cudaGetErrorString(err));
+        cudaFree(g_precomputed_tables[device_id]);
+        g_precomputed_tables[device_id] = nullptr;
+        return err;
+    }
 
-        // Copy table pointer to device symbol so kernels can access it
-        err = cudaMemcpyToSymbol(d_precomputed_table, &g_precomputed_table, sizeof(PrecomputedPoint*));
-        if (err != cudaSuccess) return;
+    // Wait for generation to complete
+    err = cudaStreamSynchronize(stream);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[EC] GPU %d: Table generation sync failed: %s\n", device_id, cudaGetErrorString(err));
+        return err;
+    }
 
-        // Generate table: one block per window, sequential within each window
-        generate_precomputed_table_kernel<<<g_ec_config.num_windows, 1, 0, stream>>>(
-            g_precomputed_table
-        );
-        err = cudaGetLastError();
-        if (err != cudaSuccess) return;
-
-        err = cudaStreamSynchronize(stream);
-        if (err != cudaSuccess) return;
-
-        // OPTIMIZATION: Enable L2 cache persistence for EC precomputed table
-        // This keeps the table hot in L2 cache across kernel launches
-        #if CUDART_VERSION >= 11040
-        {
-            // Check if device supports L2 persistence before setting the policy
-            int persisting_l2_max = 0;
-            cudaDeviceGetAttribute(&persisting_l2_max,
-                                   cudaDevAttrMaxPersistingL2CacheSize, 0);
-            if (persisting_l2_max > 0) {
-                cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, (size_t)persisting_l2_max);
-
-                // Free edition: EC table gets full L2 persistence budget
-                // (Pro edition uses 25% for EC table, 75% for bloom filter)
-                size_t persist_bytes = g_ec_config.total_bytes;
-                if (persist_bytes > (size_t)persisting_l2_max) {
-                    persist_bytes = (size_t)persisting_l2_max;
-                }
-                cudaStreamAttrValue stream_attr = {};
-                stream_attr.accessPolicyWindow.base_ptr  = g_precomputed_table;
-                stream_attr.accessPolicyWindow.num_bytes  = persist_bytes;
-                stream_attr.accessPolicyWindow.hitRatio   = 1.0f;
-                stream_attr.accessPolicyWindow.hitProp    = cudaAccessPropertyPersisting;
-                stream_attr.accessPolicyWindow.missProp   = cudaAccessPropertyStreaming;
-                err = cudaStreamSetAttribute(stream,
-                                             cudaStreamAttributeAccessPolicyWindow,
-                                             &stream_attr);
-                // Non-fatal if this fails (older GPUs may not support it)
-                if (err != cudaSuccess) {
-                    err = cudaSuccess;
-                }
-            }
-        }
-        #endif
-    });
+    // OPTIMIZATION: Enable L2 cache persistence for EC precomputed table
+    // This keeps the table hot in L2 cache across kernel launches
+    // RTX 5090 has 96MB L2, RTX 4090 has 72MB L2 - table is ~103KB
+    #if CUDART_VERSION >= 11040
+    cudaStreamAttrValue stream_attr = {};
+    stream_attr.accessPolicyWindow.base_ptr = g_precomputed_tables[device_id];
+    stream_attr.accessPolicyWindow.num_bytes = table_size;
+    stream_attr.accessPolicyWindow.hitRatio = 1.0f;  // Always persist
+    stream_attr.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
+    stream_attr.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
+    err = cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &stream_attr);
+    // Non-fatal if this fails (older GPUs may not support it)
+    if (err != cudaSuccess) {
+        err = cudaSuccess;  // Reset error, not critical
+    }
+    #endif
 
     return err;
 }
 
 cudaError_t secp256k1_cleanup() {
-    if (g_precomputed_table != nullptr) {
-        cudaFree(g_precomputed_table);
-        g_precomputed_table = nullptr;
+    // Clean up all device tables
+    for (int i = 0; i < MAX_GPU_DEVICES; i++) {
+        if (g_precomputed_tables[i] != nullptr) {
+            // Need to set device before freeing
+            cudaSetDevice(i);
+            cudaFree(g_precomputed_tables[i]);
+            g_precomputed_tables[i] = nullptr;
+        }
     }
     return cudaSuccess;
 }
@@ -1480,6 +1293,11 @@ cudaError_t secp256k1_batch_mul(
 ) {
     if (count == 0) return cudaSuccess;
 
+    // Get table for current device
+    int device_id = 0;
+    cudaGetDevice(&device_id);
+    PrecomputedPoint* table = (device_id < MAX_GPU_DEVICES) ? g_precomputed_tables[device_id] : nullptr;
+
     // Use optimized kernel with batch inversion
     const int batch_size = BATCH_INV_SIZE;
     const int num_batches = (count + batch_size - 1) / batch_size;
@@ -1487,7 +1305,7 @@ cudaError_t secp256k1_batch_mul(
     ec_mul_batch_optimized_kernel<<<num_batches, batch_size, 0, stream>>>(
         reinterpret_cast<const uint256*>(d_private_keys),
         reinterpret_cast<ECPointAffine*>(d_public_keys),
-        g_precomputed_table,
+        table,
         count
     );
 
@@ -1502,20 +1320,156 @@ cudaError_t secp256k1_batch_mul_simple(
 ) {
     if (count == 0) return cudaSuccess;
 
+    // Get table for current device
+    int device_id = 0;
+    cudaGetDevice(&device_id);
+    PrecomputedPoint* table = (device_id < MAX_GPU_DEVICES) ? g_precomputed_tables[device_id] : nullptr;
+
     const int threads_per_block = 64;  // Lower due to register pressure
     const int blocks = (count + threads_per_block - 1) / threads_per_block;
 
     ec_mul_batch_kernel<<<blocks, threads_per_block, 0, stream>>>(
         reinterpret_cast<const uint256*>(d_private_keys),
         reinterpret_cast<ECPointAffine*>(d_public_keys),
-        g_precomputed_table,
+        table,
         count
     );
 
     return cudaGetLastError();
 }
 
+// Get precomputed table pointer for current device (for use by other kernels)
+void* secp256k1_get_precomputed_table() {
+    int device_id = 0;
+    cudaGetDevice(&device_id);
+    if (device_id >= MAX_GPU_DEVICES) return nullptr;
+    return g_precomputed_tables[device_id];
+}
+
 }  // extern "C"
+
+// =============================================================================
+// TEST INFRASTRUCTURE
+// Wave 0 of the 2026-05-04 review. Permanent test entry points used by
+// tests/test_secp256k1_inv.cu and tests/test_ec_table_consistency.cu.
+// These exercise __device__ functions (mod_inv, mod_mul, EC table) that
+// have no other host-callable surface.
+// =============================================================================
+
+// Verify mod_inv(a) is the modular inverse of a, by computing a * mod_inv(a)
+// and checking the result reduces to 1 (mod p). Per-thread 1-byte result.
+__global__ void test_mod_inv_correctness_kernel(
+    const uint256* __restrict__ scalars,
+    uint8_t* __restrict__ results,
+    size_t count
+) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= count) return;
+
+    uint256 a = scalars[idx];
+
+    // Skip a == 0 (no inverse exists). Caller should not pass zero, but be safe.
+    if (a.is_zero()) { results[idx] = 0; return; }
+
+    uint256 inv;
+    mod_inv(inv, a);
+
+    uint256 product;
+    mod_mul(product, a, inv);
+    mod_reduce(product);
+
+    bool is_one = (product.limbs[0] == 1);
+    #pragma unroll
+    for (int i = 1; i < 8; i++) {
+        if (product.limbs[i] != 0) is_one = false;
+    }
+
+    results[idx] = is_one ? 1 : 0;
+}
+
+// Verify each entry in the per-GPU EC table is on the secp256k1 curve.
+// Curve: y^2 = x^3 + 7 (mod p). Increments off_curve_count for each bad entry.
+__global__ void test_table_on_curve_kernel(
+    const PrecomputedPoint* __restrict__ table,
+    uint32_t* __restrict__ off_curve_count
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = EC_NUM_WINDOWS * EC_TABLE_SIZE;
+    if (idx >= total) return;
+
+    const PrecomputedPoint& p = table[idx];
+
+    // Skip the implicit identity-encoding entry at i=0 of each window if present
+    // (i=0 means 0*G; some impls store as (0,0). Treat (0,0) as on-curve sentinel.)
+    bool x_zero = true, y_zero = true;
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        if (p.x.limbs[i] != 0) x_zero = false;
+        if (p.y.limbs[i] != 0) y_zero = false;
+    }
+    if (x_zero && y_zero) return;  // sentinel for identity
+
+    uint256 x_sq, x_cubed, y_sq, rhs;
+    mod_sqr(x_sq, p.x);
+    mod_mul(x_cubed, x_sq, p.x);
+
+    uint256 seven;
+    seven.limbs[0] = 7;
+    #pragma unroll
+    for (int i = 1; i < 8; i++) seven.limbs[i] = 0;
+
+    mod_add(rhs, x_cubed, seven);
+    mod_sqr(y_sq, p.y);
+
+    mod_reduce(rhs);
+    mod_reduce(y_sq);
+
+    bool on_curve = true;
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        if (y_sq.limbs[i] != rhs.limbs[i]) on_curve = false;
+    }
+
+    if (!on_curve) atomicAdd(off_curve_count, 1u);
+}
+
+extern "C" {
+
+cudaError_t secp256k1_test_inverse_correctness(
+    const void* d_scalars,        // count * 32 bytes
+    uint8_t* d_results,           // count bytes (1=ok, 0=wrong)
+    size_t count,
+    cudaStream_t stream
+) {
+    if (count == 0) return cudaSuccess;
+    const int threads = 64;
+    int blocks = (int)((count + threads - 1) / threads);
+    test_mod_inv_correctness_kernel<<<blocks, threads, 0, stream>>>(
+        reinterpret_cast<const uint256*>(d_scalars),
+        d_results,
+        count
+    );
+    return cudaGetLastError();
+}
+
+cudaError_t secp256k1_test_table_on_curve(
+    uint32_t* d_off_curve_count,  // single uint32, must be zeroed by caller
+    cudaStream_t stream
+) {
+    int device_id = 0;
+    cudaGetDevice(&device_id);
+    if (device_id >= MAX_GPU_DEVICES) return cudaErrorInvalidValue;
+    PrecomputedPoint* table = g_precomputed_tables[device_id];
+    if (table == nullptr) return cudaErrorInvalidValue;
+
+    int total = EC_NUM_WINDOWS * EC_TABLE_SIZE;
+    const int threads = 128;
+    int blocks = (total + threads - 1) / threads;
+    test_table_on_curve_kernel<<<blocks, threads, 0, stream>>>(table, d_off_curve_count);
+    return cudaGetLastError();
+}
+
+}  // extern "C" (test infrastructure)
 
 }  // namespace gpu
 }  // namespace collider

@@ -19,18 +19,13 @@
 #include <memory>
 #include <functional>
 #include <optional>
-#include <algorithm>
-#include "../core/edition.hpp"
-
-#if defined(__APPLE__)
-    #include <TargetConditionals.h>
-#endif
 
 namespace collider {
 namespace platform {
 
 // Platform detection
 #if defined(__APPLE__)
+    #include <TargetConditionals.h>
     #if TARGET_OS_MAC
         #define COLLIDER_PLATFORM_MACOS 1
         #define COLLIDER_PLATFORM_NAME "macOS"
@@ -61,13 +56,6 @@ namespace platform {
     #define COLLIDER_BACKEND_NAME "CPU"
 #endif
 
-enum class VRAMTier : uint8_t {
-    Minimal,    // < 8 GB (RTX 2060)
-    Standard,   // 8-16 GB (RTX 3060)
-    Enhanced,   // 16-48 GB (RTX 5090)
-    Maximum     // 48+ GB (RTX PRO 6000)
-};
-
 /**
  * GPU Device Information
  */
@@ -85,13 +73,9 @@ struct DeviceInfo {
     int compute_minor;
 
     // Architecture hints
-    bool is_turing;             // SM 7.5 (RTX 2060/2070/2080)
-    bool is_ampere;             // SM 8.0-8.6 (RTX 3060/3090)
-    bool is_ada;                // SM 8.9 (RTX 4090)
-    bool is_hopper;             // SM 9.0 (H100)
-    bool is_blackwell;          // SM 12.0 (RTX 5090, PRO 6000)
+    bool is_blackwell;          // RTX 5090
+    bool is_ampere;             // RTX 3060
     bool is_apple_silicon;      // M1/M2/M3
-    VRAMTier vram_tier;
     bool supports_fp16;
     bool supports_int8;
 
@@ -253,6 +237,9 @@ struct AdaptiveConfig {
     size_t max_passphrase_length;
     size_t passphrase_buffer_size;
 
+    // Bloom filter
+    size_t bloom_filter_size;
+    bool bloom_in_texture_memory;
 
     // Double buffering
     int num_buffers;
@@ -266,122 +253,93 @@ struct AdaptiveConfig {
     size_t max_gpu_memory_usage;
     size_t reserved_memory;
 
-    // EC precomputation (set by VRAM budget)
-    int ec_window_bits;
-    size_t ec_table_size_bytes;
-
-    // VRAM budget breakdown (logged at startup)
-    size_t vram_total;
-    size_t vram_reserved;
-    size_t vram_ec_table;
-    size_t vram_batch_buffers;
-    size_t vram_other;
-
     /**
      * Create configuration for specific device.
      */
     static AdaptiveConfig for_device(const DeviceInfo& device) {
         AdaptiveConfig config;
-        constexpr size_t GB = 1024ULL * 1024 * 1024;
-        // Use available memory for budget calculations instead of total memory.
-        // This prevents over-allocation when other processes are using VRAM.
-        // Fall back to total_memory if available_memory is not populated.
-        size_t total = (device.available_memory > 0 && device.available_memory <= device.total_memory)
-                       ? device.available_memory : device.total_memory;
 
-        // Apple Silicon -- unchanged
-        if (device.is_apple_silicon) {
-            config.candidates_per_batch = 500'000;
+        // Base on available memory
+        size_t available = device.total_memory;
+
+        if (device.is_blackwell) {
+            // RTX 5090 - 32GB VRAM, Blackwell architecture
+            config.candidates_per_batch = 4'000'000;
+            config.max_passphrase_length = 128;
+            config.passphrase_buffer_size = 512 * 1024 * 1024;  // 512 MB
+            config.bloom_filter_size = 6ULL * 1024 * 1024 * 1024;  // 6 GB
+            config.bloom_in_texture_memory = true;
+            config.num_buffers = 3;  // Triple buffering
+            config.use_pinned_memory = true;
+            config.threads_per_block = 256;
+            config.blocks_per_multiprocessor = 4;
+            config.max_gpu_memory_usage = 28ULL * 1024 * 1024 * 1024;  // 28 GB
+            config.reserved_memory = 4ULL * 1024 * 1024 * 1024;  // 4 GB reserved
+
+        } else if (device.is_ampere || available >= 10ULL * 1024 * 1024 * 1024) {
+            // RTX 3060 12GB or similar
+            config.candidates_per_batch = 1'000'000;
             config.max_passphrase_length = 64;
-            config.passphrase_buffer_size = 64 * 1024 * 1024;
-            config.num_buffers = 2;
-            config.use_pinned_memory = false;
+            config.passphrase_buffer_size = 128 * 1024 * 1024;  // 128 MB
+            config.bloom_filter_size = 4ULL * 1024 * 1024 * 1024;  // 4 GB (fits in 12GB)
+            config.bloom_in_texture_memory = true;
+            config.num_buffers = 2;  // Double buffering
+            config.use_pinned_memory = true;
             config.threads_per_block = 256;
             config.blocks_per_multiprocessor = 2;
-            config.max_gpu_memory_usage = total / 2;
-            config.reserved_memory = 1 * GB;
-            config.ec_window_bits = 5;
-            config.ec_table_size_bytes = 52 * 32 * 64;
-            config.vram_total = total;
-            config.vram_reserved = config.reserved_memory;
-            config.vram_ec_table = config.ec_table_size_bytes;
-            config.vram_batch_buffers = config.max_gpu_memory_usage / 2;
-            config.vram_other = config.max_gpu_memory_usage - config.vram_batch_buffers - config.vram_ec_table;
-            return config;
-        }
+            config.max_gpu_memory_usage = 10ULL * 1024 * 1024 * 1024;  // 10 GB
+            config.reserved_memory = 2ULL * 1024 * 1024 * 1024;  // 2 GB reserved
 
-        // CPU fallback
-        if (total < 1 * GB) {
+        } else if (device.is_apple_silicon) {
+            // M1/M2/M3 - Unified memory
+            config.candidates_per_batch = 500'000;
+            config.max_passphrase_length = 64;
+            config.passphrase_buffer_size = 64 * 1024 * 1024;  // 64 MB
+            config.bloom_filter_size = 2ULL * 1024 * 1024 * 1024;  // 2 GB
+            config.bloom_in_texture_memory = false;  // Metal handles this differently
+            config.num_buffers = 2;
+            config.use_pinned_memory = false;  // Unified memory doesn't need pinning
+            config.threads_per_block = 256;
+            config.blocks_per_multiprocessor = 2;
+            config.max_gpu_memory_usage = available / 2;  // Use half of unified memory
+            config.reserved_memory = 1ULL * 1024 * 1024 * 1024;
+
+        } else {
+            // CPU fallback or unknown GPU
             config.candidates_per_batch = 100'000;
             config.max_passphrase_length = 64;
             config.passphrase_buffer_size = 32 * 1024 * 1024;
+            config.bloom_filter_size = 512 * 1024 * 1024;  // 512 MB
+            config.bloom_in_texture_memory = false;
             config.num_buffers = 2;
             config.use_pinned_memory = false;
-            config.threads_per_block = 1;
+            config.threads_per_block = 1;  // CPU: 1 "thread" per work item
             config.blocks_per_multiprocessor = 1;
-            config.max_gpu_memory_usage = 2 * GB;
+            config.max_gpu_memory_usage = 2ULL * 1024 * 1024 * 1024;
             config.reserved_memory = 512 * 1024 * 1024;
-            config.ec_window_bits = 5;
-            config.ec_table_size_bytes = 52 * 32 * 64;
-            config.vram_total = total;
-            config.vram_reserved = config.reserved_memory;
-            config.vram_ec_table = config.ec_table_size_bytes;
-            config.vram_batch_buffers = 0;
-            config.vram_other = 0;
-            return config;
         }
-
-        // --- CUDA GPU: VRAM-based continuous scaling ---
-
-        // Reserved memory
-        if (total >= 16 * GB)
-            config.reserved_memory = 4 * GB;
-        else if (total >= 8 * GB)
-            config.reserved_memory = 2 * GB;
-        else
-            config.reserved_memory = 1 * GB;
-
-        size_t usable = total - config.reserved_memory;
-        config.max_gpu_memory_usage = usable;
-
-        // EC window bits scaled by usable VRAM
-        if (usable >= 64 * GB) config.ec_window_bits = 12;
-        else if (usable >= 48 * GB) config.ec_window_bits = 10;
-        else if (usable >= 16 * GB) config.ec_window_bits = 8;
-        else if (usable >= 8 * GB) config.ec_window_bits = 6;
-        else config.ec_window_bits = 5;
-
-        int pts_per_window = 1 << config.ec_window_bits;
-        int num_windows = (256 + config.ec_window_bits - 1) / config.ec_window_bits;
-        config.ec_table_size_bytes = (size_t)num_windows * pts_per_window * 64;
-
-        // Remaining VRAM for batch buffers
-        size_t allocated = config.ec_table_size_bytes + 1 * 1024 * 1024;
-        size_t remaining = (allocated < usable) ? (usable - allocated) : 0;
-        size_t batch_budget = remaining * 80 / 100;
-
-        config.candidates_per_batch = std::min(batch_budget / 200, (size_t)16'000'000);
-        config.max_passphrase_length = (usable >= 16 * GB) ? 128 : 64;
-        config.passphrase_buffer_size = std::min(remaining / 4, (size_t)(1 * GB));
-
-        // Buffering strategy
-        config.num_buffers = (usable >= 16 * GB) ? 3 : 2;
-        config.use_pinned_memory = true;
-
-        // Kernel config: 256 threads for all CUDA archs
-        config.threads_per_block = 256;
-        config.blocks_per_multiprocessor = (device.is_blackwell || device.is_hopper) ? 6 : 4;
-
-        // Budget breakdown
-        config.vram_total = total;
-        config.vram_reserved = config.reserved_memory;
-        config.vram_ec_table = config.ec_table_size_bytes;
-        config.vram_batch_buffers = batch_budget;
-        config.vram_other = remaining - batch_budget;
 
         return config;
     }
 
+    /**
+     * Adjust configuration for specific bloom filter size.
+     */
+    void adjust_for_bloom_size(size_t actual_bloom_size, size_t device_memory) {
+        // Ensure bloom filter fits with headroom
+        size_t needed = actual_bloom_size + passphrase_buffer_size * num_buffers +
+                        candidates_per_batch * 200;  // ~200 bytes per candidate
+
+        if (needed > device_memory - reserved_memory) {
+            // Scale down
+            double scale = static_cast<double>(device_memory - reserved_memory - actual_bloom_size) /
+                          (passphrase_buffer_size * num_buffers + candidates_per_batch * 200);
+            scale = std::max(0.1, std::min(1.0, scale));
+
+            candidates_per_batch = static_cast<size_t>(candidates_per_batch * scale);
+            passphrase_buffer_size = static_cast<size_t>(passphrase_buffer_size * scale);
+        }
+    }
 };
 
 }  // namespace platform

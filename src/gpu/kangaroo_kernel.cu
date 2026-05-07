@@ -1012,7 +1012,7 @@ __global__ void kangaroo_step_kernel_jlp(
         }
     }
 
-    const uint64_t dp_mask = (~0ULL) << (64 - dp_bits);  // Mask for top dp_bits of x[3] (leading zeros)
+    const uint64_t dp_mask = (1ULL << dp_bits) - 1;
 
     // Main stepping loop
     for (int step = 0; step < steps_per_kernel; step++) {
@@ -1070,7 +1070,7 @@ __global__ void kangaroo_step_kernel_jlp(
             add256(dist[g], dist[g], jd);
 
             // Check for DP (already in affine coordinates!)
-            if ((px[g][3] & dp_mask) == 0) {
+            if ((px[g][0] & dp_mask) == 0) {
                 size_t idx = base_idx + g;
                 if (idx < total_kangaroos) {
                     state.flags[idx] = 1;
@@ -1176,7 +1176,7 @@ __global__ void kangaroo_step_kernel_sota(
         }
     }
 
-    const uint64_t dp_mask = (~0ULL) << (64 - dp_bits);  // Mask for top dp_bits of x[3] (leading zeros)
+    const uint64_t dp_mask = (1ULL << dp_bits) - 1;
 
     // Main stepping loop with SOTA symmetry optimization
     for (int step = 0; step < steps_per_kernel; step++) {
@@ -1257,7 +1257,7 @@ __global__ void kangaroo_step_kernel_sota(
             }
 
             // Check for DP (already in affine coordinates!)
-            if ((px[g][3] & dp_mask) == 0) {
+            if ((px[g][0] & dp_mask) == 0) {
                 size_t idx = base_idx + g;
                 if (idx < total_kangaroos) {
                     state.flags[idx] = 1;
@@ -1360,7 +1360,7 @@ __global__ void kangaroo_step_kernel(
         dist[i] = state.dist[tid * 4 + i];
     }
 
-    const uint64_t dp_mask = (~0ULL) << (64 - dp_bits);  // Mask for top dp_bits of x[3] (leading zeros)
+    const uint64_t dp_mask = (1ULL << dp_bits) - 1;
 
     // Step loop with periodic batch affine conversion for CORRECT DP detection
     for (int step = 0; step < steps_per_kernel; step++) {
@@ -1494,7 +1494,7 @@ __global__ void kangaroo_step_kernel(
             #endif
 
             // NOW check the AFFINE X coordinate for DP property (correct approach!)
-            if ((affine_x[3] & dp_mask) == 0) {
+            if ((affine_x[0] & dp_mask) == 0) {
                 // TRUE Distinguished Point found!
                 state.flags[tid] = 1;
 

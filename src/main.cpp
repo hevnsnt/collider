@@ -1,5 +1,5 @@
 /**
- * collider - Bitcoin Puzzle Solver
+ * theCollider - Bitcoin Puzzle Solver
  *
  * GPU-accelerated solver for the Bitcoin Puzzle Challenge.
  *
@@ -21,14 +21,10 @@
  */
 
 // Prevent Windows min/max macros from breaking std::min/std::max
-#ifndef NOMINMAX
 #define NOMINMAX
-#endif
 
 // Prevent Windows.h from including winsock.h (conflicts with winsock2.h)
-#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
-#endif
 
 // Windows console ANSI support
 #ifdef _WIN32
@@ -43,22 +39,17 @@
 #include <vector>
 #include <chrono>
 #include <thread>
+#include <future>
 #include <csignal>
 #include <atomic>
-#ifndef _WIN32
-#include <unistd.h>
-#endif
 #include <iomanip>
-#include <sstream>
 #include <filesystem>
 #include <algorithm>
 #include <cmath>
 #include <set>
-#include <mutex>
-#include <cstdlib>
 
-#include "core/edition.hpp"
 #include "core/types.hpp"
+#include "core/rule_engine.hpp"
 #include "core/puzzle_config.hpp"
 #include "core/crypto_cpu.hpp"
 #include "core/kangaroo.hpp"
@@ -73,7 +64,24 @@
 #include "ui/banner.hpp"
 #include "ui/interactive.hpp"
 #include "gpu/puzzle_gpu.hpp"
+// ---- Pro-only includes ---------------------------------------------------
+// These headers (and the symbols they declare) are part of the brain wallet
+// pipeline, which is gated behind COLLIDER_PRO. In the free build none of
+// them are available; main.cpp's brain wallet dispatch is also wrapped in
+// #ifdef COLLIDER_PRO and falls back to a "Pro required" error message.
+#ifdef COLLIDER_PRO
+#include "core/brainwallet_state.hpp"
+#include "ui/brainwallet_setup.hpp"
+#include "gpu/brain_wallet_gpu.hpp"
+#include "gpu/gpu_rules.hpp"
+#include "generators/brain_wallet_engine.hpp"
+#include "generators/streaming_brain_wallet.hpp"
+#include "core/hit_verifier.hpp"
+#include "license/license_check.hpp"
+#endif
+// --------------------------------------------------------------------------
 #include "pool/pool_manager.hpp"
+#include "tools/utxo_bloom_builder.hpp"
 #include "core/yaml_config.hpp"
 #include <random>
 #include <array>
@@ -209,7 +217,7 @@ static const size_t NUM_SOLVED_PUZZLES = sizeof(SOLVED_PUZZLES) / sizeof(SOLVED_
 // Analyze solved puzzles to validate zone priorities
 inline void analyze_solved_puzzles() {
     // Count solutions per zone
-    int zone_counts[NUM_ZONES] = {0};
+    int zone_counts[5] = {0};  // Matches NUM_ZONES
 
     for (size_t i = 0; i < NUM_SOLVED_PUZZLES; i++) {
         double pct = SOLVED_PUZZLES[i].position_pct / 100.0;
@@ -331,19 +339,31 @@ namespace gpu {
 
 using namespace collider;
 
-// Global shutdown flag
+// Global shutdown flag.
+// Set ONLY by signal_handler (which must be async-signal-safe per POSIX
+// signal-safety(7)). All logging/printing of the shutdown event happens from
+// the main thread once it observes g_shutdown == true.
 std::atomic<bool> g_shutdown{false};
-volatile sig_atomic_t g_signal_received = 0;
 
-// Background thread lifecycle management (FIX 5: no more detached threads)
-static std::mutex g_bg_threads_mutex;
-static std::vector<std::thread> g_background_threads;
+// Track-f F-03: captured signal number for delayed reporting from main thread.
+// Set inside signal_handler (atomic store is safe). Read once after the main
+// loop exits and the LOG_INFO is then emitted from non-signal context.
+std::atomic<int> g_shutdown_signal{0};
+std::atomic<bool> g_shutdown_logged{false};
 
-// Mutex for synchronized console output from background threads (FIX 15)
-static std::mutex g_cout_mutex;
-
-// Named constant for fallback range bits (FIX 16)
-static constexpr int DEFAULT_RANGE_BITS = 135;
+// Track-f F-03: invoked from main-thread context after the loop sees
+// g_shutdown==true. Performs the print + log emission that USED to live in
+// signal_handler (and self-deadlocked on Logger::mutex_ if SIGINT arrived
+// while a worker thread held the lock).
+inline void emit_shutdown_message_from_main() {
+    if (g_shutdown_logged.exchange(true)) return;
+    int signum = g_shutdown_signal.load(std::memory_order_acquire);
+    if (signum == 0) return;  // shutdown set without a signal (e.g. found key)
+    std::cout << "\n[!] Interrupt received, shutting down...\n";
+    LOG_INFO("Signal received: " + std::to_string(signum) +
+             " (SIGINT=" + std::to_string(SIGINT) +
+             ", SIGTERM=" + std::to_string(SIGTERM) + ")");
+}
 
 /**
  * Detect GPU hardware and return formatted info for banner
@@ -367,12 +387,9 @@ GPUDetectionResult detect_gpus(std::vector<int>& requested_ids) {
 
     try {
         auto& platform = platform::get_platform();
-        if (!platform.is_initialized()) {
-            std::cerr << "Platform initialization failed\n";
-            return result;
-        }
+        auto init_result = platform.initialize();
 
-        {
+        if (init_result.code == platform::ErrorCode::Success) {
             result.backend = platform.get_backend_name();
             int total_devices = platform.get_device_count();
 
@@ -408,14 +425,8 @@ GPUDetectionResult detect_gpus(std::vector<int>& requested_ids) {
                             result.estimated_speed += 2'000'000;   // ~2M/s
                         }
                     } else if (info.is_blackwell) {
-                        // Blackwell estimates
-                        if (info.name.find("PRO 6000") != std::string::npos || info.name.find("RTX 6000") != std::string::npos) {
-                            result.estimated_speed += 800'000'000; // ~800M/s (RTX PRO 6000 Blackwell)
-                        } else if (info.name.find("5090") != std::string::npos) {
-                            result.estimated_speed += 80'000'000;  // ~80M/s
-                        } else {
-                            result.estimated_speed += 60'000'000;  // ~60M/s (other Blackwell)
-                        }
+                        // RTX 5090 estimate
+                        result.estimated_speed += 80'000'000;      // ~80M/s
                     } else if (info.is_ampere) {
                         // Ampere estimates (RTX 30xx series)
                         if (info.name.find("3090") != std::string::npos) {
@@ -424,44 +435,17 @@ GPUDetectionResult detect_gpus(std::vector<int>& requested_ids) {
                             result.estimated_speed += 15'000'000;  // ~15M/s
                         } else if (info.name.find("3070") != std::string::npos) {
                             result.estimated_speed += 10'000'000;  // ~10M/s
-                        } else if (info.name.find("3060 Ti") != std::string::npos) {
-                            result.estimated_speed += 8'000'000;   // ~8M/s
                         } else {
                             result.estimated_speed += 5'000'000;   // ~5M/s (3060)
                         }
-                    } else if (info.is_ada) {
+                    } else {
                         // Ada Lovelace (RTX 40xx series)
                         if (info.name.find("4090") != std::string::npos) {
                             result.estimated_speed += 50'000'000;  // ~50M/s
                         } else if (info.name.find("4080") != std::string::npos) {
                             result.estimated_speed += 35'000'000;  // ~35M/s
-                        } else if (info.name.find("4070") != std::string::npos) {
+                        } else {
                             result.estimated_speed += 25'000'000;  // ~25M/s
-                        } else if (info.name.find("4060") != std::string::npos) {
-                            result.estimated_speed += 18'000'000;  // ~18M/s
-                        } else {
-                            result.estimated_speed += 20'000'000;  // ~20M/s (other Ada)
-                        }
-                    } else if (info.is_turing) {
-                        // Turing estimates (RTX 20xx series, ~40-50% of Ada)
-                        if (info.name.find("2080 Ti") != std::string::npos) {
-                            result.estimated_speed += 20'000'000;  // ~20M/s
-                        } else if (info.name.find("2080 Super") != std::string::npos || info.name.find("2080 SUPER") != std::string::npos) {
-                            result.estimated_speed += 19'000'000;  // ~19M/s
-                        } else if (info.name.find("2080") != std::string::npos) {
-                            result.estimated_speed += 18'000'000;  // ~18M/s
-                        } else if (info.name.find("2070") != std::string::npos) {
-                            result.estimated_speed += 14'000'000;  // ~14M/s
-                        } else {
-                            result.estimated_speed += 10'000'000;  // ~10M/s (2060)
-                        }
-                    } else {
-                        // Unknown architecture fallback: estimate from SM count
-                        if (info.multiprocessor_count > 0) {
-                            result.estimated_speed += static_cast<uint64_t>(
-                                (double)info.multiprocessor_count * 100'000.0);
-                        } else {
-                            result.estimated_speed += 10'000'000;
                         }
                     }
                 }
@@ -490,6 +474,8 @@ GPUDetectionResult detect_gpus(std::vector<int>& requested_ids) {
                     }
                 }
             }
+        } else {
+            result.gpu_names = "GPU init failed: " + init_result.message;
         }
     } catch (const std::exception& e) {
         result.gpu_names = std::string("Detection error: ") + e.what();
@@ -506,30 +492,20 @@ GPUDetectionResult detect_gpus(std::vector<int>& requested_ids) {
     return result;
 }
 
+// Track-f F-03 fix: async-signal-safe handler.
+// Per POSIX signal-safety(7), almost nothing in the C++ runtime is safe to
+// call from a signal handler. The previous implementation called std::cout
+// (libstdc++ I/O lock), LOG_INFO (Logger::mutex_, std::localtime, ofstream
+// flush, std::string concatenation that allocates) and self-deadlocked if
+// SIGINT landed while the main thread held Logger::mutex_ inside a LOG_*
+// call. We now do nothing but two atomic stores (which ARE async-signal-safe
+// for lock-free atomics, and std::atomic<int>/<bool> are guaranteed lock-free
+// on all supported platforms). The actual print+log happens from the main
+// thread via emit_shutdown_message_from_main() once it observes the flag.
 void signal_handler(int signum) {
-    // Only use async-signal-safe functions here.
-    // write() and _exit() are safe; printf, std::cout, LOG_INFO are NOT.
-    // Do NOT write to std::atomic from signal handler -- it is not async-signal-safe.
-    // Instead, set the volatile sig_atomic_t flag and let the main loop propagate it.
-    g_signal_received = signum;
-#ifndef _WIN32
-    const char msg[] = "\n[!] Interrupt received, shutting down...\n";
-    (void)write(STDERR_FILENO, msg, sizeof(msg) - 1);
-#endif
+    g_shutdown_signal.store(signum, std::memory_order_release);
+    g_shutdown.store(true, std::memory_order_release);
 }
-
-#ifdef _WIN32
-BOOL WINAPI ConsoleCtrlHandler(DWORD dwCtrlType) {
-    switch (dwCtrlType) {
-        case CTRL_C_EVENT:
-        case CTRL_BREAK_EVENT:
-        case CTRL_CLOSE_EVENT:
-            g_signal_received = 1;
-            return TRUE;
-    }
-    return FALSE;
-}
-#endif
 
 /**
  * Command-line arguments.
@@ -559,7 +535,15 @@ struct Arguments {
     bool puzzle_kangaroo = false;         // Use Pollard's Kangaroo algorithm (O(sqrt(n)))
     bool use_rckangaroo = true;           // Use RCKangaroo as backend (default: true if available)
     int dp_bits = -1;                     // Distinguished point bits (-1 = auto-calculate)
+    std::string bloom_file;               // Bloom filter file for opportunistic address checking
 
+    // Brainwallet mode
+    bool brainwallet_mode = false;        // Brainwallet-only mode (requires bloom filter)
+    bool brainwallet_setup = false;       // Run brainwallet setup wizard
+    std::string wordlist_file;            // Wordlist file for brainwallet scanning
+    bool resume = false;                  // Resume from saved state
+    size_t save_interval = 1000000;       // Save state every N passphrases checked
+    bool cpu_rules = false;               // Force CPU rule processing (enables multi-GPU)
 
     // Calibration mode
     bool calibrate = false;               // Run batch size calibration
@@ -585,16 +569,62 @@ struct Arguments {
     // Menu navigation
     bool go_back = false;                 // Signal to return to main menu (not exit)
     bool exit_program = false;            // Signal to exit program cleanly
-
-    // Track which boolean flags were explicitly set via CLI (for config merge priority)
-    std::set<std::string> cli_explicit_flags;
 };
 
 /**
- * Parse command-line arguments.
+ * Mutually-exclusive search-mode validation (track-e fix E.1).
+ *
+ * Returns 0 if no conflict; -1 with `msg` set if more than one of
+ * {--brainwallet, --pool, --kangaroo (with no other puzzle mode), --puzzle N
+ * (when combined with brainwallet/pool)} is active.
+ *
+ * `--puzzle N --kangaroo` is the standard "solve puzzle N with kangaroo
+ * algorithm" combination and is NOT a conflict by itself.
  */
-Arguments parse_args(int argc, char* argv[]) {
-    Arguments args;
+inline int validate_mode_mutex(const Arguments& args, std::string& msg) {
+    int active = 0;
+    std::vector<std::string> chosen;
+    if (args.brainwallet_mode) { active++; chosen.emplace_back("--brainwallet"); }
+    if (args.pool_mode)        { active++; chosen.emplace_back("--pool <url>"); }
+    // --kangaroo is a sub-mode of puzzle solving. Only count it as a top-level
+    // mode claim when neither brainwallet nor pool is asserted (so combining
+    // --kangaroo with either still flags the conflict via the != 1 check below).
+    if (args.puzzle_kangaroo && (args.brainwallet_mode || args.pool_mode)) {
+        active++;
+        chosen.emplace_back("--kangaroo");
+    }
+    if ((args.puzzle_number > 0 || args.puzzle_all_unsolved) &&
+        (args.brainwallet_mode || args.pool_mode)) {
+        active++;
+        if (args.puzzle_all_unsolved) chosen.emplace_back("--all-unsolved");
+        else chosen.emplace_back("--puzzle " + std::to_string(args.puzzle_number));
+    }
+
+    if (active <= 1) return 0;
+
+    msg = "[!] Conflicting search modes selected: ";
+    for (size_t i = 0; i < chosen.size(); ++i) {
+        msg += chosen[i];
+        if (i + 1 < chosen.size()) msg += ", ";
+    }
+    msg += ".\n";
+    msg += "    Pick exactly one of: --brainwallet, --pool <url>, --puzzle <N> [--kangaroo].\n";
+    msg += "    --kangaroo by itself is allowed (it implies puzzle mode);\n";
+    msg += "    --puzzle <N> + --kangaroo is the standard kangaroo-on-puzzle case.\n";
+    return -1;
+}
+
+/**
+ * Internal core argv parser. No exit, no stderr -- pure transformation.
+ * Returns 0 on success, -1 if mode mutex violated (msg set in that case).
+ *
+ * Both parse_args() and parse_args_for_test() delegate here. Keeps a single
+ * source of truth for argv -> Arguments / CLIFlags.
+ */
+inline int parse_args_core(int argc, char* argv[], Arguments& args,
+                           collider::CLIFlags& cli, std::string& err_msg) {
+    args = Arguments{};
+    cli = collider::CLIFlags{};
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -603,206 +633,185 @@ Arguments parse_args(int argc, char* argv[]) {
             args.help = true;
         } else if (arg == "--verbose" || arg == "-v") {
             args.verbose = true;
+            cli.verbose_set = true;
         } else if ((arg == "--gpus" || arg == "-g") && i + 1 < argc) {
             args.gpu_ids.clear();
             std::string gpus = argv[++i];
             size_t pos = 0;
-            try {
-                while ((pos = gpus.find(',')) != std::string::npos) {
-                    args.gpu_ids.push_back(std::stoi(gpus.substr(0, pos)));
-                    gpus.erase(0, pos + 1);
-                }
-                args.gpu_ids.push_back(std::stoi(gpus));
-            } catch (const std::exception& e) {
-                std::cerr << "[!] Invalid value for --gpus: " << argv[i] << "\n";
-                args.exit_program = true;
-                continue;
+            while ((pos = gpus.find(',')) != std::string::npos) {
+                args.gpu_ids.push_back(std::stoi(gpus.substr(0, pos)));
+                gpus.erase(0, pos + 1);
             }
+            args.gpu_ids.push_back(std::stoi(gpus));
+            cli.gpu_ids_set = true;
         } else if (arg == "--batch-size" && i + 1 < argc) {
-            try {
-                args.batch_size = std::stoull(argv[++i]);
-            } catch (const std::exception& e) {
-                std::cerr << "[!] Invalid value for --batch-size: " << argv[i] << "\n";
-                args.exit_program = true;
-                continue;
-            }
+            args.batch_size = std::stoull(argv[++i]);
+            cli.batch_size_set = true;
         } else if (arg == "--benchmark") {
             args.benchmark = true;
         } else if (arg == "--benchmark-time" && i + 1 < argc) {
-            try {
-                args.benchmark_seconds = std::stoi(argv[++i]);
-            } catch (const std::exception& e) {
-                std::cerr << "[!] Invalid value for --benchmark-time: " << argv[i] << "\n";
-                args.exit_program = true;
-                continue;
-            }
+            args.benchmark_seconds = std::stoi(argv[++i]);
+            cli.benchmark_seconds_set = true;
         } else if (arg == "--puzzle" || arg == "-P") {
-#if COLLIDER_HAS_SOLO
             args.puzzle_mode = true;
-            // Check if next arg is a number (puzzle number) or another flag
             if (i + 1 < argc && argv[i + 1][0] != '-') {
-                try {
-                    args.puzzle_number = std::stoi(argv[++i]);
-                } catch (const std::exception& e) {
-                    std::cerr << "[!] Invalid value for --puzzle: " << argv[i] << "\n";
-                    args.exit_program = true;
-                    continue;
-                }
+                args.puzzle_number = std::stoi(argv[++i]);
+                cli.puzzle_number_set = true;
             }
-#else
-            std::cerr << "[*] Solo puzzle solver requires collider pro — collisionprotocol.com/pro\n";
-            std::cerr << "    Use the free edition to join pools: collider --worker <your_btc_address>\n";
-            args.exit_program = true;
-            return args;
-#endif
         } else if (arg == "--puzzle-target" && i + 1 < argc) {
-#if COLLIDER_HAS_SOLO
             args.puzzle_target = argv[++i];
-#else
-            std::cerr << "[*] SOLO requires collider pro — collisionprotocol.com/pro\n";
-            args.exit_program = true; continue;
-#endif
         } else if (arg == "--puzzle-start" && i + 1 < argc) {
-#if COLLIDER_HAS_SOLO
             args.puzzle_range_start = argv[++i];
-#else
-            std::cerr << "[*] SOLO requires collider pro — collisionprotocol.com/pro\n";
-            args.exit_program = true; continue;
-#endif
         } else if (arg == "--puzzle-end" && i + 1 < argc) {
-#if COLLIDER_HAS_SOLO
             args.puzzle_range_end = argv[++i];
-#else
-            std::cerr << "[*] SOLO requires collider pro — collisionprotocol.com/pro\n";
-            args.exit_program = true; continue;
-#endif
         } else if (arg == "--sequential") {
             args.puzzle_random = false;
-            args.cli_explicit_flags.insert("random");
+            cli.puzzle_random_set = true;
         } else if (arg == "--random") {
             args.puzzle_random = true;
-            args.cli_explicit_flags.insert("random");
+            cli.puzzle_random_set = true;
         } else if (arg == "--puzzle-checkpoint" && i + 1 < argc) {
             args.puzzle_checkpoint = argv[++i];
+            cli.puzzle_checkpoint_set = true;
         } else if (arg == "--auto-next") {
             args.puzzle_auto_next = true;
-            args.cli_explicit_flags.insert("auto-next");
+            cli.puzzle_auto_next_set = true;
         } else if (arg == "--all-unsolved") {
             args.puzzle_all_unsolved = true;
         } else if (arg == "--puzzle-min-bits" && i + 1 < argc) {
-            try {
-                args.puzzle_min_bits = std::stoi(argv[++i]);
-            } catch (const std::exception& e) {
-                std::cerr << "[!] Invalid value for --puzzle-min-bits: " << argv[i] << "\n";
-                args.exit_program = true;
-                continue;
-            }
+            args.puzzle_min_bits = std::stoi(argv[++i]);
+            cli.puzzle_min_bits_set = true;
         } else if (arg == "--puzzle-max-bits" && i + 1 < argc) {
-            try {
-                args.puzzle_max_bits = std::stoi(argv[++i]);
-            } catch (const std::exception& e) {
-                std::cerr << "[!] Invalid value for --puzzle-max-bits: " << argv[i] << "\n";
-                args.exit_program = true;
-                continue;
-            }
+            args.puzzle_max_bits = std::stoi(argv[++i]);
+            cli.puzzle_max_bits_set = true;
         } else if (arg == "--kangaroo") {
             args.puzzle_kangaroo = true;
-            args.cli_explicit_flags.insert("kangaroo");
+            cli.puzzle_kangaroo_set = true;
         } else if (arg == "--dp-bits" && i + 1 < argc) {
-            try {
-                args.dp_bits = std::stoi(argv[++i]);
-            } catch (const std::exception& e) {
-                std::cerr << "[!] Invalid value for --dp-bits: " << argv[i] << "\n";
-                args.exit_program = true;
-                continue;
-            }
+            args.dp_bits = std::stoi(argv[++i]);
+            cli.dp_bits_set = true;
         } else if (arg == "--bloom" && i + 1 < argc) {
-            std::cerr << "[*] Bloom filters require collider pro — collisionprotocol.com/pro\n";
-            args.exit_program = true; continue;
+#ifdef COLLIDER_PRO
+            args.bloom_file = argv[++i];
+            cli.bloom_file_set = true;
+#else
+            // Pro-only: opportunistic address scanning. Consume the path
+            // arg but ignore it; one-time hint so the user knows why.
+            std::string ignored = argv[++i];
+            std::cerr << "[Pro] --bloom '" << ignored
+                      << "' ignored -- opportunistic address scanning is a "
+                         "Pro feature. https://collisionprotocol.com/pro"
+                      << std::endl;
+#endif
         } else if (arg == "--brainwallet") {
-            std::cerr << "[*] Brain wallet requires collider pro — collisionprotocol.com/pro\n";
-            args.exit_program = true; continue;
+            args.brainwallet_mode = true;
+            args.pool_mode = false;     // Brainwallet overrides pool mode from config
+            args.pool_url.clear();      // Don't leak a pool URL once brainwallet is selected
+            cli.brainwallet_set = true;
         } else if (arg == "--brainwallet-setup") {
-            std::cerr << "[!] ERROR: --brainwallet-setup is only available in collider pro\n";
-            std::cerr << "    Visit https://collisionprotocol.com/pro to upgrade.\n";
-            args.exit_program = true; continue;
+            args.brainwallet_setup = true;
+        } else if (arg == "--resume") {
+            args.resume = true;
+            cli.resume_set = true;
+        } else if (arg == "--cpu-rules") {
+            args.cpu_rules = true;
+        } else if (arg == "--save-interval" && i + 1 < argc) {
+            args.save_interval = std::stoull(argv[++i]);
+            cli.save_interval_set = true;
         } else if (arg == "--calibrate") {
             args.calibrate = true;
         } else if (arg == "--force-calibrate") {
             args.calibrate = true;
             args.force_calibrate = true;
+            cli.force_calibrate_set = true;
         } else if (arg == "--debug") {
             args.debug = true;
+            cli.debug_set = true;
         } else if (arg == "--analyze") {
             args.analyze_puzzles = true;
         } else if (arg == "--no-smart") {
             args.smart_select = false;
-            args.cli_explicit_flags.insert("smart-select");
+            cli.smart_select_set = true;
         } else if ((arg == "--pool" || arg == "-p") && i + 1 < argc) {
-            std::cerr << "[!] ERROR: --pool (custom pool) is only available in collider pro\n";
-            std::cerr << "    Free edition connects to: " << COLLIDER_FREE_POOL_URL << "\n";
-            std::cerr << "    Use --worker <your_btc_address> to join the pool.\n";
-            std::cerr << "    Visit https://collisionprotocol.com/pro for custom pool support.\n";
-            args.exit_program = true; continue;
+            args.pool_mode = true;
+            args.pool_url = argv[++i];
+            cli.pool_url_set = true;
         } else if ((arg == "--worker" || arg == "-w") && i + 1 < argc) {
             args.pool_worker = argv[++i];
-            // In free edition, automatically enable pool mode with hardcoded URL
-            args.pool_mode = true;
-            args.pool_url = COLLIDER_FREE_POOL_URL;
+            cli.pool_worker_set = true;
         } else if (arg == "--pool-password" && i + 1 < argc) {
-            std::cerr << "[!] ERROR: --pool-password is only available in collider pro\n";
-            args.exit_program = true; continue;
+            args.pool_password = argv[++i];
+            cli.pool_password_set = true;
         } else if (arg == "--pool-api-key" && i + 1 < argc) {
-            std::cerr << "[!] ERROR: --pool-api-key is only available in collider pro\n";
-            args.exit_program = true; continue;
+            args.pool_api_key = argv[++i];
+            cli.pool_api_key_set = true;
         } else if ((arg == "--config" || arg == "-c") && i + 1 < argc) {
             args.config_file = argv[++i];
-        } else if (arg[0] == '-') {
-            // Warn about unrecognized flags so typos don't silently fail
-            std::cerr << "[!] Warning: Unrecognized option '" << arg << "' (ignored)\n";
-            std::cerr << "    Use --help to see available options.\n";
-            // If it looks like it expects a value, skip the next arg too
-            if (i + 1 < argc && argv[i + 1][0] != '-') {
-                std::cerr << "    (also skipping value '" << argv[i + 1] << "')\n";
-                i++;
-            }
         }
     }
 
+    return validate_mode_mutex(args, err_msg);
+}
+
+/**
+ * Production entry point: parses argv, exits the process with a clear error
+ * on mode-mutex violation. Fills `cli_out` (if non-null) with which CLI flags
+ * were explicitly set.
+ */
+Arguments parse_args(int argc, char* argv[], collider::CLIFlags* cli_out = nullptr) {
+    Arguments args;
+    collider::CLIFlags cli;
+    std::string err;
+    if (parse_args_core(argc, argv, args, cli, err) != 0) {
+        std::cerr << err;
+        std::cerr << "    Run `collider --help` for usage details.\n";
+        std::exit(1);
+    }
+    if (cli_out) *cli_out = cli;
     return args;
+}
+
+/**
+ * Test-only entry point: returns -1 instead of exiting on mode-mutex
+ * violation, and reports the rejection message in `err_out`. Used by
+ * tests/test_cli_parser.cpp.
+ */
+inline int parse_args_for_test(int argc, char* argv[], Arguments& args,
+                               collider::CLIFlags& cli, std::string* err_out = nullptr) {
+    std::string err;
+    int rc = parse_args_core(argc, argv, args, cli, err);
+    if (err_out) *err_out = err;
+    return rc;
 }
 
 /**
  * Print usage information.
  */
 void print_usage() {
-    std::cout << "\n";
-    std::cout << "collider - Pool Edition\n";
-    std::cout << "========================\n\n";
-    std::cout << "Free edition - pool mining for distributed solving.\n";
-    std::cout << "For all features, visit https://collisionprotocol.com/pro\n\n";
+    std::cout << R"(
+theCollider - Bitcoin Puzzle Solver
+===================================
 
-    std::cout << "GPU-accelerated solver for the Bitcoin Puzzle Challenge.\n\n";
+GPU-accelerated solver for the Bitcoin Puzzle Challenge.
 
-    std::cout << "Usage:\n";
-    std::cout << "  collider                          # Auto-start pool mode\n";
-    std::cout << "  collider --worker <btc_address>   # Join pool with specified address\n";
-    std::cout << "  collider --puzzle <number>        # Solo mode (via CLI)\n\n";
-    std::cout << R"(Pool Mode (Default):
-  --worker, -w <address>  Your Bitcoin address for rewards
-                          Default pool: )" << COLLIDER_FREE_POOL_URL << R"(
+Usage:
+  collider [options]
+  collider --puzzle <number>
 
-Solo Mode (via CLI):
-  --puzzle, -P [N]        Target puzzle number N (default: auto-select)
+Puzzle Options:
+  --puzzle, -P [N]        Target puzzle number N (default: auto-select easiest unsolved)
+                          Auto-selects Kangaroo if pubkey available, else brute force
   --kangaroo              Force Pollard's Kangaroo algorithm (requires pubkey)
-  --dp-bits <N>           Distinguished point bits for Kangaroo (default: auto)
+  --dp-bits <N>           Distinguished point bits for Kangaroo (default: auto-calculate)
+                          Auto-calculation: optimal for puzzle size and kangaroo count
+                          Manual override: 16-28, higher = fewer DPs, lower = more DPs
+  --puzzle-target <addr>  Override target Bitcoin address
+  --puzzle-start <hex>    Override range start (hex with 0x prefix)
+  --puzzle-end <hex>      Override range end (hex with 0x prefix)
   --random                Use random search instead of sequential
   --all-unsolved          Auto-progress through all unsolved puzzles
-  --analyze               Show puzzle analysis with ROI ranking
 
-)";
-
-    std::cout << R"(GPU Options:
+GPU Options:
   --gpus, -g <ids>        GPU device IDs to use (default: auto-detect all)
   --batch-size <n>        Keys per batch (default: 4000000)
 
@@ -811,30 +820,107 @@ Output Options:
 
 Benchmark Mode:
   --benchmark             Run GPU performance benchmark
-  --benchmark-time <sec>  Benchmark duration (default: 30s)
+  --benchmark-time <sec>  Benchmark duration in seconds (default: 30)
 
 Calibration:
-  --calibrate             Run GPU batch size calibration
-  --force-calibrate       Force re-calibration
+  --calibrate             Run GPU batch size calibration (auto on first run)
+  --force-calibrate       Force re-calibration even if already saved
+
+Smart Selection:
+  --analyze               Show puzzle analysis with ROI ranking (no search)
+  --no-smart              Disable smart selection, use sequential (71, 72, ...)
+
+)";
+#ifdef COLLIDER_PRO
+    std::cout << R"(License:
+  --activate <KEY>        Activate your Pro license key (run once after purchase)
+                          Example: ./collider --activate CLLDR-A1B2-C3D4-E5F6-G7H8
+                          Purchase at: https://collisionprotocol.com/pro
+
+Brainwallet Mode (PRO):
+  --brainwallet           Brainwallet-only mode (requires --bloom)
+                          Generates passphrases and checks against bloom filter
+  --brainwallet-setup     Run the brainwallet setup wizard
+                          Configure wordlists, deduplication, and PCFG training
+  --bloom <file.blf>      Bloom filter file with funded addresses
+  --resume                Resume from last saved checkpoint
+  --save-interval <n>     Save state every N passphrases (default: 1000000)
+  --cpu-rules             Force CPU rule processing (enables multi-GPU parallelism)
+
+)";
+#else
+    std::cout << R"(Brainwallet Mode:
+  Brain wallet scanning is a Pro feature. This is the FREE build.
+  Pro adds: --brainwallet, --brainwallet-setup, --bloom, --resume,
+            --save-interval, --cpu-rules.
+  Purchase at: https://collisionprotocol.com/pro
+
+)";
+#endif
+    std::cout << R"(Pool Mode (Distributed Solving):
+  --pool, -p <url>        Connect to pool for distributed Kangaroo solving
+                          URL format: jlp://host:port or http://host:port
+                          Example: jlp://pool.collisionprotocol.com:17403
+  --worker, -w <address>  Worker name (your Bitcoin address for rewards)
+  --pool-password <pass>  Pool password (if required)
+  --pool-api-key <key>    API key for HTTP pools (if required)
 
 Other:
   --help, -h              Show this help message
-  --debug                 Show debug output
-  --config, -c <file>     Config file (default: ./config.yml)
+  --debug                 Show debug output for troubleshooting
+  --config, -c <file>     Use custom config file (default: ./config.yml)
+
+Configuration:
+  Settings can be stored in config.yml (current directory or ~/.collider/)
+  Command-line arguments override config file settings.
 
 Examples:
-)";
+  # Auto-select easiest unsolved puzzle
+  collider
 
-    std::cout << R"(  collider                              # Auto-start pool (prompts for BTC addr)
-  collider --worker 1YourBitcoinAddr...  # Join pool with address
-  collider --puzzle 135                  # Solo mode - target puzzle 135
-  collider --puzzle 135 --kangaroo       # Solo mode with Kangaroo algorithm
-  collider --benchmark                   # Benchmark GPU performance
-)";
+  # Target specific puzzle
+  collider --puzzle 71
 
-    std::cout << R"(
-Performance Targets:
-  RTX 3060:  ~5M keys/s    RTX 3090:  ~20M keys/s    RTX 4090:  ~50M keys/s
+  # Target puzzle with Kangaroo algorithm (if pubkey known)
+  collider --puzzle 135 --kangaroo
+
+  # Kangaroo with manual dp_bits override (for tuning)
+  collider --puzzle 135 --kangaroo --dp-bits 25
+
+  # Use random search pattern
+  collider --puzzle 71 --random
+
+  # Auto-progress through all unsolved puzzles
+  collider --all-unsolved
+
+  # Use specific GPUs
+  collider --puzzle 71 --gpus 0,1
+
+  # Run GPU benchmark
+  collider --benchmark
+
+)";
+#ifdef COLLIDER_PRO
+    std::cout << R"(  # Brainwallet mode - scan for compromised brainwallets (PRO)
+  collider --brainwallet --bloom funded_addresses.blf
+
+)";
+#endif
+    std::cout << R"(  # Custom range search
+  collider --puzzle-start 0x20000000000000000 --puzzle-end 0x3ffffffffffffffff \
+           --puzzle-target 13zb1hQbWVsc2S7ZTZnP2G4undNNpdh5so
+
+  # Join Collision Protocol for distributed solving
+  collider --pool jlp://pool.collisionprotocol.com:17403 --worker 1YourBitcoinAddress...
+
+  # Pool mode with HTTP API
+  collider --pool http://api.collisionprotocol.com --worker 1YourBitcoinAddress...
+
+Performance Targets (EC multiply bottleneck):
+  - RTX 3060:  ~5M keys/second
+  - RTX 3090:  ~20M keys/second
+  - RTX 4090:  ~50M keys/second
+
 )";
 }
 
@@ -1009,22 +1095,10 @@ int get_best_puzzle(double gpu_speed_mkeys = 400.0) {
  * Runs in background thread to not block scanning.
  */
 void check_balance_async(const std::string& address, const std::string& passphrase) {
-    // Sanitize address before interpolating into shell command (popen).
-    // Bitcoin addresses are Base58 ([a-zA-Z0-9], max ~35 chars).
-    if (address.empty() || address.size() > 64) {
-        std::cerr << "[!] Invalid address length, skipping balance check\n";
-        return;
-    }
-    for (char c : address) {
-        if (!std::isalnum(static_cast<unsigned char>(c))) {
-            std::cerr << "[!] Invalid address character, skipping balance check\n";
-            return;
-        }
-    }
-
-    auto thread = std::thread([address, passphrase]() {
-        if (g_shutdown.load(std::memory_order_relaxed)) return;
+    std::thread([address, passphrase]() {
+        using namespace collider::ui::ansi;
         try {
+            // Build curl command to check balance
             std::string cmd;
 #ifdef _WIN32
             cmd = "curl -s \"https://mempool.space/api/address/" + address + "\" 2>nul";
@@ -1060,61 +1134,42 @@ void check_balance_async(const std::string& address, const std::string& passphra
             size_t pos = result.find("\"funded_txo_sum\":");
             if (pos != std::string::npos) {
                 pos += 17;
-                try {
-                    funded = std::stoll(result.substr(pos));
-                } catch (...) {}
+                funded = std::stoll(result.substr(pos));
             }
 
             // Find spent_txo_sum
             pos = result.find("\"spent_txo_sum\":");
             if (pos != std::string::npos) {
                 pos += 16;
-                try {
-                    spent = std::stoll(result.substr(pos));
-                } catch (...) {}
+                spent = std::stoll(result.substr(pos));
             }
 
             int64_t balance_sats = funded - spent;
             double balance_btc = balance_sats / 100000000.0;
 
-            // Print result with synchronized output (FIX 15)
-            {
-                std::lock_guard<std::mutex> lock(g_cout_mutex);
-                std::cout << "\n";
-                if (balance_sats > 0) {
-                    std::cout << "+==============================================================+\n";
-                    std::cout << "|  *** VERIFIED HIT - ADDRESS HAS BALANCE! ***                 |\n";
-                    std::cout << "+==============================================================+\n";
-                    {
-                        std::ostringstream a_line, p_line, b_line, s_line;
-                        a_line << " Address:    " << address;
-                        p_line << " Passphrase: " << passphrase;
-                        b_line << " Balance:    " << std::fixed << std::setprecision(8) << balance_btc << " BTC";
-                        s_line << " Satoshis:   " << balance_sats;
-                        std::cout << "|" << std::left << std::setw(62) << a_line.str() << "|\n";
-                        std::cout << "|" << std::left << std::setw(62) << p_line.str() << "|\n";
-                        std::cout << "|" << std::left << std::setw(62) << b_line.str() << "|\n";
-                        std::cout << "|" << std::left << std::setw(62) << s_line.str() << "|\n";
-                    }
-                    std::cout << "+==============================================================+\n";
-                } else {
-                    std::cout << "[*] Balance check: " << address << " = "
-                              << std::fixed << std::setprecision(8) << balance_btc
-                              << " BTC (false positive)\n";
-                }
+            // Print result with colors
+            std::cout << "\n";
+            if (balance_sats > 0) {
+                // TRUE HIT - Green celebration!
+                std::cout << BRIGHT_GREEN << "+========================================================+" << RESET << "\n";
+                std::cout << BRIGHT_GREEN << "|" << RESET << "  " << BOLD << BRIGHT_GREEN << "*** VERIFIED HIT - ADDRESS HAS BALANCE! ***" << RESET << "           " << BRIGHT_GREEN << "|" << RESET << "\n";
+                std::cout << BRIGHT_GREEN << "+========================================================+" << RESET << "\n";
+                std::cout << BRIGHT_GREEN << "|" << RESET << " Address:    " << BRIGHT_CYAN << address << RESET << "\n";
+                std::cout << BRIGHT_GREEN << "|" << RESET << " Passphrase: " << BRIGHT_WHITE << passphrase << RESET << "\n";
+                std::cout << BRIGHT_GREEN << "|" << RESET << " Balance:    " << BOLD << BRIGHT_GREEN << std::fixed << std::setprecision(8) << balance_btc << " BTC" << RESET << "\n";
+                std::cout << BRIGHT_GREEN << "|" << RESET << " Satoshis:   " << BRIGHT_WHITE << balance_sats << RESET << "\n";
+                std::cout << BRIGHT_GREEN << "+========================================================+" << RESET << "\n";
+            } else {
+                // False positive - dim red
+                std::cout << CYAN << "[*] " << RESET << "Balance check: " << DIM << address << RESET << " = "
+                          << BRIGHT_RED << std::fixed << std::setprecision(8) << balance_btc
+                          << " BTC" << RESET << DIM << " (false positive)" << RESET << "\n";
             }
 
         } catch (const std::exception& e) {
-            std::lock_guard<std::mutex> lock(g_cout_mutex);
-            std::cout << "[!] Balance check failed for " << address << ": " << e.what() << "\n";
+            std::cout << BRIGHT_RED << "[!] " << RESET << "Balance check failed for " << address << ": " << DIM << e.what() << RESET << "\n";
         }
-    });
-
-    // Store thread handle for lifecycle management (FIX 5)
-    {
-        std::lock_guard<std::mutex> lock(g_bg_threads_mutex);
-        g_background_threads.emplace_back(std::move(thread));
-    }
+    }).detach();
 }
 
 /**
@@ -1147,33 +1202,50 @@ std::string format_number(uint64_t n) {
  * Uses 1 decimal place for precision.
  */
 std::string format_number_human(uint64_t n) {
-    char buf[32];
-    double value = static_cast<double>(n);
-    if (value >= 1e15) snprintf(buf, sizeof(buf), "%.1fP", value / 1e15);
-    else if (value >= 1e12) snprintf(buf, sizeof(buf), "%.1fT", value / 1e12);
-    else if (value >= 1e9) snprintf(buf, sizeof(buf), "%.1fG", value / 1e9);
-    else if (value >= 1e6) snprintf(buf, sizeof(buf), "%.1fM", value / 1e6);
-    else if (value >= 1e3) snprintf(buf, sizeof(buf), "%.1fK", value / 1e3);
-    else snprintf(buf, sizeof(buf), "%.0f", value);
-    return buf;
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(1);
+    if (n >= 1000000000000ULL) {
+        oss << (static_cast<double>(n) / 1e12) << "T";
+    } else if (n >= 1000000000ULL) {
+        oss << (static_cast<double>(n) / 1e9) << "B";
+    } else if (n >= 1000000ULL) {
+        oss << (static_cast<double>(n) / 1e6) << "M";
+    } else if (n >= 1000ULL) {
+        oss << (static_cast<double>(n) / 1e3) << "K";
+    } else {
+        oss << n;
+    }
+    return oss.str();
 }
 
 /**
  * Format rate as human-readable string.
- * Uses snprintf for locale-independent formatting (FIX 7).
  */
 std::string format_rate(double rate) {
-    char buf[32];
     if (rate >= 1e9) {
-        snprintf(buf, sizeof(buf), "%.2fB/s", rate / 1e9);
+        return std::to_string(rate / 1e9).substr(0, 5) + "B/s";
     } else if (rate >= 1e6) {
-        snprintf(buf, sizeof(buf), "%.2fM/s", rate / 1e6);
+        return std::to_string(rate / 1e6).substr(0, 5) + "M/s";
     } else if (rate >= 1e3) {
-        snprintf(buf, sizeof(buf), "%.2fK/s", rate / 1e3);
-    } else {
-        snprintf(buf, sizeof(buf), "%.0f/s", rate);
+        return std::to_string(rate / 1e3).substr(0, 5) + "K/s";
     }
-    return buf;
+    return std::to_string(static_cast<int>(rate)) + "/s";
+}
+
+/**
+ * Normalize path separators for display (consistent slashes per platform).
+ * Windows: backslash, Unix: forward slash
+ */
+std::string normalize_path(const std::string& path) {
+    std::string result = path;
+#ifdef _WIN32
+    // On Windows, use backslashes consistently
+    std::replace(result.begin(), result.end(), '/', '\\');
+#else
+    // On Unix, use forward slashes consistently
+    std::replace(result.begin(), result.end(), '\\', '/');
+#endif
+    return result;
 }
 
 // =============================================================================
@@ -1202,13 +1274,9 @@ Arguments run_puzzle_interactive(Arguments base_args, double gpu_speed_mkeys) {
     bool use_pool = (mode_choice == PuzzleModeChoice::JOIN_POOL);
 
     if (use_pool) {
-        // Configure pool settings - default to collisionprotocol.com
-        std::string default_pool = args.pool_url;
-#ifdef COLLIDER_DEFAULT_POOL_URL
-        if (default_pool.empty()) default_pool = COLLIDER_DEFAULT_POOL_URL;
-#endif
+        // Configure pool settings
         std::string pool_url, worker;
-        if (!Interactive::prompt_pool_config(pool_url, worker, default_pool, args.pool_worker)) {
+        if (!Interactive::prompt_pool_config(pool_url, worker, args.pool_url, args.pool_worker)) {
             args.go_back = true;
             return args;
         }
@@ -1216,19 +1284,11 @@ Arguments run_puzzle_interactive(Arguments base_args, double gpu_speed_mkeys) {
         args.pool_url = pool_url;
         args.pool_worker = worker;
 
-        // Save pool config for next time
-        if (!worker.empty() || !pool_url.empty()) {
-            if (collider::save_pool_config(pool_url, worker)) {
-                std::cout << ui::colors::GREEN << "[+] " << ui::colors::RESET
-                          << "Saved pool config to config.yml (will be used automatically next time)\n";
-            } else {
-                std::cerr << "[!] Warning: failed to save pool configuration to config.yml\n";
-            }
-        }
-
         // Pool mode doesn't need puzzle selection - pool assigns work
         std::cout << "\n";
-        Interactive::info_message("Pool mode: Connecting to pool...");
+        Interactive::info_message("Pool mode: Work will be assigned by the pool server.");
+        Interactive::info_message("Press Enter to connect to pool...");
+        Interactive::read_line();
         return args;
     }
 
@@ -1340,6 +1400,415 @@ Arguments run_puzzle_interactive(Arguments base_args, double gpu_speed_mkeys) {
     return args;
 }
 
+#ifdef COLLIDER_PRO
+/**
+ * Run brain wallet interactive flow.
+ * @return Arguments struct configured for brain wallet mode
+ */
+Arguments run_brainwallet_interactive(Arguments base_args) {
+    using namespace ui;
+    Arguments args = base_args;
+    args.brainwallet_mode = true;
+    args.pool_mode = false;  // Disable pool mode - brainwallet is mutually exclusive
+
+    Interactive::display_section("Brain Wallet Scanner Mode");
+
+    // Check if this is first run - need to set up wordlists
+    BrainwalletConfig config;
+    bool first_run = !BrainwalletSetup::is_setup_complete();
+
+    if (first_run) {
+        std::cout << colors::BRIGHT_WHITE << "First-time setup detected!\n" << colors::RESET;
+        std::cout << "Before scanning, we need to set up your wordlists.\n\n";
+
+        if (Interactive::prompt_yes_no("Run the setup wizard now?", true)) {
+            config = BrainwalletSetup::run_wizard();
+
+            if (!config.setup_complete) {
+                Interactive::warning_message("Setup was not completed.");
+                args.go_back = true;
+                return args;
+            }
+        } else {
+            Interactive::info_message("You can run setup later with: ./collider --brainwallet-setup");
+            args.go_back = true;
+            return args;
+        }
+    } else {
+        // Load existing configuration
+        config = BrainwalletSetup::load_config();
+        BrainwalletSetup::show_config_summary(config);
+
+        // Offer to reconfigure
+        if (Interactive::prompt_yes_no("Reconfigure wordlists?", false)) {
+            config = BrainwalletSetup::run_wizard();
+        }
+    }
+
+    // Set the wordlist from config
+    if (!config.processed_wordlist.empty() && std::filesystem::exists(config.processed_wordlist)) {
+        args.wordlist_file = config.processed_wordlist;
+        Interactive::status_message("Using wordlist: " + config.processed_wordlist +
+                                   " (" + BrainwalletSetup::format_number(config.total_unique_lines) + " entries)", true);
+    }
+
+    // Check for bloom filter
+    std::cout << "\n";
+    std::string default_bloom = "funded_addresses.blf";
+
+    // Build search paths for UTXO and bloom files
+    std::vector<std::string> search_dirs;
+    search_dirs.push_back(".");  // Current directory
+    search_dirs.push_back("..");  // Parent directory
+
+    // Add user's wordlist directories
+    for (const auto& dir : config.wordlist_dirs) {
+        search_dirs.push_back(dir);
+        // Also check parent of wordlist dirs
+        std::filesystem::path p(dir);
+        if (p.has_parent_path()) {
+            search_dirs.push_back(p.parent_path().string());
+        }
+    }
+
+    // Add common Windows locations
+#ifdef _WIN32
+    search_dirs.push_back("D:\\theCollider");
+    search_dirs.push_back("C:\\theCollider");
+    search_dirs.push_back("D:\\");
+    search_dirs.push_back("C:\\");
+#endif
+
+    // Search for existing bloom filters and UTXO dumps
+    std::vector<std::pair<std::string, size_t>> found_blooms;
+    std::vector<std::pair<std::string, size_t>> found_utxos;
+
+    for (const auto& dir : search_dirs) {
+        if (!std::filesystem::exists(dir)) continue;
+
+        try {
+            for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+                if (!entry.is_regular_file()) continue;
+
+                std::string filename = entry.path().filename().string();
+                std::string ext = entry.path().extension().string();
+                std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+                std::transform(filename.begin(), filename.end(), filename.begin(), ::tolower);
+
+                // Check for bloom filters
+                if (ext == ".blf") {
+                    found_blooms.push_back({entry.path().string(), entry.file_size()});
+                }
+
+                // Check for UTXO dumps
+                if (filename.find("utxo") != std::string::npos && ext == ".csv") {
+                    found_utxos.push_back({entry.path().string(), entry.file_size()});
+                }
+            }
+        } catch (const std::exception&) {
+            // Skip inaccessible directories
+        }
+    }
+
+    // Remove duplicates (normalize paths)
+    auto dedupe = [](std::vector<std::pair<std::string, size_t>>& vec) {
+        std::set<std::string> seen;
+        vec.erase(std::remove_if(vec.begin(), vec.end(), [&](const auto& p) {
+            std::string canonical;
+            try {
+                canonical = std::filesystem::canonical(p.first).string();
+            } catch (...) {
+                canonical = p.first;
+            }
+            if (seen.count(canonical)) return true;
+            seen.insert(canonical);
+            return false;
+        }), vec.end());
+    };
+    dedupe(found_blooms);
+    dedupe(found_utxos);
+
+    // Check config first, then search results
+    if (!config.bloom_file.empty() && std::filesystem::exists(config.bloom_file)) {
+        args.bloom_file = config.bloom_file;
+        Interactive::status_message("Using bloom filter: " + config.bloom_file, true);
+    } else if (std::filesystem::exists(default_bloom)) {
+        args.bloom_file = default_bloom;
+        Interactive::status_message("Found bloom filter: " + default_bloom, true);
+    } else if (!found_blooms.empty()) {
+        // Found bloom filter(s) - let user choose
+        Interactive::status_message("Found " + std::to_string(found_blooms.size()) + " bloom filter(s):", true);
+        std::cout << "\n";
+
+        for (size_t i = 0; i < found_blooms.size(); i++) {
+            double size_mb = found_blooms[i].second / (1024.0 * 1024.0);
+            std::cout << "  [" << (i + 1) << "] " << found_blooms[i].first
+                      << " (" << std::fixed << std::setprecision(1) << size_mb << " MB)\n";
+        }
+        std::cout << "  [" << (found_blooms.size() + 1) << "] Enter a different path\n";
+        std::cout << "\n";
+
+        int choice = Interactive::prompt_menu_choice(1, static_cast<int>(found_blooms.size() + 1));
+
+        if (choice >= 1 && choice <= static_cast<int>(found_blooms.size())) {
+            args.bloom_file = found_blooms[choice - 1].first;
+            config.bloom_file = args.bloom_file;
+            BrainwalletSetup::save_config(config);
+        } else {
+            std::string bloom_path = Interactive::prompt_path("Enter path to bloom filter (.blf)", true);
+            if (bloom_path.empty() || !std::filesystem::exists(bloom_path)) {
+                Interactive::warning_message("Invalid bloom filter path.");
+                args.go_back = true;
+                return args;
+            }
+            args.bloom_file = bloom_path;
+            config.bloom_file = bloom_path;
+            BrainwalletSetup::save_config(config);
+        }
+    } else if (!found_utxos.empty()) {
+        // No bloom filter, but found UTXO dump(s) - offer to build
+        Interactive::warning_message("No bloom filter found, but UTXO dump(s) detected!");
+        std::cout << "\n";
+
+        std::cout << colors::BRIGHT_WHITE << "Found UTXO dump file(s):\n" << colors::RESET;
+        for (size_t i = 0; i < found_utxos.size(); i++) {
+            double size_mb = found_utxos[i].second / (1024.0 * 1024.0);
+            std::cout << "  [" << (i + 1) << "] " << found_utxos[i].first
+                      << " (" << std::fixed << std::setprecision(1) << size_mb << " MB)\n";
+        }
+        std::cout << "  [" << (found_utxos.size() + 1) << "] Enter a different path\n";
+        std::cout << "\n";
+
+        int choice = Interactive::prompt_menu_choice(1, static_cast<int>(found_utxos.size() + 1));
+
+        std::string selected_utxo;
+        if (choice >= 1 && choice <= static_cast<int>(found_utxos.size())) {
+            selected_utxo = found_utxos[choice - 1].first;
+        } else {
+            selected_utxo = Interactive::prompt_path("Enter path to UTXO dump (.csv)", true);
+            if (selected_utxo.empty() || !std::filesystem::exists(selected_utxo)) {
+                Interactive::warning_message("Invalid UTXO dump path.");
+                args.go_back = true;
+                return args;
+            }
+        }
+
+        // Build the bloom filter automatically
+        std::cout << "\n";
+        Interactive::display_section("Building Bloom Filter");
+
+        std::cout << "This will create a bloom filter from the UTXO dump.\n";
+        std::cout << "  Input:  " << selected_utxo << "\n";
+        std::cout << "  Output: " << default_bloom << "\n\n";
+
+        std::cout << colors::BRIGHT_WHITE << "Configuration:\n" << colors::RESET;
+        std::cout << "  Min balance:  0.001 BTC (100,000 satoshis)\n";
+        std::cout << "  FP rate:      0.001%\n";
+        std::cout << "  Expected:     ~50 million addresses\n\n";
+
+        if (!Interactive::prompt_yes_no("Build bloom filter now?", true)) {
+            Interactive::warning_message("Bloom filter setup cancelled.");
+            args.go_back = true;
+            return args;
+        }
+
+        std::cout << "\n";
+        Interactive::info_message("Building bloom filter (this may take a few minutes)...");
+        std::cout << "\n";
+
+        try {
+            auto start_time = std::chrono::steady_clock::now();
+
+            // Configure builder
+            utxo::UTXOBloomBuilder::Config bloom_config;
+            bloom_config.target_fp_rate = 0.00001;  // 0.001%
+            bloom_config.expected_elements = 50000000;
+            bloom_config.min_satoshis = 100000;  // 0.001 BTC
+
+            utxo::UTXOBloomBuilder builder(bloom_config);
+
+            std::cout << "  Filter size:  " << (builder.num_bits() / 8 / 1024 / 1024) << " MB\n";
+            std::cout << "  Hash funcs:   " << builder.num_hashes() << "\n\n";
+
+            std::cout << "  Processing CSV...\n";
+            builder.process_csv(selected_utxo);
+
+            auto end_time = std::chrono::steady_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(end_time - start_time).count();
+
+            // Save the bloom filter
+            builder.save(default_bloom);
+
+            auto stats = builder.get_stats();
+
+            std::cout << "\n";
+            Interactive::status_message("Bloom filter built successfully!", true);
+            std::cout << "  Addresses:    " << BrainwalletSetup::format_number(stats.elements_added) << "\n";
+            std::cout << "  Filter size:  " << stats.size_mb << " MB\n";
+            std::cout << "  FP rate:      " << std::fixed << std::setprecision(4) << (stats.estimated_fp_rate * 100) << "%\n";
+            std::cout << "  Fill ratio:   " << std::fixed << std::setprecision(1) << (stats.fill_ratio * 100) << "%\n";
+            std::cout << "  Time:         " << elapsed << " seconds\n";
+            std::cout << "  Output:       " << default_bloom << "\n";
+
+            args.bloom_file = default_bloom;
+            config.bloom_file = default_bloom;
+            BrainwalletSetup::save_config(config);
+
+        } catch (const std::exception& e) {
+            std::cout << "\n";
+            Interactive::error_message("Failed to build bloom filter: " + std::string(e.what()));
+            args.go_back = true;
+            return args;
+        }
+    } else {
+        // No bloom filter or UTXO dump found anywhere
+        Interactive::warning_message("No bloom filter or UTXO dump found!");
+        std::cout << "\n";
+        std::cout << "A bloom filter is required to check addresses efficiently.\n\n";
+
+        std::cout << colors::BRIGHT_WHITE << "Options:\n" << colors::RESET;
+        std::cout << "  [1] I have a UTXO dump file (will build bloom filter)\n";
+        std::cout << "  [2] I have a bloom filter at a custom path\n";
+        std::cout << "  [3] Show me how to get a UTXO dump\n\n";
+
+        std::cout << colors::CYAN << "Select option (1-3): " << colors::RESET;
+        std::string input = Interactive::read_line();
+
+        int choice = 0;
+        try { choice = std::stoi(input); } catch (...) { choice = 3; }
+
+        if (choice == 1) {
+            std::string utxo_path = Interactive::prompt_path("Enter path to UTXO dump (.csv)", true);
+            if (utxo_path.empty() || !std::filesystem::exists(utxo_path)) {
+                Interactive::warning_message("Invalid UTXO dump path.");
+                args.go_back = true;
+                return args;
+            }
+
+            // Build bloom filter (same code as above)
+            std::cout << "\n";
+            Interactive::info_message("Building bloom filter...");
+
+            try {
+                utxo::UTXOBloomBuilder::Config bloom_config;
+                bloom_config.target_fp_rate = 0.00001;
+                bloom_config.expected_elements = 50000000;
+                bloom_config.min_satoshis = 100000;
+
+                utxo::UTXOBloomBuilder builder(bloom_config);
+                builder.process_csv(utxo_path);
+                builder.save(default_bloom);
+
+                Interactive::status_message("Bloom filter built: " + default_bloom, true);
+                args.bloom_file = default_bloom;
+                config.bloom_file = default_bloom;
+                BrainwalletSetup::save_config(config);
+            } catch (const std::exception& e) {
+                Interactive::error_message("Failed: " + std::string(e.what()));
+                args.go_back = true;
+                return args;
+            }
+        } else if (choice == 2) {
+            std::string bloom_path = Interactive::prompt_path("Enter path to bloom filter (.blf)", true);
+            if (bloom_path.empty() || !std::filesystem::exists(bloom_path)) {
+                Interactive::warning_message("Invalid bloom filter path.");
+                args.go_back = true;
+                return args;
+            }
+            args.bloom_file = bloom_path;
+            config.bloom_file = bloom_path;
+            BrainwalletSetup::save_config(config);
+        } else {
+            std::cout << "\n";
+            Interactive::info_message("How to get a UTXO dump:");
+            std::cout << "\n";
+            std::cout << "  1. Download bitcoin-utxo-dump: github.com/in3rsha/bitcoin-utxo-dump\n";
+            std::cout << "  2. Run against your Bitcoin Core data directory\n";
+            std::cout << "  3. Place the resulting CSV file in this directory\n";
+            std::cout << "  4. Restart theCollider - it will auto-detect and build the bloom filter\n\n";
+            std::cout << "  Alternative: Download a pre-built UTXO dump from trusted sources.\n\n";
+            args.go_back = true;
+            return args;
+        }
+    }
+
+    // Validate we have what we need
+    std::cout << "\n";
+    if (args.wordlist_file.empty()) {
+        Interactive::warning_message("No wordlist configured. Run setup wizard first.");
+        args.go_back = true;
+        return args;
+    }
+
+    // Check for saved state and offer auto-resume
+    if (BrainWalletStateManager::has_saved_state()) {
+        auto saved_state = BrainWalletStateManager::load_state();
+        if (saved_state.valid) {
+            // Check if wordlist matches
+            bool wordlist_matches = BrainWalletStateManager::verify_wordlist(saved_state, args.wordlist_file);
+
+            Interactive::display_section("Resume Previous Session?");
+
+            std::cout << colors::BRIGHT_CYAN << "Found saved progress:\n" << colors::RESET;
+            std::cout << "  Session:      " << saved_state.session_id << "\n";
+            std::cout << "  Last saved:   " << saved_state.timestamp << "\n";
+            std::cout << "  Checked:      " << format_number_human(saved_state.total_checked) << " passphrases\n";
+            std::cout << "  Progress:     Word " << format_number(saved_state.current_word_idx)
+                      << " / " << format_number(saved_state.wordlist_size) << "\n";
+            std::cout << "  Phase:        " << saved_state.current_phase
+                      << " (iteration " << saved_state.phase_iteration << ")\n";
+            if (saved_state.hits_found > 0) {
+                std::cout << colors::BRIGHT_GREEN << "  Hits found:   " << saved_state.hits_found << colors::RESET << "\n";
+            }
+            std::cout << "\n";
+
+            if (!wordlist_matches) {
+                Interactive::warning_message("Wordlist has changed since last session!");
+                std::cout << "  Previous: " << saved_state.wordlist_path << "\n";
+                std::cout << "  Current:  " << args.wordlist_file << "\n\n";
+
+                if (Interactive::prompt_yes_no("Start fresh with new wordlist?", true)) {
+                    BrainWalletStateManager::clear_state();
+                    Interactive::info_message("Previous state cleared. Starting fresh.");
+                    args.resume = false;
+                } else {
+                    Interactive::info_message("Please use the same wordlist to resume, or start fresh.");
+                    args.go_back = true;
+                    return args;
+                }
+            } else {
+                // Wordlist matches - offer to resume
+                if (Interactive::prompt_yes_no("Resume from saved progress?", true)) {
+                    args.resume = true;
+                    Interactive::status_message("Will resume from saved state", true);
+                } else {
+                    if (Interactive::prompt_yes_no("Clear saved state and start fresh?", false)) {
+                        BrainWalletStateManager::clear_state();
+                        Interactive::info_message("Previous state cleared.");
+                    }
+                    args.resume = false;
+                }
+            }
+            std::cout << "\n";
+        }
+    }
+
+    Interactive::display_section("Ready to Scan");
+
+    std::cout << colors::BRIGHT_WHITE << "Configuration Summary:\n" << colors::RESET;
+    std::cout << "  Wordlist:     " << normalize_path(args.wordlist_file) << "\n";
+    std::cout << "  Bloom filter: " << args.bloom_file << "\n";
+    std::cout << "  Entries:      " << BrainwalletSetup::format_number(config.total_unique_lines) << " passphrases\n";
+    std::cout << "\n";
+
+    if (!Interactive::prompt_yes_no("Start brain wallet scan?", true)) {
+        args.go_back = true;
+        return args;
+    }
+
+    return args;
+}
+#endif // COLLIDER_PRO
 
 /**
  * Run interactive mode - main menu and mode selection.
@@ -1350,14 +1819,12 @@ Arguments run_interactive_mode(Arguments base_args, double gpu_speed_mkeys) {
     using namespace ui;
     Arguments args = base_args;
 
-
     while (true) {
         // Reset navigation flags
         args.go_back = false;
 
-
         // Display main menu
-        MainMenuChoice choice = Interactive::display_main_menu(collider::edition::version());
+        MainMenuChoice choice = Interactive::display_main_menu("1.2.1");
 
         switch (choice) {
             case MainMenuChoice::PUZZLE_MODE: {
@@ -1368,6 +1835,19 @@ Arguments run_interactive_mode(Arguments base_args, double gpu_speed_mkeys) {
                 return args;
             }
 
+            case MainMenuChoice::BRAINWALLET_MODE: {
+#ifdef COLLIDER_PRO
+                args = run_brainwallet_interactive(args);
+                if (args.go_back) {
+                    continue;  // Return to main menu
+                }
+                return args;
+#else
+                std::cout << "\n[PRO] Brain wallet scanning requires theCollider Pro.\n"
+                          << "      Purchase at: https://collisionprotocol.com/pro\n\n";
+                continue;  // Return to main menu
+#endif
+            }
 
             case MainMenuChoice::BENCHMARK_MODE:
                 args.benchmark = true;
@@ -1426,6 +1906,9 @@ int run_pool_mode(const Arguments& args, const GPUDetectionResult& gpu_info) {
     using namespace collider::pool;
 
     std::cout << "\n";
+    std::cout << "=============================================================\n";
+    std::cout << "             POOL MODE - Distributed Kangaroo Solving\n";
+    std::cout << "=============================================================\n\n";
 
     // Validate arguments
     if (args.pool_url.empty()) {
@@ -1443,7 +1926,7 @@ int run_pool_mode(const Arguments& args, const GPUDetectionResult& gpu_info) {
     PoolConfig pool_config;
     if (!parse_pool_url(args.pool_url, pool_config)) {
         std::cerr << "[!] Error: Invalid pool URL format\n";
-        std::cerr << "    Expected: jlp://host:port or http://host:port\n";
+        std::cerr << "    Expected: jlps://host:port (TLS) or jlp://host:port\n";
         return 1;
     }
 
@@ -1483,28 +1966,6 @@ int run_pool_mode(const Arguments& args, const GPUDetectionResult& gpu_info) {
     std::cout << "    DP Bits: " << work.dp_bits << "\n";
     std::cout << "    Work ID: " << work.work_id << "\n\n";
 
-    // Pool mode: non-blocking solve check (warning only, pool decides what to work on)
-    // Try to extract puzzle number from puzzle_name (e.g., "Puzzle #135")
-    {
-        int pool_puzzle_num = 0;
-        size_t hash_pos = work.puzzle_name.find('#');
-        if (hash_pos != std::string::npos && hash_pos + 1 < work.puzzle_name.size()) {
-            try {
-                pool_puzzle_num = std::stoi(work.puzzle_name.substr(hash_pos + 1));
-            } catch (...) {}
-        }
-        if (pool_puzzle_num > 0) {
-            const auto* pool_puzzle = PuzzleDatabase::get_puzzle(pool_puzzle_num);
-            if (pool_puzzle && !pool_puzzle->solved) {
-                if (PuzzleDatabase::check_if_solved(pool_puzzle->target_address)) {
-                    std::cerr << "\n[!] WARNING: Puzzle #" << pool_puzzle_num << " appears to have been SOLVED!\n";
-                    std::cerr << "    Address " << pool_puzzle->target_address << " has zero balance.\n";
-                    std::cerr << "    The pool may be assigning stale work. Continuing anyway (pool decides).\n\n";
-                }
-            }
-        }
-    }
-
     // Set solution callback
     pool_manager.set_solution_callback([](const uint8_t* key, const std::string& worker) {
         std::cout << "\n";
@@ -1530,31 +1991,8 @@ int run_pool_mode(const Arguments& args, const GPUDetectionResult& gpu_info) {
     rc_kangaroo.dp_bits = work.dp_bits;
 
     // Calculate range bits from work assignment
-    // Derive from range_end: find the highest set bit in the 32-byte big-endian value
-    {
-        int computed_range_bits = 0;
-        for (int i = 0; i < 32; i++) {
-            if (work.range_end[i] != 0) {
-                // Find highest bit in this byte (big-endian, so first non-zero byte matters)
-                int bit_pos = 0;
-                uint8_t val = work.range_end[i];
-                while (val >>= 1) bit_pos++;
-                computed_range_bits = (31 - i) * 8 + bit_pos + 1;
-                break;
-            }
-        }
-        // Fallback: use puzzle number from work_id (puzzle_id from server)
-        if (computed_range_bits == 0 && work.work_id > 0) {
-            computed_range_bits = static_cast<int>(work.work_id);
-        }
-        // Last resort fallback with warning
-        if (computed_range_bits == 0) {
-            computed_range_bits = DEFAULT_RANGE_BITS;
-            std::cerr << "[!] WARNING: Could not determine range_bits from pool work assignment, defaulting to " << DEFAULT_RANGE_BITS << "\n";
-        }
-        rc_kangaroo.range_bits = computed_range_bits;
-        std::cout << "[+] Range bits: " << rc_kangaroo.range_bits << " (derived from pool work assignment)\n";
-    }
+    // (simplified - in real implementation, parse from work.range_start/end)
+    rc_kangaroo.range_bits = 135;  // Default to puzzle 135
 
     int num_gpus = rc_kangaroo.init(args.gpu_ids);
     if (num_gpus == 0) {
@@ -1565,8 +2003,29 @@ int run_pool_mode(const Arguments& args, const GPUDetectionResult& gpu_info) {
 
     std::cout << "[+] RCKangaroo initialized with " << num_gpus << " GPU(s)\n";
 
-    // Auto-detect bloom filter for opportunistic brainwallet scanning (Pro only)
-
+    // Load bloom filter if specified (same as standalone mode).
+    // Opportunistic address scanning is a Pro feature; the free build
+    // strips bloom_file at the config-merge gateway, so this block is a
+    // no-op there. Defense-in-depth: also #ifdef-guard the load itself.
+#ifdef COLLIDER_PRO
+    if (!args.bloom_file.empty()) {
+        if (rc_kangaroo.load_bloom_filter(args.bloom_file)) {
+            std::cout << "[*] Bloom filter loaded - opportunistic address checking enabled\n";
+            rc_kangaroo.bloom_hit_callback = [](const gpu::BloomHit& hit) {
+                std::ofstream hitlog("bloom_hits.txt", std::ios::app);
+                if (hitlog) {
+                    char h160_hex[41];
+                    for (int i = 0; i < 20; i++) {
+                        snprintf(h160_hex + i*2, 3, "%02x", hit.hash160[i]);
+                    }
+                    hitlog << "H160: " << h160_hex << " at ops " << hit.ops_at_hit << "\n";
+                }
+            };
+        } else {
+            std::cerr << "[!] WARNING: Failed to load bloom filter: " << args.bloom_file << "\n";
+        }
+    }
+#endif
 
     // Set target public key from work assignment
     std::string pubkey_hex;
@@ -1587,81 +2046,68 @@ int run_pool_mode(const Arguments& args, const GPUDetectionResult& gpu_info) {
         pool_manager.submit_dp(x, d, type, work.dp_bits);
     };
 
-    // Calculate expected operations for ETA (same as standalone)
-    double expected_ops_bits = (rc_kangaroo.range_bits - 1) / 2.0 + 1;
-    uint64_t expected_ops = (expected_ops_bits < 63) ? (1ULL << (int)expected_ops_bits) : 0;
+    // Progress callback. Pool mode shows the worker's contribution share
+    // since session start (server-aggregated across ALL machines using
+    // this worker name) rather than a single-worker-finish-the-puzzle
+    // ETA, which is meaningless in a pool context.
+    //
+    // Share is computed against deltas from a baseline captured on the
+    // first STATS_RSP, not all-time totals: the all-time pool count is
+    // dragged down by historical DPs (e.g., from earlier pre-protocol-fix
+    // testing) that distort the operator's true present-day contribution.
+    // A heavy local worker correctly reads as ~90% of *current* work even
+    // if the lifetime pool counter started in the thousands.
+    bool baseline_captured = false;
+    uint64_t baseline_pool_dps = 0;
+    uint64_t baseline_your_dps = 0;
+    rc_kangaroo.progress_callback = [&, baseline_captured,
+                                      baseline_pool_dps,
+                                      baseline_your_dps](
+            uint64_t /*ops*/, uint64_t dp_count, int speed) mutable -> bool {
+        if (g_shutdown.load()) return false;
 
-    // Open invalid DP log for diagnostics
-    rc_kangaroo.reset_invalid_dp_count();
-    rc_kangaroo.open_invalid_dp_log("invalid_dps.log");
-
-    // Progress callback with pool stats and professional formatting
-    auto start_time = std::chrono::steady_clock::now();
-    rc_kangaroo.progress_callback = [&, expected_ops, start_time](uint64_t ops, uint64_t dp_count, int speed) -> bool {
-        // Propagate signal to atomic shutdown flag (FIX 1)
-        if (g_signal_received) {
-            g_shutdown.store(true, std::memory_order_relaxed);
+        collider::pool::PoolStats ps = pool_manager.get_stats();
+        if (!baseline_captured && ps.total_dps > 0) {
+            baseline_pool_dps = ps.total_dps;
+            baseline_your_dps = ps.your_dps;
+            baseline_captured = true;
         }
-        if (!g_shutdown.load(std::memory_order_relaxed)) {
-            auto now = std::chrono::steady_clock::now();
-            double elapsed = std::chrono::duration<double>(now - start_time).count();
+        uint64_t pool_delta = (ps.total_dps > baseline_pool_dps)
+            ? (ps.total_dps - baseline_pool_dps) : 0;
+        uint64_t your_delta = (ps.your_dps > baseline_your_dps)
+            ? (ps.your_dps - baseline_your_dps) : 0;
+        double share_pct = (pool_delta > 0)
+            ? (100.0 * static_cast<double>(your_delta)
+                      / static_cast<double>(pool_delta))
+            : 0.0;
 
-            // Calculate progress percentage
-            double progress_pct = (expected_ops > 0) ? (100.0 * ops / expected_ops) : 0;
-            if (progress_pct > 100.0) progress_pct = 100.0;
+        std::cout << "\r\033[K";
+        std::cout << "\033[32mSpeed:\033[0m " << ui::ProfessionalUI::format_speed(speed) << " | "
+                  << "\033[35mLocal DPs:\033[0m " << ui::ProfessionalUI::format_number_short(dp_count) << " | "
+                  << "\033[33mSent:\033[0m " << ui::ProfessionalUI::format_number_short(pool_manager.get_submitted_count()) << " | "
+                  << "\033[36mYour total:\033[0m " << ui::ProfessionalUI::format_number_short(ps.your_dps) << " | "
+                  << "\033[34mPool total:\033[0m " << ui::ProfessionalUI::format_number_short(ps.total_dps) << " | "
+                  << "\033[35mSession share:\033[0m " << std::fixed << std::setprecision(1) << share_pct << "%"
+                  << "  " << std::flush;
 
-            // Format elapsed time
-            std::string elapsed_str = ui::ProfessionalUI::format_duration(elapsed);
-
-            // Get invalid DP count
-            uint64_t invalid_dps = rc_kangaroo.get_invalid_dp_count();
-
-            // Professional single-line progress (matching standalone style)
-            std::cout << "\r\033[K";
-            std::cout << "\033[36mPool:\033[0m "
-                      << std::fixed << std::setprecision(2) << progress_pct << "% | "
-                      << "\033[32mSpeed:\033[0m " << ui::ProfessionalUI::format_speed(speed) << " | "
-                      << "\033[35mDPs:\033[0m " << ui::ProfessionalUI::format_number_short(dp_count) << " | "
-                      << "\033[33mSent:\033[0m " << ui::ProfessionalUI::format_number_short(pool_manager.get_submitted_count());
-
-            // Show acceptance rate (rejected DPs tracked by pool client)
-            uint64_t sent = pool_manager.get_submitted_count();
-            uint64_t rejected = pool_manager.get_stats().rejected_dps;
-            if (sent > 0) {
-                double accept_rate = 100.0 * (1.0 - (double)rejected / (double)sent);
-                std::cout << " | \033[32mAccepted:\033[0m " << std::fixed << std::setprecision(1) << accept_rate << "%";
-            }
-
-            std::cout << " | \033[34mElapsed:\033[0m " << elapsed_str
-                      << "  " << std::flush;
-
-            return true;  // Continue
-        }
-        return false;  // Stop
+        return true;  // Continue
     };
 
-    // Display professional search header (matching standalone style)
+    // Display professional search header. The per-worker "Expected Ops"
+    // line was removed -- in pool mode the relevant total is the pool-wide
+    // 2^((range_bits-1)/2 + 1) figure, which the website dashboard already
+    // surfaces against the live aggregate pool speed.
     std::cout << "\n";
     ui::ProfessionalUI::render_section("Pool Solving - RCKangaroo");
     ui::ProfessionalUI::render_kv("Pool", pool_config.host + ":" + std::to_string(pool_config.port));
     ui::ProfessionalUI::render_kv("Worker", pool_config.worker_name);
     ui::ProfessionalUI::render_kv("GPUs", std::to_string(num_gpus) + " detected");
     ui::ProfessionalUI::render_kv("DP Bits", std::to_string(work.dp_bits));
-    ui::ProfessionalUI::render_kv("Expected Ops", "~2^" + std::to_string((int)expected_ops_bits));
     std::cout << "\n";
     ui::ProfessionalUI::render_footer("Press Ctrl+C to stop");
 
     // Solve (this will run until solution found or stopped)
     auto result = rc_kangaroo.solve();
-
-    // Close invalid DP log
-    rc_kangaroo.close_invalid_dp_log();
-
-    // Show final invalid DP count
-    uint64_t final_invalid = rc_kangaroo.get_invalid_dp_count();
-    if (final_invalid > 0) {
-        std::cout << "\n\033[33m[!] " << final_invalid << " invalid DPs detected (logged to invalid_dps.log)\033[0m\n";
-    }
 
     std::cout << "\n";
 
@@ -1689,9 +2135,122 @@ int run_pool_mode(const Arguments& args, const GPUDetectionResult& gpu_info) {
     }
 
 #else
-    std::cerr << "[!] RCKangaroo not available - pool mode requires CUDA backend\n";
-    pool_manager.disconnect();
-    return 1;
+    // CPU/Metal fallback: use KangarooSolver for pool mode.
+    // On macOS (Metal) and any non-CUDA build, we run the portable CPU kangaroo
+    // and wire its dp_callback to submit distinguished points to the pool.
+    std::cout << "[*] No CUDA available. Using CPU kangaroo for pool solving.\n";
+    std::cout << "    Performance will be lower than a CUDA GPU.\n\n";
+
+    // Convert work.range_start / work.range_end (big-endian uint8[32]) to UInt256
+    auto bytes_to_uint256 = [](const uint8_t* b) -> UInt256 {
+        UInt256 v;
+        for (int i = 0; i < 4; i++) {
+            uint64_t part = 0;
+            for (int j = 0; j < 8; j++) {
+                part = (part << 8) | b[i * 8 + j];
+            }
+            v.parts[3 - i] = part;  // big-endian bytes → little-endian UInt256 parts
+        }
+        return v;
+    };
+
+    KangarooSolver cpu_solver;
+    cpu_solver.set_range(bytes_to_uint256(work.range_start), bytes_to_uint256(work.range_end));
+    cpu_solver.dp_bits = static_cast<int>(work.dp_bits);
+    // Pool mode: the worker contributes to a *global* solve, not its own
+    // chunk-local discrete-log. set_range() defaults max_steps to
+    // expected_steps*4 (~16M for a 2^40 chunk), which trips after ~80s of CPU
+    // grinding -- before any DP is statistically likely at dp_bits=35. Run
+    // indefinitely instead; the receiver/server controls termination.
+    cpu_solver.max_steps = UINT64_MAX;
+
+    // Decompress the 33-byte pool pubkey (0x02/03 prefix + 32 X bytes) into
+    // the (X, Y) form the CPU kangaroo expects. Without this the solver
+    // searches for the discrete log of the all-zeros point, makes no
+    // progress, and exits immediately with 0 steps / 0 DPs.
+    {
+        std::string pubkey_hex;
+        pubkey_hex.reserve(66);
+        for (int i = 0; i < 33; ++i) {
+            char buf[3];
+            snprintf(buf, sizeof(buf), "%02x", work.public_key[i]);
+            pubkey_hex += buf;
+        }
+        cpu::uint256_t target_x, target_y;
+        if (!cpu::decompress_pubkey(target_x, target_y, pubkey_hex)) {
+            std::cerr << "[!] Failed to decompress pool target pubkey: "
+                      << pubkey_hex << "\n";
+            pool_manager.disconnect();
+            return 1;
+        }
+        cpu_solver.set_target_pubkey(target_x, target_y);
+    }
+
+    // Submit each DP to the pool as it is found
+    cpu_solver.dp_callback = [&](const cpu::uint256_t& x, const cpu::uint256_t& dist, bool is_tame) {
+        uint8_t x_bytes[32], d_bytes[32];
+        for (int i = 0; i < 4; i++) {
+            uint64_t xv = x.d[3 - i], dv = dist.d[3 - i];
+            for (int j = 0; j < 8; j++) {
+                x_bytes[i * 8 + j] = static_cast<uint8_t>((xv >> (56 - j * 8)) & 0xFF);
+                d_bytes[i * 8 + j] = static_cast<uint8_t>((dv >> (56 - j * 8)) & 0xFF);
+            }
+        }
+        pool_manager.submit_dp(x_bytes, d_bytes, is_tame ? 0 : 1, work.dp_bits);
+    };
+
+    cpu_solver.progress_callback = [&](uint64_t, uint64_t, uint64_t dp_count, double rate) -> bool {
+        if (!g_shutdown.load()) {
+            // CPU rates are typically <1 MKeys/s on Apple Silicon, so the
+            // standard format_speed (int MKeys/s) rounds them to "0". Display
+            // with two decimals or fall back to KKeys/s for sub-MKey/s rates.
+            std::ostringstream speed_str;
+            double mkeys = rate / 1e6;
+            if (mkeys >= 1.0) {
+                speed_str << std::fixed << std::setprecision(2) << mkeys << " MKeys/s";
+            } else {
+                speed_str << std::fixed << std::setprecision(1) << (rate / 1e3) << " KKeys/s";
+            }
+            std::cout << "\r\033[K"
+                      << "\033[36mPool:\033[0m CPU | "
+                      << "\033[32mSpeed:\033[0m " << speed_str.str() << " | "
+                      << "\033[35mDPs:\033[0m " << ui::ProfessionalUI::format_number_short(dp_count) << " | "
+                      << "\033[33mSent:\033[0m " << ui::ProfessionalUI::format_number_short(pool_manager.get_submitted_count())
+                      << "  " << std::flush;
+            return true;
+        }
+        return false;
+    };
+
+    std::cout << "\n";
+    ui::ProfessionalUI::render_section("Pool Solving - CPU Kangaroo");
+    ui::ProfessionalUI::render_kv("Pool", pool_config.host + ":" + std::to_string(pool_config.port));
+    ui::ProfessionalUI::render_kv("Worker", pool_config.worker_name);
+    ui::ProfessionalUI::render_kv("DP Bits", std::to_string(work.dp_bits));
+    std::cout << "\n";
+    ui::ProfessionalUI::render_footer("Press Ctrl+C to stop");
+
+    auto cpu_result = cpu_solver.solve();
+    std::cout << "\n";
+
+    if (cpu_result.found) {
+        std::cout << "[+] SOLUTION FOUND!\n";
+        uint8_t key[32] = {};
+        for (int i = 0; i < 4; i++) {
+            uint64_t v = cpu_result.private_key.d[3 - i];
+            for (int j = 0; j < 8; j++) {
+                key[i * 8 + j] = static_cast<uint8_t>((v >> (56 - j * 8)) & 0xFF);
+            }
+        }
+        std::stringstream ss;
+        for (int i = 0; i < 32; i++) {
+            ss << std::hex << std::setfill('0') << std::setw(2) << static_cast<int>(key[i]);
+        }
+        std::cout << "    Private Key: " << ss.str() << "\n";
+        pool_manager.report_solution(key);
+    } else {
+        std::cout << "[*] Solving stopped\n";
+    }
 #endif
 
     // Disconnect from pool
@@ -1709,43 +2268,23 @@ int run_pool_mode(const Arguments& args, const GPUDetectionResult& gpu_info) {
 }
 
 /**
- * Clean up background threads before exit (FIX 5: no detached threads).
- */
-void cleanup_background_threads() {
-    g_shutdown.store(true, std::memory_order_relaxed);
-    std::vector<std::thread> threads_to_join;
-    {
-        std::lock_guard<std::mutex> lock(g_bg_threads_mutex);
-        threads_to_join = std::move(g_background_threads);
-        g_background_threads.clear();
-    }
-    for (auto& t : threads_to_join) {
-        if (t.joinable()) t.join();
-    }
-}
-
-/**
  * Main entry point.
  */
 int main(int argc, char* argv[]) {
-    // Register cleanup for background threads (FIX 5)
-    std::atexit(cleanup_background_threads);
-
     // Enable ANSI colors on Windows
     enable_windows_ansi();
 
-    // Parse arguments
-    Arguments args = parse_args(argc, argv);
-
-    // Track which CLI options were explicitly set (before config merge)
-    bool cli_has_pool_url = !args.pool_url.empty();
-    bool cli_has_worker = !args.pool_worker.empty();
+    // Parse arguments. CLIFlags now carries explicit per-arg "was set" bits,
+    // populated inside parse_args at the moment argv supplied each value
+    // (track-e refactor, Wave 5). The previous post-parse inference is gone.
+    collider::CLIFlags cli_flags;
+    Arguments args = parse_args(argc, argv, &cli_flags);
 
     // Load config file (config.yml in current directory or ~/.collider/config.yml)
     // Command-line arguments take precedence over config file
     collider::AppConfig app_config;
     if (app_config.load(args.config_file)) {
-        collider::apply_config_to_args(args, app_config, cli_has_pool_url, cli_has_worker);
+        collider::apply_config_to_args(args, app_config, cli_flags);
     }
 
     if (args.help) {
@@ -1753,17 +2292,89 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
+#ifndef COLLIDER_PRO
+    // Free build: brain-wallet code is not compiled in. Reject the mode
+    // early (before any GPU init or banner display) with a clear pointer
+    // to the Pro upgrade. Both --brainwallet (CLI) and brainwallet_enabled
+    // (config.yml) end up setting args.brainwallet_mode, so a single check
+    // catches both.
+    if (args.brainwallet_mode) {
+        std::cerr << "[PRO] Brain wallet scanning requires theCollider Pro.\n"
+                  << "      Purchase at: https://collisionprotocol.com/pro\n";
+        return 1;
+    }
+#endif
+
+#ifdef COLLIDER_PRO
+    // --activate KEY: save and validate a new license key.
+    // Usage: ./collider --activate CLLDR-XXXX-XXXX-XXXX-XXXX
+    if (argc >= 3 && std::string(argv[1]) == "--activate") {
+        std::string key = argv[2];
+        std::cout << "[LICENSE] Validating " << key << " ...\n";
+        auto result = collider::license::validate(key);
+        if (!result.valid) {
+            std::cerr << "[LICENSE] Invalid key: "
+                      << (result.error.empty() ? "key not found" : result.error) << "\n"
+                      << "          Purchase at: https://collisionprotocol.com/pro\n";
+            return 1;
+        }
+        // Persist the key
+        namespace fs = std::filesystem;
+        std::string kpath = collider::license::cache_path();
+        // store key next to cache as license_key file
+        std::string kfile = fs::path(kpath).parent_path().string() + "/license_key";
+        try { fs::create_directories(fs::path(kfile).parent_path()); } catch (...) {}
+        std::ofstream kf(kfile, std::ios::trunc);
+        if (kf) kf << key << "\n";
+        std::cout << "[LICENSE] Activated for " << result.email << ". Enjoy theCollider Pro!\n";
+        return 0;
+    }
+
+    // Startup license check: read stored key and validate (cache-backed, 24h).
+    {
+        namespace fs = std::filesystem;
+        std::string kpath = collider::license::cache_path();
+        std::string kfile = fs::path(kpath).parent_path().string() + "/license_key";
+        std::string stored_key;
+        {
+            std::ifstream kf(kfile);
+            if (kf) std::getline(kf, stored_key);
+        }
+        if (stored_key.empty()) {
+            std::cerr << "[LICENSE] No license key found.\n"
+                      << "          Run: ./collider --activate YOUR_KEY\n"
+                      << "          Purchase at: https://collisionprotocol.com/pro\n";
+            return 1;
+        }
+        auto result = collider::license::validate(stored_key);
+        if (!result.valid) {
+            std::cerr << "[LICENSE] License invalid or expired.\n"
+                      << "          Key: " << stored_key << "\n"
+                      << "          Error: " << result.error << "\n"
+                      << "          Visit: https://collisionprotocol.com/pro\n";
+            return 1;
+        }
+    }
+#endif
+
     // Run brainwallet setup wizard if requested
+    if (args.brainwallet_setup) {
+#ifdef COLLIDER_PRO
+        enable_windows_ansi();
+        ui::BrainwalletSetup::run_wizard();
+        return 0;
+#else
+        std::cerr << "[PRO] Brain wallet scanning requires theCollider Pro.\n"
+                  << "      Purchase at: https://collisionprotocol.com/pro\n";
+        return 1;
+#endif
+    }
 
     if (args.debug) std::cout << "[DEBUG] Starting collider...\n" << std::flush;
 
-    // Setup signal handler (FIX 12: platform-specific)
-#ifdef _WIN32
-    SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE);
-#else
+    // Setup signal handler
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
-#endif
     if (args.debug) std::cout << "[DEBUG] Signal handlers set\n" << std::flush;
 
     // Initialize logger for crash diagnosis
@@ -1773,7 +2384,7 @@ int main(int argc, char* argv[]) {
         if (args.debug) std::cout << "[DEBUG] Got logger instance, calling init()...\n" << std::flush;
         if (logger.init()) {
             if (args.debug) std::cout << "[DEBUG] Logger init succeeded\n" << std::flush;
-            LOG_INFO("Starting collider v" COLLIDER_VERSION);
+            LOG_INFO("Starting theCollider v1.2.1");
         } else {
             if (args.debug) std::cout << "[DEBUG] Logger init returned false\n" << std::flush;
         }
@@ -1792,75 +2403,38 @@ int main(int argc, char* argv[]) {
     // INTERACTIVE MODE: When no command-line arguments provided
     // This check must come after GPU detection so we can show estimated speeds
     if (argc == 1) {
-        // Free edition: auto-start pool mode with default pool
-        // No menu, just connect and start mining
-        using namespace ui;
+        // Calculate GPU speed for estimation (default 400 MKeys/s if unknown)
+        double gpu_speed_mkeys = gpu_info.estimated_speed > 0
+            ? gpu_info.estimated_speed / 1e6
+            : 400.0;
 
-        // Show GPU info
-        std::cout << colors::CYAN << "[*] " << colors::RESET << "GPU: " << gpu_info.gpu_names << "\n";
-        std::cout << colors::CYAN << "[*] " << colors::RESET << "Backend: " << gpu_info.backend << "\n";
-        std::cout << "\n";
+        // Run interactive mode and get user configuration
+        args = run_interactive_mode(args, gpu_speed_mkeys);
 
-        // Check for worker address (from config file or prompt)
-        if (args.pool_worker.empty()) {
-            std::cout << colors::BRIGHT_WHITE << "Enter your Bitcoin payout address" << colors::RESET << "\n";
-            std::cout << colors::DIM << "(This is where your share of any solved puzzle will be sent)" << colors::RESET << "\n";
-            std::cout << "\n";
-            std::cout << colors::BRIGHT_CYAN << "BTC Address: " << colors::RESET;
-            std::cout << std::flush;
-
-            std::string worker_input;
-            std::getline(std::cin, worker_input);
-
-            // Trim whitespace
-            size_t start = worker_input.find_first_not_of(" \t\r\n");
-            size_t end = worker_input.find_last_not_of(" \t\r\n");
-            if (start != std::string::npos) {
-                args.pool_worker = worker_input.substr(start, end - start + 1);
-            }
-
-            if (args.pool_worker.empty()) {
-                std::cerr << colors::RED << "[!] " << colors::RESET 
-                          << "Bitcoin address required. Use --worker <address> or enter when prompted.\n";
-                return 1;
-            }
-
-            // Save to config for next time
-            if (collider::save_worker_config(args.pool_worker)) {
-                std::cout << "\n";
-                std::cout << colors::GREEN << "[+] " << colors::RESET
-                          << "Saved address to config.yml (will be used automatically next time)\n";
-            } else {
-                std::cerr << "[!] Warning: failed to save worker configuration\n";
-            }
-        } else {
-            std::cout << colors::GREEN << "[+] " << colors::RESET 
-                      << "Worker: " << args.pool_worker << " (from config)\n";
+        // Handle exit request (user selected Exit from menu)
+        if (args.exit_program) {
+            return 0;
         }
 
-        // Set pool mode with default URL
-        args.pool_mode = true;
-        args.pool_url = COLLIDER_FREE_POOL_URL;
+        // If help was set (user cancelled or wants help), show help and exit
+        if (args.help) {
+            print_usage();
+            return 0;
+        }
+    }
 
-        std::cout << "\n";
-        std::cout << colors::CYAN << "[*] " << colors::RESET 
-                  << "Connecting to pool: " << args.pool_url << "\n";
-        std::cout << "\n";
-
-        // Show upgrade hint
-        std::cout << colors::YELLOW << "  Upgrade to Pro: " << colors::RESET 
-                  << "collisionprotocol.com/pro\n";
-        std::cout << colors::DIM << "  Solo mining, brainwallet scanner, custom pools, and more" << colors::RESET << "\n";
-        std::cout << "\n";
+    // POOL MODE: If pool URL specified, run pool mode and exit
+    if (args.pool_mode) {
+        return run_pool_mode(args, gpu_info);
     }
 
     // Display animated banner with context-aware mode
     // Skip for brainwallet mode - it has its own header
-    {
+    if (!args.brainwallet_mode) {
     ui::BannerConfig banner_config;
     banner_config.enable_animation = !args.verbose;
     banner_config.enable_color = true;
-    banner_config.animation_frames = 1;
+    banner_config.animation_frames = 2;
     banner_config.frame_delay_ms = 100;
 
     // Set operation mode for context-aware display
@@ -1877,11 +2451,7 @@ int main(int argc, char* argv[]) {
     banner_stats.gpu_names = gpu_info.gpu_names;
     banner_stats.backend = gpu_info.backend;  // Actual backend: CUDA, Metal, or CPU
     banner_stats.estimated_speed = gpu_info.estimated_speed;
-    banner_stats.version = COLLIDER_VERSION;
-
-    // Cache smart puzzle selection result (FIX 17: avoid running analysis twice)
-    int cached_best_puzzle = 0;
-    bool cached_best_puzzle_valid = false;
+    banner_stats.version = "1.2.1";
 
     // Add puzzle info if in puzzle mode
     if (args.puzzle_mode) {
@@ -1895,9 +2465,7 @@ int main(int argc, char* argv[]) {
         } else if (args.puzzle_number == 0) {
             // Smart puzzle selection: choose best ROI puzzle
             if (args.smart_select) {
-                cached_best_puzzle = get_best_puzzle(400.0);
-                cached_best_puzzle_valid = true;
-                int best = cached_best_puzzle;
+                int best = get_best_puzzle(400.0);
                 if (best > 0) {
                     args.puzzle_number = best;
                     puzzle = PuzzleDatabase::get_puzzle(best);
@@ -1956,12 +2524,6 @@ int main(int argc, char* argv[]) {
     ui::display_banner(banner_stats, banner_config);
     if (args.debug) std::cout << "[DEBUG] Banner displayed.\n" << std::flush;
 
-    // POOL MODE: If pool URL specified, run pool mode and exit (after banner)
-    // Benchmark and other explicit modes take priority over auto-pool
-    if (args.pool_mode && !args.benchmark && !args.analyze_puzzles) {
-        return run_pool_mode(args, gpu_info);
-    }
-
     // Show solved puzzle analysis in verbose mode
     if (args.verbose) {
         analyze_solved_puzzles();
@@ -1972,8 +2534,733 @@ int main(int argc, char* argv[]) {
         print_puzzle_analysis(400.0);  // Assume 400 MKeys/sec GPU speed
         return 0;
     }
-    } // End of banner/pool block
+    } // End of !args.brainwallet_mode block
 
+    // Brainwallet mode - scan passphrases against bloom filter
+    // (Pro-only block; in the free build this entire branch is excluded
+    // and the early-rejection above ensures args.brainwallet_mode is false
+    // before we ever get here.)
+#ifdef COLLIDER_PRO
+    if (args.brainwallet_mode) {
+        if (args.bloom_file.empty()) {
+            std::cerr << "[!] ERROR: Brainwallet mode requires --bloom <file.blf>\n";
+            return 1;
+        }
+
+        std::cout << "\n";
+        std::cout << "+================================================================+\n";
+        std::cout << "|               BRAINWALLET SCANNER MODE                         |\n";
+        std::cout << "+================================================================+\n";
+        std::cout << "|  Bloom Filter: " << std::left << std::setw(43) << args.bloom_file << "|\n";
+        std::cout << "|  GPUs: ";
+        for (size_t i = 0; i < args.gpu_ids.size() && i < 8; i++) {
+            std::cout << args.gpu_ids[i];
+            if (i < args.gpu_ids.size() - 1 && i < 7) std::cout << ",";
+        }
+        std::cout << std::string(56 - std::min(args.gpu_ids.size(), size_t(8)) * 2, ' ') << "|\n";
+        std::cout << "+================================================================+\n\n";
+
+        // Initialize brain wallet pipeline
+        gpu::MultiGPUBrainWallet::Config bw_config;
+        bw_config.gpu_ids = args.gpu_ids;
+        bw_config.batch_size = args.batch_size;
+
+        gpu::MultiGPUBrainWallet bw_pipeline(bw_config);
+        if (!bw_pipeline.init()) {
+            std::cerr << "[!] ERROR: Failed to initialize brain wallet GPU pipeline\n";
+            return 1;
+        }
+
+        // Load and parse bloom filter header
+        std::ifstream bloom_in(args.bloom_file, std::ios::binary);
+        if (!bloom_in) {
+            std::cerr << "[!] ERROR: Cannot open bloom filter: " << args.bloom_file << "\n";
+            return 1;
+        }
+
+        // Read bloom filter header (128 bytes)
+        struct BloomHeader {
+            char magic[4];
+            uint32_t version;
+            uint64_t num_bits;
+            uint32_t num_hashes;
+            uint32_t seed;
+            uint64_t num_elements;
+            double target_fp_rate;
+            uint64_t data_offset;
+            uint8_t reserved[80];
+        } bloom_header;
+
+        bloom_in.read(reinterpret_cast<char*>(&bloom_header), sizeof(bloom_header));
+        if (std::string(bloom_header.magic, 4) != "BLF1") {
+            std::cerr << "[!] ERROR: Invalid bloom filter format (expected BLF1 header)\n";
+            return 1;
+        }
+
+        // Read bloom filter data
+        size_t data_size = (bloom_header.num_bits + 7) / 8;
+        std::vector<uint8_t> bloom_data(data_size);
+        bloom_in.seekg(bloom_header.data_offset);
+        bloom_in.read(reinterpret_cast<char*>(bloom_data.data()), data_size);
+        bloom_in.close();
+
+        if (!bw_pipeline.load_bloom_filter(bloom_data.data(), data_size,
+                                           bloom_header.num_bits, bloom_header.num_hashes, bloom_header.seed)) {
+            std::cerr << "[!] ERROR: Failed to load bloom filter\n";
+            return 1;
+        }
+
+        std::cout << "[*] Bloom filter loaded: " << (data_size / 1024 / 1024) << " MB, "
+                  << bloom_header.num_elements << " addresses, k=" << bloom_header.num_hashes << "\n";
+
+        // Initialize streaming passphrase generator with hashcat-compatible rules
+        std::cout << "[*] Initializing streaming brain wallet scanner...\n";
+        std::cout << "[*] Wordlist: " << normalize_path(args.wordlist_file) << "\n";
+
+        // Find rules directory
+        std::string rules_dir = "rules";
+        if (!std::filesystem::exists(rules_dir + "/best64.rule")) {
+            rules_dir = "data/rules";
+            if (!std::filesystem::exists(rules_dir + "/best64.rule")) {
+                rules_dir = "processed/rules";
+            }
+        }
+        std::cout << "[*] Rules directory: " << normalize_path(rules_dir) << "\n";
+
+        // Configure streaming generator
+        generators::StreamingBrainWallet::Config stream_config;
+        stream_config.base_wordlist = args.wordlist_file;
+        stream_config.rules_dir = rules_dir;
+        stream_config.batch_size = args.batch_size;
+        stream_config.enable_feedback = true;
+        stream_config.verbose = args.verbose;
+
+        generators::StreamingBrainWallet streaming_gen(stream_config);
+        if (!streaming_gen.init()) {
+            std::cerr << "[!] Failed to initialize streaming generator\n";
+            return 1;
+        }
+
+        // Handle resume from saved state
+        bool resumed = false;
+        if (args.resume) {
+            if (BrainWalletStateManager::has_saved_state()) {
+                auto saved_state = BrainWalletStateManager::load_state();
+                if (saved_state.valid) {
+                    // Verify wordlist matches
+                    if (BrainWalletStateManager::verify_wordlist(saved_state, args.wordlist_file)) {
+                        // Restore generator state
+                        generators::StreamingBrainWallet::StateSnapshot snap;
+                        snap.current_phase = saved_state.current_phase;
+                        snap.current_word_idx = saved_state.current_word_idx;
+                        snap.current_rule_idx = saved_state.current_rule_idx;
+                        snap.phase_iteration = saved_state.phase_iteration;
+                        snap.total_generated = saved_state.total_checked;
+                        snap.wordlist_size = saved_state.wordlist_size;
+                        snap.rules_count = saved_state.rules_count;
+
+                        if (streaming_gen.restore_state(snap)) {
+                            streaming_gen.set_hits_found(saved_state.hits_found);
+                            resumed = true;
+                            std::cout << "[*] Resumed from saved state:\n";
+                            BrainWalletStateManager::print_state_summary(saved_state);
+                        } else {
+                            std::cerr << "[!] Failed to restore state - starting fresh\n";
+                        }
+                    } else {
+                        std::cerr << "[!] Wordlist changed - cannot resume, starting fresh\n";
+                    }
+                } else {
+                    std::cerr << "[!] Saved state is invalid - starting fresh\n";
+                }
+            } else {
+                std::cout << "[*] No saved state found - starting fresh\n";
+            }
+        }
+
+        // Initialize session ID for state tracking
+        std::string session_id = BrainWalletStateManager::generate_session_id();
+        uint64_t wordlist_hash = BrainWalletStateManager::compute_wordlist_hash(args.wordlist_file);
+        size_t last_save_count = 0;
+
+        auto stats = streaming_gen.get_stats();
+
+        // Use colors for startup info
+        using namespace collider::ui::ansi;
+        std::cout << CYAN << "[*] " << RESET << "Wordlist size: " << BRIGHT_WHITE << format_number_human(stats.wordlist_size) << " words" << RESET << "\n";
+        std::cout << CYAN << "[*] " << RESET << "Rules loaded: " << BRIGHT_WHITE << stats.rules_loaded << RESET << "\n";
+        std::cout << CYAN << "[*] " << RESET << "Attack phases: " << MAGENTA << "Quick Wins" << DIM << " → " << RESET
+                  << MAGENTA << "Crypto Focus" << DIM << " → " << RESET
+                  << MAGENTA << "Extended" << DIM << " → " << RESET
+                  << MAGENTA << "Combinator" << DIM << " → " << RESET
+                  << MAGENTA << "Deep Dive" << RESET << "\n";
+        std::cout << CYAN << "[*] " << RESET << "Mode: " << BRIGHT_GREEN << "INFINITE" << RESET << DIM << " (never exhausts - cycles through attack phases)" << RESET << "\n";
+        std::cout << CYAN << "[*] " << RESET << "State saves every: " << BRIGHT_WHITE << format_number_human(args.save_interval) << RESET << " passphrases\n";
+        if (resumed) {
+            std::cout << BRIGHT_GREEN << "[*] " << RESET << "RESUMED from checkpoint - continuing from previous position\n";
+        }
+
+        // Initialize GPU rule engines - one per GPU for true multi-GPU parallelism
+        bool use_gpu_rules = false;
+        std::vector<gpu::GPURuleEngine> gpu_rule_engines;
+        std::vector<std::string> loaded_rules;
+
+        // Track GPU rule engine's max_words for main loop synchronization
+        size_t gpu_rule_max_words = 0;
+        size_t num_rule_gpus = 0;  // Number of GPUs with rule engines
+
+        // GPU rules are MUCH faster than CPU rules (66+ M/s vs 2 M/s)
+        // Always use GPU rules unless explicitly disabled with --cpu-rules
+        if (args.cpu_rules) {
+            std::cout << CYAN << "[*] " << RESET << "CPU rules mode: " << BRIGHT_GREEN << "FORCED" << RESET
+                      << DIM << " (--cpu-rules flag)" << RESET << "\n";
+        } else if (stats.rules_loaded > 0) {
+            // Calculate memory-safe batch sizes (per GPU)
+            // Output buffer = max_words * max_rules * 256 bytes
+            // Target ~2.5 GB per output buffer (safe for 8GB GPUs like RTX 2060)
+            size_t max_product = 10'000'000;  // 10M entries = ~2.5 GB output buffer
+            size_t estimated_max_rules = std::max(static_cast<size_t>(stats.rules_loaded * 2), static_cast<size_t>(200));
+            size_t max_rules = std::min(estimated_max_rules, static_cast<size_t>(500));
+            size_t max_words = max_product / max_rules;
+            if (max_words < 10000) max_words = 10000;
+            gpu_rule_max_words = max_words;  // Save for main loop
+
+            // Initialize a rule engine for EACH GPU
+            const auto& gpu_ids = bw_config.gpu_ids.empty() ? std::vector<int>{0} : bw_config.gpu_ids;
+            loaded_rules = streaming_gen.get_rules();
+
+            for (int gpu_id : gpu_ids) {
+                gpu::GPURuleEngine::Config rule_config;
+                rule_config.device_id = gpu_id;
+                rule_config.max_rules = max_rules;
+                rule_config.max_words = max_words;
+                rule_config.gpu_only_mode = true;  // Skip 2.4 GB pinned host buffer per GPU
+                                                   // (brainwallet keeps data on GPU, doesn't need host copy)
+
+                gpu_rule_engines.emplace_back(rule_config);
+                auto& engine = gpu_rule_engines.back();
+
+                if (engine.init() && engine.load_rules(loaded_rules)) {
+                    // Initialize mega-fused kernel EC tables for this GPU
+                    if (engine.init_mega_kernel()) {
+                        std::cout << BRIGHT_GREEN << "[MEGA] " << RESET << "GPU " << gpu_id
+                                  << ": Mega-fused kernel initialized\n";
+                    }
+                    num_rule_gpus++;
+                } else {
+                    std::cout << BRIGHT_YELLOW << "[!] " << RESET << "GPU " << gpu_id
+                              << " rule engine init failed\n";
+                    gpu_rule_engines.pop_back();  // Remove failed engine
+                }
+            }
+
+            if (num_rule_gpus > 0) {
+                use_gpu_rules = true;
+                size_t batch_throughput = gpu_rule_max_words * loaded_rules.size() * num_rule_gpus;
+                std::cout << BRIGHT_GREEN << "[*] " << RESET << "GPU Rule Engines: " << BRIGHT_GREEN << num_rule_gpus << " GPUs" << RESET
+                          << " (" << loaded_rules.size() << " rules, " << gpu_rule_max_words << " words/GPU = "
+                          << (batch_throughput / 1'000'000.0) << "M passphrases/batch total)\n";
+            } else {
+                std::cout << BRIGHT_YELLOW << "[!] " << RESET << "GPU Rule Engine: All init failed, using CPU rules\n";
+            }
+        }
+
+        if (!use_gpu_rules) {
+            // Start async prefetch for CPU rule mode
+            streaming_gen.start_async_prefetch();
+            std::cout << CYAN << "[*] " << RESET << "Pipeline: " << BRIGHT_YELLOW << "CPU RULES" << RESET
+                      << DIM << " (slower - GPU rules preferred)" << RESET << "\n";
+        } else {
+            // Start async prefetch for raw words (GPU rules mode)
+            // Prefetch enough words for ALL GPUs (num_rule_gpus * gpu_rule_max_words)
+            streaming_gen.start_raw_word_prefetch(gpu_rule_max_words * num_rule_gpus);
+            std::cout << CYAN << "[*] " << RESET << "Pipeline: " << BRIGHT_GREEN << "TWO-STAGE GPU" << RESET
+                      << DIM << " (Rules→Crypto, " << num_rule_gpus << " GPUs)" << RESET << "\n";
+        }
+        std::cout << CYAN << "[*] " << RESET << "Starting brainwallet scan...\n\n";
+
+        uint64_t total_checked = resumed ? streaming_gen.get_stats().total_generated : 0;
+        uint64_t bloom_hits = 0;      // Unverified bloom filter hits
+        uint64_t verified_hits = 0;   // Verified against UTXO
+        auto start_time = std::chrono::steady_clock::now();
+        auto last_report = start_time;
+
+        // Track reported hits to prevent duplicate output
+        std::unordered_set<std::string> reported_passphrases;
+
+        // Main brainwallet scanning loop (never exhausts - infinite mode)
+        // Two modes:
+        // 1. GPU rules mode: raw words → GPU rule engines → GPU brain wallets (multi-GPU parallel)
+        // 2. CPU rules mode: async prefetch with CPU rule application
+        std::string last_phase = "";
+        std::vector<std::string> current_words;  // Keep track for hit reconstruction in GPU mode
+        size_t num_rules = loaded_rules.size();
+
+        // Sample passphrase tracking for status display
+        std::string sample_passphrase = "";
+        uint64_t last_sample_update = 0;
+        const uint64_t SAMPLE_UPDATE_INTERVAL = 500000;  // Update sample every 500K checks
+
+        while (!g_shutdown) {
+            std::vector<std::string> passphrases;
+            gpu::MultiGPUBrainWallet::BatchResult result;
+
+            if (use_gpu_rules && num_rules > 0 && num_rule_gpus > 0) {
+                // Multi-GPU Rules Mode - parallel processing across all GPUs
+                // Each GPU: raw words → rule engine → brain wallet (zero-copy)
+                size_t total_words_needed = gpu_rule_max_words * num_rule_gpus;
+
+                // Get words for ALL GPUs at once
+                current_words = streaming_gen.next_raw_words_async(total_words_needed);
+                if (current_words.empty()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    continue;
+                }
+
+                // Check if phase changed - reload rules on ALL GPUs
+                if (streaming_gen.phase_changed()) {
+                    auto new_rules = streaming_gen.get_rules();
+                    size_t new_num_rules = new_rules.size();
+
+                    if (new_num_rules > 0) {
+                        bool all_loaded = true;
+                        for (auto& engine : gpu_rule_engines) {
+                            if (!engine.load_rules(new_rules)) {
+                                all_loaded = false;
+                            }
+                        }
+                        if (all_loaded) {
+                            loaded_rules = std::move(new_rules);
+                            num_rules = loaded_rules.size();
+                            std::cout << "\n[*] Phase changed to: " << streaming_gen.current_phase_name()
+                                      << " (" << num_rules << " rules on " << num_rule_gpus << " GPUs)\n";
+                        }
+                    }
+                }
+
+                // Determine sync frequency
+                constexpr size_t ASYNC_BATCH_COUNT = 50;
+                static size_t async_batch_counter = 0;
+                async_batch_counter++;
+                bool should_sync = (async_batch_counter >= ASYNC_BATCH_COUNT) ||
+                                   (total_checked - last_sample_update >= SAMPLE_UPDATE_INTERVAL);
+
+                // Process each GPU's share of words
+                // NOTE: Sequential dispatch is required - CUDA contexts are thread-local,
+                // so std::async breaks stream handling. GPUs still run in parallel
+                // because CUDA kernel launches are async and each GPU has its own stream.
+                size_t words_per_gpu = current_words.size() / num_rule_gpus;
+                size_t batch_total = 0;
+
+                // Pre-reserve result vectors to avoid reallocations
+                result.match_indices.reserve(1024);
+                result.private_keys.reserve(1024);
+
+                for (size_t gpu_idx = 0; gpu_idx < num_rule_gpus; gpu_idx++) {
+                    auto& engine = gpu_rule_engines[gpu_idx];
+                    auto& ctx = bw_pipeline.get_context(static_cast<int>(gpu_idx));
+
+                    // Calculate word range for this GPU
+                    size_t word_start = gpu_idx * words_per_gpu;
+                    size_t word_end = (gpu_idx == num_rule_gpus - 1)
+                                       ? current_words.size()  // Last GPU gets remainder
+                                       : word_start + words_per_gpu;
+
+                    // Create word subset for this GPU
+                    std::vector<std::string> gpu_words(
+                        current_words.begin() + word_start,
+                        current_words.begin() + word_end
+                    );
+
+                    // TWO-STAGE PIPELINE: Rules → Crypto (faster than mega kernel due to better occupancy)
+                    // Stage 1: Apply rules on GPU (keeps data on GPU)
+                    size_t num_passphrases = engine.apply_rules_to_words_gpu(gpu_words, true);
+
+                    if (num_passphrases > 0) {
+                        // Stage 2: Process through crypto pipeline directly from GPU buffers
+                        auto crypto_result = bw_pipeline.process_batch_from_gpu(
+                            reinterpret_cast<const uint8_t*>(engine.d_output()),
+                            engine.d_output_lengths(),
+                            gpu::GPU_MAX_OUTPUT_LEN,  // stride = 256 bytes per passphrase
+                            num_passphrases,
+                            gpu_idx,
+                            engine.get_stream(),
+                            true  // sync
+                        );
+
+                        // Merge results
+                        for (auto idx : crypto_result.match_indices) {
+                            // Adjust index to account for multi-GPU word offset
+                            result.match_indices.push_back(idx + (word_start * num_rules));
+                        }
+                        for (auto& key : crypto_result.private_keys) {
+                            result.private_keys.push_back(std::move(key));
+                        }
+                        result.processed += crypto_result.processed;
+                    }
+                    batch_total += num_passphrases;
+                }
+
+                total_checked += batch_total;
+
+                if (should_sync) {
+                    async_batch_counter = 0;
+                }
+
+                // Capture sample passphrase for display
+                // OPTIMIZATION: Only fetch from GPU when we're already syncing (should_sync=true)
+                // Otherwise use a sample from current_words (avoids stalling async pipeline)
+                if (total_checked - last_sample_update >= SAMPLE_UPDATE_INTERVAL) {
+                    if (should_sync && !gpu_rule_engines.empty()) {
+                        // Safe to do GPU read since we just synced
+                        sample_passphrase = gpu_rule_engines[0].get_passphrase_from_gpu(words_per_gpu * num_rules / 2);
+                    } else if (!current_words.empty()) {
+                        // Use input word with rule indicator (no GPU stall)
+                        sample_passphrase = current_words[current_words.size() / 2] + " + " + std::to_string(num_rules) + " rules";
+                    }
+                    if (sample_passphrase.length() > 40) {
+                        sample_passphrase = sample_passphrase.substr(0, 37) + "...";
+                    }
+                    last_sample_update = total_checked;
+                }
+
+                // For hit handling, we'll reconstruct passphrases on-demand (hits are rare)
+                // Don't populate passphrases vector - let hit handler reconstruct
+                passphrases.clear();
+            } else {
+                // CPU Rules Mode - use async prefetch with CPU rule application
+                passphrases = streaming_gen.next_batch_async();
+
+                if (passphrases.empty()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    continue;
+                }
+
+                result = bw_pipeline.process_batch(passphrases);
+                total_checked += passphrases.size();
+
+                // Capture sample passphrase for display (CPU mode has easy access)
+                if (total_checked - last_sample_update >= SAMPLE_UPDATE_INTERVAL && !passphrases.empty()) {
+                    sample_passphrase = passphrases[passphrases.size() / 2];  // Middle of batch
+                    if (sample_passphrase.length() > 32) {
+                        sample_passphrase = sample_passphrase.substr(0, 29) + "...";
+                    }
+                    last_sample_update = total_checked;
+                }
+            }
+
+            // Check for hits and display full information
+            for (size_t i = 0; i < result.match_indices.size(); i++) {
+                uint32_t match_idx = result.match_indices[i];
+
+                // Get or reconstruct the passphrase
+                std::string hit_passphrase;
+                if (use_gpu_rules && num_rules > 0 && passphrases.empty() && !gpu_rule_engines.empty()) {
+                    // Multi-GPU zero-copy mode: figure out which GPU has this hit
+                    // The match_idx was adjusted by (word_start * num_rules), so reverse that
+                    size_t words_per_gpu = gpu_rule_max_words;
+                    size_t passphrases_per_gpu = words_per_gpu * num_rules;
+                    size_t gpu_idx = match_idx / passphrases_per_gpu;
+                    size_t local_idx = match_idx % passphrases_per_gpu;
+
+                    if (gpu_idx < gpu_rule_engines.size()) {
+                        hit_passphrase = gpu_rule_engines[gpu_idx].get_passphrase_from_gpu(local_idx);
+                    }
+                    if (hit_passphrase.empty()) {
+                        hit_passphrase = "[Failed to retrieve from GPU " + std::to_string(gpu_idx) + "]";
+                    }
+                } else if (!passphrases.empty() && match_idx < passphrases.size()) {
+                    hit_passphrase = passphrases[match_idx];
+                } else {
+                    hit_passphrase = "[Invalid match index]";
+                }
+
+                // Skip if already reported (prevents duplicate output)
+                if (reported_passphrases.count(hit_passphrase)) {
+                    continue;
+                }
+                reported_passphrases.insert(hit_passphrase);
+                bloom_hits++;
+
+                // Get private key from GPU result (if available)
+                std::array<uint8_t, 32> private_key = {};
+                if (i < result.private_keys.size()) {
+                    private_key = result.private_keys[i];
+                } else {
+                    // Compute private key from passphrase (SHA256)
+                    auto sha_result = cpu::SHA256::hash(
+                        reinterpret_cast<const uint8_t*>(hit_passphrase.data()),
+                        hit_passphrase.size());
+                    std::copy(sha_result.begin(), sha_result.end(), private_key.begin());
+                }
+
+                // Compute Hash160 from private key (does pubkey computation internally)
+                auto hash160 = cpu::compute_hash160(private_key.data());
+
+                // Compute public key for display (using the same EC math)
+                cpu::uint256_t priv_k;
+                priv_k.d[3] = ((uint64_t)private_key[0] << 56) | ((uint64_t)private_key[1] << 48) |
+                             ((uint64_t)private_key[2] << 40) | ((uint64_t)private_key[3] << 32) |
+                             ((uint64_t)private_key[4] << 24) | ((uint64_t)private_key[5] << 16) |
+                             ((uint64_t)private_key[6] << 8) | private_key[7];
+                priv_k.d[2] = ((uint64_t)private_key[8] << 56) | ((uint64_t)private_key[9] << 48) |
+                             ((uint64_t)private_key[10] << 40) | ((uint64_t)private_key[11] << 32) |
+                             ((uint64_t)private_key[12] << 24) | ((uint64_t)private_key[13] << 16) |
+                             ((uint64_t)private_key[14] << 8) | private_key[15];
+                priv_k.d[1] = ((uint64_t)private_key[16] << 56) | ((uint64_t)private_key[17] << 48) |
+                             ((uint64_t)private_key[18] << 40) | ((uint64_t)private_key[19] << 32) |
+                             ((uint64_t)private_key[20] << 24) | ((uint64_t)private_key[21] << 16) |
+                             ((uint64_t)private_key[22] << 8) | private_key[23];
+                priv_k.d[0] = ((uint64_t)private_key[24] << 56) | ((uint64_t)private_key[25] << 48) |
+                             ((uint64_t)private_key[26] << 40) | ((uint64_t)private_key[27] << 32) |
+                             ((uint64_t)private_key[28] << 24) | ((uint64_t)private_key[29] << 16) |
+                             ((uint64_t)private_key[30] << 8) | private_key[31];
+
+                cpu::ECPoint P;
+                cpu::ec_mul(P, priv_k);
+                cpu::uint256_t pub_x, pub_y;
+                cpu::ec_to_affine(pub_x, pub_y, P);
+
+                // Build compressed public key (33 bytes)
+                std::array<uint8_t, 33> public_key_compressed;
+                public_key_compressed[0] = pub_y.is_odd() ? 0x03 : 0x02;
+                public_key_compressed[1] = (pub_x.d[3] >> 56) & 0xff;
+                public_key_compressed[2] = (pub_x.d[3] >> 48) & 0xff;
+                public_key_compressed[3] = (pub_x.d[3] >> 40) & 0xff;
+                public_key_compressed[4] = (pub_x.d[3] >> 32) & 0xff;
+                public_key_compressed[5] = (pub_x.d[3] >> 24) & 0xff;
+                public_key_compressed[6] = (pub_x.d[3] >> 16) & 0xff;
+                public_key_compressed[7] = (pub_x.d[3] >> 8) & 0xff;
+                public_key_compressed[8] = pub_x.d[3] & 0xff;
+                public_key_compressed[9] = (pub_x.d[2] >> 56) & 0xff;
+                public_key_compressed[10] = (pub_x.d[2] >> 48) & 0xff;
+                public_key_compressed[11] = (pub_x.d[2] >> 40) & 0xff;
+                public_key_compressed[12] = (pub_x.d[2] >> 32) & 0xff;
+                public_key_compressed[13] = (pub_x.d[2] >> 24) & 0xff;
+                public_key_compressed[14] = (pub_x.d[2] >> 16) & 0xff;
+                public_key_compressed[15] = (pub_x.d[2] >> 8) & 0xff;
+                public_key_compressed[16] = pub_x.d[2] & 0xff;
+                public_key_compressed[17] = (pub_x.d[1] >> 56) & 0xff;
+                public_key_compressed[18] = (pub_x.d[1] >> 48) & 0xff;
+                public_key_compressed[19] = (pub_x.d[1] >> 40) & 0xff;
+                public_key_compressed[20] = (pub_x.d[1] >> 32) & 0xff;
+                public_key_compressed[21] = (pub_x.d[1] >> 24) & 0xff;
+                public_key_compressed[22] = (pub_x.d[1] >> 16) & 0xff;
+                public_key_compressed[23] = (pub_x.d[1] >> 8) & 0xff;
+                public_key_compressed[24] = pub_x.d[1] & 0xff;
+                public_key_compressed[25] = (pub_x.d[0] >> 56) & 0xff;
+                public_key_compressed[26] = (pub_x.d[0] >> 48) & 0xff;
+                public_key_compressed[27] = (pub_x.d[0] >> 40) & 0xff;
+                public_key_compressed[28] = (pub_x.d[0] >> 32) & 0xff;
+                public_key_compressed[29] = (pub_x.d[0] >> 24) & 0xff;
+                public_key_compressed[30] = (pub_x.d[0] >> 16) & 0xff;
+                public_key_compressed[31] = (pub_x.d[0] >> 8) & 0xff;
+                public_key_compressed[32] = pub_x.d[0] & 0xff;
+
+                // Build address from Hash160
+                std::string hash160_hex;
+                for (int j = 0; j < 20; j++) {
+                    char hex[3];
+                    snprintf(hex, sizeof(hex), "%02x", hash160[j]);
+                    hash160_hex += hex;
+                }
+
+                // Convert Hash160 to Bitcoin address (Base58Check)
+                std::string btc_address = Base58::hash160_to_address(
+                    hash160.data(), [](const uint8_t* data, size_t len) {
+                        return cpu::SHA256::hash(data, len);
+                    });
+
+                // Display full hit information with colors
+                std::cout << "\n";
+                std::cout << BRIGHT_YELLOW << "+========================================================+" << RESET << "\n";
+                std::cout << BRIGHT_YELLOW << "|" << RESET << "                  " << BOLD << BRIGHT_YELLOW << "BLOOM HIT FOUND" << RESET << "                       " << BRIGHT_YELLOW << "|" << RESET << "\n";
+                std::cout << BRIGHT_YELLOW << "+========================================================+" << RESET << "\n";
+                std::cout << BRIGHT_YELLOW << "|" << RESET << " Passphrase:  " << BRIGHT_WHITE << hit_passphrase << RESET << "\n";
+                std::cout << BRIGHT_YELLOW << "|" << RESET << " Private Key: " << DIM;
+                for (int j = 0; j < 32; j++) {
+                    printf("%02x", private_key[j]);
+                }
+                std::cout << RESET << "\n";
+                std::cout << BRIGHT_YELLOW << "|" << RESET << " Public Key:  " << DIM;
+                for (int j = 0; j < 33; j++) {
+                    printf("%02x", public_key_compressed[j]);
+                }
+                std::cout << RESET << "\n";
+                std::cout << BRIGHT_YELLOW << "|" << RESET << " Address:     " << BRIGHT_CYAN << btc_address << RESET << "\n";
+                std::cout << BRIGHT_YELLOW << "|" << RESET << " Hash160:     " << DIM << hash160_hex << RESET << "\n";
+                std::cout << BRIGHT_YELLOW << "|" << RESET << " VERIFY:      " << BLUE << "https://mempool.space/address/" << btc_address << RESET << "\n";
+                std::cout << BRIGHT_YELLOW << "|" << RESET << " " << DIM << "Checking balance..." << RESET << "\n";
+                std::cout << BRIGHT_YELLOW << "+========================================================+" << RESET << "\n";
+                std::cout << std::endl;
+
+                // Check balance asynchronously (won't block scanning)
+                check_balance_async(btc_address, hit_passphrase);
+
+                // Report hit to streaming generator for feedback learning
+                streaming_gen.report_hit(hit_passphrase);
+
+                // Log to detailed hits file
+                std::ofstream hitlog("brainwallet_hits.txt", std::ios::app);
+                if (hitlog) {
+                    hitlog << "=== HIT FOUND ===\n";
+                    hitlog << "Passphrase: " << hit_passphrase << "\n";
+                    hitlog << "Private Key: ";
+                    for (int j = 0; j < 32; j++) {
+                        char hex[3];
+                        snprintf(hex, sizeof(hex), "%02x", private_key[j]);
+                        hitlog << hex;
+                    }
+                    hitlog << "\n";
+                    hitlog << "Public Key: ";
+                    for (int j = 0; j < 33; j++) {
+                        char hex[3];
+                        snprintf(hex, sizeof(hex), "%02x", public_key_compressed[j]);
+                        hitlog << hex;
+                    }
+                    hitlog << "\n";
+                    hitlog << "Address: " << btc_address << "\n";
+                    hitlog << "Hash160: " << hash160_hex << "\n";
+                    hitlog << "Verify: https://mempool.space/address/" << btc_address << "\n";
+                    hitlog << "================\n\n";
+                    hitlog.close();
+                }
+
+                // Also log to potfile format (hashcat-compatible)
+                std::ofstream potfile("brainwallet.pot", std::ios::app);
+                if (potfile) {
+                    for (int j = 0; j < 20; j++) {
+                        char hex[3];
+                        snprintf(hex, sizeof(hex), "%02x", hash160[j]);
+                        potfile << hex;
+                    }
+                    potfile << ":" << hit_passphrase << "\n";
+                    potfile.close();
+                }
+            }
+
+            // Progress report every 5 seconds
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_report).count();
+            if (elapsed >= 5) {
+                auto total_elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
+                double speed = total_elapsed > 0 ? (double)total_checked / total_elapsed : 0;
+
+                // Get current phase info
+                auto current_stats = streaming_gen.get_stats();
+                std::string phase_info = current_stats.current_phase_name;
+                if (current_stats.phase_iteration > 0) {
+                    phase_info += " (iter " + std::to_string(current_stats.phase_iteration + 1) + ")";
+                }
+
+                // Announce phase changes with color
+                if (phase_info != last_phase) {
+                    std::cout << "\n" << CYAN << "[*] " << RESET << "Phase: "
+                              << BRIGHT_MAGENTA << phase_info << RESET << "\n";
+                    last_phase = phase_info;
+                }
+
+                // Professional colored status line with sample passphrase
+                std::string sample_display = sample_passphrase.empty() ? "" :
+                    (std::string(DIM) + " | " + RESET + "\"" + sample_passphrase + "\"");
+
+                std::cout << "\r" << CYAN << "[*] " << RESET
+                          << "Checked: " << BRIGHT_WHITE << format_number_human(total_checked) << RESET
+                          << " " << DIM << "|" << RESET << " Speed: " << BRIGHT_GREEN << format_number_human((uint64_t)speed) << "/s" << RESET
+                          << " " << DIM << "|" << RESET << " Hits: " << (bloom_hits > 0 ? BRIGHT_YELLOW : DIM) << bloom_hits << RESET
+                          << " " << DIM << "|" << RESET << " " << MAGENTA << phase_info << RESET
+                          << sample_display
+                          << "\033[K" << std::flush;  // Clear to end of line
+                last_report = now;
+
+                // Save state periodically (every save_interval passphrases)
+                if (total_checked - last_save_count >= args.save_interval) {
+                    auto snap = streaming_gen.get_state_snapshot();
+                    BrainWalletSearchState save_state;
+                    save_state.current_word_idx = snap.current_word_idx;
+                    save_state.current_rule_idx = snap.current_rule_idx;
+                    save_state.current_phase = snap.current_phase;
+                    save_state.phase_iteration = snap.phase_iteration;
+                    save_state.total_checked = total_checked;
+                    save_state.unique_tested = current_stats.unique_tested;
+                    save_state.hits_found = bloom_hits;
+                    save_state.wordlist_hash = wordlist_hash;
+                    save_state.wordlist_size = snap.wordlist_size;
+                    save_state.wordlist_path = args.wordlist_file;
+                    save_state.rules_count = snap.rules_count;
+                    save_state.rules_path = rules_dir;
+                    save_state.session_id = session_id;
+
+                    if (BrainWalletStateManager::save_state(save_state)) {
+                        last_save_count = total_checked;
+                        if (args.verbose) {
+                            std::cout << "\n" << DIM << "[*] State saved at " << total_checked << " passphrases" << RESET << "\n";
+                        }
+                    }
+                }
+            }
+        }
+
+        // Track-f F-03: emit the deferred shutdown print/log from main-thread
+        // context now that we have exited the scan loop. Safe to take Logger
+        // mutex here; no risk of self-deadlock because we are not in a
+        // signal handler.
+        emit_shutdown_message_from_main();
+
+        // Save final state before exit
+        {
+            auto snap = streaming_gen.get_state_snapshot();
+            BrainWalletSearchState save_state;
+            save_state.current_word_idx = snap.current_word_idx;
+            save_state.current_rule_idx = snap.current_rule_idx;
+            save_state.current_phase = snap.current_phase;
+            save_state.phase_iteration = snap.phase_iteration;
+            save_state.total_checked = total_checked;
+            save_state.unique_tested = streaming_gen.get_stats().unique_tested;
+            save_state.hits_found = bloom_hits;
+            save_state.wordlist_hash = wordlist_hash;
+            save_state.wordlist_size = snap.wordlist_size;
+            save_state.wordlist_path = args.wordlist_file;
+            save_state.rules_count = snap.rules_count;
+            save_state.rules_path = rules_dir;
+            save_state.session_id = session_id;
+
+            if (BrainWalletStateManager::save_state(save_state)) {
+                std::cout << "\n" << BRIGHT_GREEN << "[*] " << RESET << "State saved - use " << BRIGHT_WHITE << "--resume" << RESET << " to continue\n";
+            }
+        }
+
+        // Stop async prefetch thread before cleanup
+        if (!use_gpu_rules) {
+            streaming_gen.stop_async_prefetch();
+        }
+
+        // Cleanup GPU rule engines
+        if (use_gpu_rules) {
+            for (auto& engine : gpu_rule_engines) {
+                engine.cleanup();
+            }
+        }
+
+        auto end_time = std::chrono::steady_clock::now();
+        auto total_seconds = std::chrono::duration_cast<std::chrono::seconds>(end_time - start_time).count();
+        auto final_stats = streaming_gen.get_stats();
+
+        std::cout << "\n\n";
+        std::cout << CYAN << "+================================================================+" << RESET << "\n";
+        std::cout << CYAN << "|" << RESET << "               " << BOLD << BRIGHT_WHITE << "BRAINWALLET SCAN COMPLETE" << RESET << "                        " << CYAN << "|" << RESET << "\n";
+        std::cout << CYAN << "+================================================================+" << RESET << "\n";
+        std::cout << CYAN << "|" << RESET << "  Total Checked:   " << BRIGHT_WHITE << std::setw(15) << format_number_human(total_checked) << RESET << "                        " << CYAN << "|" << RESET << "\n";
+        std::cout << CYAN << "|" << RESET << "  Bloom Hits:      " << (bloom_hits > 0 ? BRIGHT_YELLOW : DIM) << std::setw(15) << bloom_hits << RESET << "                        " << CYAN << "|" << RESET << "\n";
+        std::cout << CYAN << "|" << RESET << "  Duration:        " << BRIGHT_GREEN << std::setw(15) << total_seconds << " seconds" << RESET << "                 " << CYAN << "|" << RESET << "\n";
+        std::cout << CYAN << "|" << RESET << "  Final Phase:     " << MAGENTA << std::setw(15) << final_stats.current_phase_name << RESET << "                        " << CYAN << "|" << RESET << "\n";
+        std::cout << CYAN << "|" << RESET << "  Iterations:      " << DIM << std::setw(15) << (final_stats.phase_iteration + 1) << RESET << "                        " << CYAN << "|" << RESET << "\n";
+        std::cout << CYAN << "+================================================================+" << RESET << "\n";
+
+        bw_pipeline.cleanup();
+        return 0;
+    }
+#endif // COLLIDER_PRO
 
     // Validate arguments - puzzle mode is required (brain wallet mode disabled)
     if (!args.benchmark && !args.puzzle_mode) {
@@ -2012,25 +3299,35 @@ int main(int argc, char* argv[]) {
     }
 
     // Benchmark mode - test GPU performance without bloom filter
+    // The benchmark exercises the brain-wallet pipeline (SHA256 -> EC ->
+    // hash160 -> bloom) and so depends on Pro symbols (MultiGPUBrainWallet).
+    // The free build prints a notice and exits cleanly instead.
     if (args.benchmark) {
+#ifndef COLLIDER_PRO
         std::cout << "\n";
-        std::cout << "+==============================================================+\n";
-        std::cout << "|             GPU PERFORMANCE BENCHMARK                        |\n";
-        std::cout << "+==============================================================+\n";
-        {
-            std::ostringstream dur_line, gpu_line, batch_line;
-            dur_line << "  Duration: " << args.benchmark_seconds << " seconds";
-            std::cout << "|" << std::left << std::setw(62) << dur_line.str() << "|\n";
-            gpu_line << "  GPUs:     ";
-            for (size_t i = 0; i < args.gpu_ids.size() && i < 8; i++) {
-                gpu_line << args.gpu_ids[i];
-                if (i < args.gpu_ids.size() - 1) gpu_line << ",";
-            }
-            std::cout << "|" << std::left << std::setw(62) << gpu_line.str() << "|\n";
-            batch_line << "  Batch:    " << format_number(args.batch_size);
-            std::cout << "|" << std::left << std::setw(62) << batch_line.str() << "|\n";
+        std::cout << "+================================================================+\n";
+        std::cout << "|               GPU PERFORMANCE BENCHMARK                        |\n";
+        std::cout << "+================================================================+\n";
+        std::cout << "[PRO] The full brain-wallet pipeline benchmark requires\n"
+                  << "      theCollider Pro. Free builds can still run the puzzle\n"
+                  << "      solver (--puzzle N [--kangaroo]) and the JLP pool client\n"
+                  << "      (--pool jlps://...).\n"
+                  << "      Purchase Pro at: https://collisionprotocol.com/pro\n";
+        return 0;
+#else
+        std::cout << "\n";
+        std::cout << "+================================================================+\n";
+        std::cout << "|               GPU PERFORMANCE BENCHMARK                        |\n";
+        std::cout << "+================================================================+\n";
+        std::cout << "|  Duration: " << std::setw(3) << args.benchmark_seconds << " seconds                                        |\n";
+        std::cout << "|  GPUs:     ";
+        for (size_t i = 0; i < args.gpu_ids.size() && i < 8; i++) {
+            std::cout << args.gpu_ids[i];
+            if (i < args.gpu_ids.size() - 1) std::cout << ",";
         }
-        std::cout << "+==============================================================+\n\n";
+        std::cout << std::string(53 - args.gpu_ids.size() * 2, ' ') << "|\n";
+        std::cout << "|  Batch:    " << std::setw(10) << format_number(args.batch_size) << "                                   |\n";
+        std::cout << "+================================================================+\n\n";
 
         // Generate synthetic test candidates (random strings)
         std::cout << "[*] Generating synthetic test data...\n";
@@ -2065,6 +3362,33 @@ int main(int argc, char* argv[]) {
         std::cout << "[*] Starting GPU benchmark...\n";
         std::cout << "    (Full SHA256 -> secp256k1 -> RIPEMD160 -> Bloom pipeline)\n\n";
 
+#ifdef COLLIDER_USE_CUDA
+        // Initialize GPU pipeline for benchmarking
+        gpu::MultiGPUBrainWallet::Config bench_config;
+        bench_config.gpu_ids = args.gpu_ids;
+        bench_config.batch_size = args.batch_size;
+        bench_config.max_passphrase_length = 256;
+        bench_config.store_private_keys = false;  // Don't need keys for benchmark
+
+        gpu::MultiGPUBrainWallet bench_pipeline(bench_config);
+        if (!bench_pipeline.init()) {
+            std::cerr << "[!] Failed to initialize GPU for benchmark\n";
+            return 1;
+        }
+
+        // Create minimal "all-zeros" bloom filter (no false positives = fast path)
+        // 1MB bloom filter is enough for benchmarking purposes
+        const size_t bench_bloom_size = 1024 * 1024;  // 1MB
+        const uint64_t bench_bloom_bits = bench_bloom_size * 8;
+        std::vector<uint8_t> dummy_bloom(bench_bloom_size, 0);
+
+        if (!bench_pipeline.load_bloom_filter(dummy_bloom.data(), dummy_bloom.size(),
+                                               bench_bloom_bits, 8, 0x5F3759DF)) {
+            std::cerr << "[!] Failed to load benchmark bloom filter\n";
+            return 1;
+        }
+        std::cout << "[*] GPU pipeline initialized with dummy bloom filter\n\n";
+#endif
 
         auto bench_start = std::chrono::steady_clock::now();
         auto bench_end = bench_start + std::chrono::seconds(args.benchmark_seconds);
@@ -2072,12 +3396,16 @@ int main(int argc, char* argv[]) {
         uint64_t iterations = 0;
         auto last_status = bench_start;
 
-        while (std::chrono::steady_clock::now() < bench_end && !g_shutdown.load(std::memory_order_relaxed)) {
-            // Propagate signal to shutdown flag (FIX 1)
-            if (g_signal_received) { g_shutdown.store(true, std::memory_order_relaxed); break; }
-            // Free edition: CPU simulation benchmark
+        while (std::chrono::steady_clock::now() < bench_end && !g_shutdown) {
+#ifdef COLLIDER_USE_CUDA
+            // Run actual GPU pipeline
+            auto result = bench_pipeline.process_batch(test_candidates);
+            total_hashed += result.processed;
+#else
+            // CPU fallback: simulate batch processing time
             std::this_thread::sleep_for(std::chrono::microseconds(1600));
             total_hashed += test_candidates.size();
+#endif
             iterations++;
 
             // Status update every second
@@ -2106,26 +3434,15 @@ int main(int argc, char* argv[]) {
         std::cout << "+==============================================================+\n";
         std::cout << "|                   BENCHMARK RESULTS                          |\n";
         std::cout << "+==============================================================+\n";
-        {
-            std::ostringstream l1, l2, l3, l4;
-            l1 << "  Duration:        " << std::fixed << std::setprecision(2) << actual_seconds << " seconds";
-            l2 << "  Total Processed: " << format_number(total_hashed);
-            l3 << "  Iterations:      " << iterations;
-            l4 << "  Average Rate:    " << format_rate(final_rate);
-            std::cout << "|" << std::left << std::setw(62) << l1.str() << "|\n";
-            std::cout << "|" << std::left << std::setw(62) << l2.str() << "|\n";
-            std::cout << "|" << std::left << std::setw(62) << l3.str() << "|\n";
-            std::cout << "|" << std::left << std::setw(62) << l4.str() << "|\n";
-        }
+        std::cout << "|  Duration:        " << std::fixed << std::setprecision(2) << std::setw(8) << actual_seconds << " seconds                       |\n";
+        std::cout << "|  Total Processed: " << std::setw(14) << format_number(total_hashed) << "                       |\n";
+        std::cout << "|  Iterations:      " << std::setw(8) << iterations << "                               |\n";
+        std::cout << "|  Average Rate:    " << std::setw(10) << format_rate(final_rate) << "                             |\n";
         std::cout << "+==============================================================+\n";
 
         // Performance projections
         double projected_daily = final_rate * 86400;
-        {
-            std::ostringstream pd;
-            pd << "  Projected Daily: " << format_number(static_cast<uint64_t>(projected_daily));
-            std::cout << "|" << std::left << std::setw(62) << pd.str() << "|\n";
-        }
+        std::cout << "|  Projected Daily: " << std::setw(14) << format_number(static_cast<uint64_t>(projected_daily)) << "                       |\n";
 
         // Compare to targets
         double target_per_gpu = 2.5e9;  // 2.5B/s per RTX 5090
@@ -2133,25 +3450,28 @@ int main(int argc, char* argv[]) {
         double efficiency = (final_rate / expected) * 100.0;
 
         std::cout << "+==============================================================+\n";
-        {
-            std::ostringstream e1, e2;
-            e1 << "  Expected (RTX 5090): " << format_rate(expected);
-            e2 << "  Efficiency:          " << std::fixed << std::setprecision(1) << efficiency << "%";
-            std::cout << "|" << std::left << std::setw(62) << e1.str() << "|\n";
-            std::cout << "|" << std::left << std::setw(62) << e2.str() << "|\n";
-        }
+        std::cout << "|  Expected (RTX 5090): " << std::setw(10) << format_rate(expected) << "                         |\n";
+        std::cout << "|  Efficiency:          " << std::fixed << std::setprecision(1) << std::setw(6) << efficiency << "%                            |\n";
         std::cout << "+==============================================================+\n\n";
 
+#ifndef COLLIDER_USE_CUDA
         std::cout << "[!] Note: CUDA not available - benchmark used CPU simulation.\n";
         std::cout << "    Real GPU performance will be significantly higher.\n";
         std::cout << "    Build with CUDA enabled for actual GPU benchmarks.\n";
+#else
+        if (efficiency < 80.0) {
+            std::cout << "[*] Note: Performance varies by GPU. RTX 5090 target is 2.5B/s.\n";
+        } else {
+            std::cout << "[+] GPU pipeline performing at expected efficiency.\n";
+        }
+#endif
 
         return 0;
+#endif // COLLIDER_PRO (benchmark)
     }
 
     // Puzzle mode - Bitcoin Puzzle Challenge
     if (args.puzzle_mode) {
-#if COLLIDER_HAS_SOLO
         // Load config for progress saving
         UserConfig config;
         config.load();
@@ -2227,44 +3547,20 @@ int main(int argc, char* argv[]) {
         }
 
         // Loop through each puzzle (single iteration unless --all-unsolved)
-        for (size_t puzzle_idx = 0; puzzle_idx < puzzles_to_solve.size() && !g_shutdown.load(std::memory_order_relaxed); puzzle_idx++) {
-            // Propagate signal handler flag to atomic shutdown (FIX 1: async-signal-safe)
-            if (g_signal_received) {
-                g_shutdown.store(true, std::memory_order_relaxed);
-                break;
-            }
+        for (size_t puzzle_idx = 0; puzzle_idx < puzzles_to_solve.size() && !g_shutdown; puzzle_idx++) {
             int current_puzzle = puzzles_to_solve[puzzle_idx];
 
             // Show progress for auto-progression mode
             if (args.puzzle_all_unsolved && puzzle_idx > 0) {
                 std::cout << "\n\n";
                 std::cout << "+==============================================================+\n";
-                {
-                    std::ostringstream ap;
-                    ap << "  AUTO-PROGRESSION: Moving to puzzle #" << current_puzzle
-                       << " (" << (puzzle_idx + 1) << "/" << puzzles_to_solve.size() << ")";
-                    std::cout << "|" << std::left << std::setw(62) << ap.str() << "|\n";
-                }
+                std::cout << "|  AUTO-PROGRESSION: Moving to puzzle #" << current_puzzle
+                          << " (" << (puzzle_idx + 1) << "/" << puzzles_to_solve.size() << ")        |\n";
                 std::cout << "+==============================================================+\n";
             }
 
         // Get puzzle info
         const PuzzleInfo* puzzle = PuzzleDatabase::get_puzzle(current_puzzle);
-
-        // Solo mode: verify puzzle is still unsolved via mempool.space API
-        // This is a blocking check - refuse to start if puzzle appears solved
-        if (puzzle && !puzzle->solved && !args.pool_mode) {
-            if (!PuzzleDatabase::verify_unsolved(current_puzzle)) {
-                std::cerr << "[!] Aborting: puzzle #" << current_puzzle << " appears to be already solved.\n";
-                std::cerr << "    Use a different puzzle number, or check https://btcpuzzle.info/ for status.\n";
-                if (args.puzzle_all_unsolved) {
-                    // In auto-progression mode, skip this puzzle and continue to next
-                    std::cout << "[*] Skipping solved puzzle, continuing to next...\n";
-                    continue;
-                }
-                return 1;
-            }
-        }
 
         std::cout << "\n";
         std::cout << "+==============================================================+\n";
@@ -2282,7 +3578,7 @@ int main(int argc, char* argv[]) {
             range_end = UInt256(args.puzzle_range_end);
             bits = range_end.bit_length();
             target_address = args.puzzle_target;
-            std::cout << "|" << std::left << std::setw(62) << "  Mode:       Custom Range" << "|\n";
+            std::cout << "|  Mode:       Custom Range                                    |\n";
         } else if (puzzle) {
             // Use known puzzle data
             range_start = puzzle->range_start();
@@ -2290,15 +3586,11 @@ int main(int argc, char* argv[]) {
             bits = puzzle->bits;
             target_address = args.puzzle_target.empty() ? puzzle->target_address : args.puzzle_target;
 
-            {
-                std::ostringstream line;
-                line << "  Puzzle:     #" << puzzle->number;
-                if (puzzle->solved) {
-                    line << " (SOLVED - for testing)";
-                } else {
-                    line << " (" << std::fixed << std::setprecision(1) << puzzle->btc_reward << " BTC reward)";
-                }
-                std::cout << "|" << std::left << std::setw(62) << line.str() << "|\n";
+            std::cout << "|  Puzzle:     #" << std::setw(3) << puzzle->number;
+            if (puzzle->solved) {
+                std::cout << " (SOLVED - for testing)                      |\n";
+            } else {
+                std::cout << " (" << std::fixed << std::setprecision(1) << puzzle->btc_reward << " BTC reward)                       |\n";
             }
         } else {
             std::cerr << "[!] Error: Unknown puzzle number: " << current_puzzle << "\n";
@@ -2306,30 +3598,13 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        {
-            std::ostringstream bits_line;
-            bits_line << "  Bits:       " << bits << " (2^" << (bits-1) << " keys in range)";
-            std::cout << "|" << std::left << std::setw(62) << bits_line.str() << "|\n";
-        }
-        {
-            std::ostringstream target_line;
-            target_line << "  Target:     " << target_address.substr(0, 34);
-            std::cout << "|" << std::left << std::setw(62) << target_line.str() << "|\n";
-        }
-        {
-            std::ostringstream search_line;
-            search_line << "  Search:     " << (args.puzzle_random ? "Random" : "Sequential");
-            std::cout << "|" << std::left << std::setw(62) << search_line.str() << "|\n";
-        }
-        std::cout << "|" << std::left << std::setw(62) << ("  Backend:    " + gpu_info.backend) << "|\n";
+        std::cout << "|  Bits:       " << std::setw(3) << bits << " (2^" << (bits-1) << " keys in range)                    |\n";
+        std::cout << "|  Target:     " << target_address.substr(0, 15) << "...                           |\n";
+        std::cout << "|  Search:     " << (args.puzzle_random ? "Random    " : "Sequential") << "                                    |\n";
+        std::cout << "|  Backend:    " << std::left << std::setw(46) << gpu_info.backend << "|\n";
         std::cout << "+==============================================================+\n";
-        {
-            std::ostringstream rs_line, re_line;
-            rs_line << "  Range Start: " << range_start.to_hex().substr(0, 20) << "...";
-            re_line << "  Range End:   " << range_end.to_hex().substr(0, 20) << "...";
-            std::cout << "|" << std::left << std::setw(62) << rs_line.str() << "|\n";
-            std::cout << "|" << std::left << std::setw(62) << re_line.str() << "|\n";
-        }
+        std::cout << "|  Range Start: " << std::setw(20) << range_start.to_hex().substr(0, 20) << "...                   |\n";
+        std::cout << "|  Range End:   " << std::setw(20) << range_end.to_hex().substr(0, 20) << "...                   |\n";
         std::cout << "+==============================================================+\n\n";
 
         // Calculate search space info
@@ -2480,6 +3755,30 @@ int main(int argc, char* argv[]) {
                 // Initialize GPUs
                 int num_gpus = rc_kangaroo.init(args.gpu_ids);
                 if (num_gpus > 0) {
+                    // Load bloom filter if specified -- Pro feature; the
+                    // free build clears args.bloom_file at config merge,
+                    // so this block is a no-op there. #ifdef-guard the
+                    // load as defense-in-depth.
+#ifdef COLLIDER_PRO
+                    if (!args.bloom_file.empty()) {
+                        if (rc_kangaroo.load_bloom_filter(args.bloom_file)) {
+                            std::cout << "[*] Bloom filter loaded - opportunistic address checking enabled\n";
+                            // Optional: Set hit callback for real-time notifications
+                            rc_kangaroo.bloom_hit_callback = [](const gpu::BloomHit& hit) {
+                                std::ofstream hitlog("bloom_hits.txt", std::ios::app);
+                                if (hitlog) {
+                                    char h160_hex[41];
+                                    for (int i = 0; i < 20; i++) {
+                                        snprintf(h160_hex + i*2, 3, "%02x", hit.hash160[i]);
+                                    }
+                                    hitlog << "H160: " << h160_hex << " at ops " << hit.ops_at_hit << "\n";
+                                }
+                            };
+                        } else {
+                            std::cerr << "[!] WARNING: Failed to load bloom filter: " << args.bloom_file << "\n";
+                        }
+                    }
+#endif
 
                     // Set target public key
                     std::string pubkey_hex = puzzle->public_key_hex;
@@ -2503,7 +3802,7 @@ int main(int argc, char* argv[]) {
 
                     // Progress callback
                     rc_kangaroo.progress_callback = [&, expected_ops, expected_ops_bits](uint64_t ops, uint64_t dp_count, int speed) -> bool {
-                        if (g_shutdown.load(std::memory_order_relaxed)) return false;
+                        if (g_shutdown) return false;
 
                         // Calculate progress percentage and ETA
                         double progress_pct = (expected_ops > 0) ? (100.0 * ops / expected_ops) : 0;
@@ -2526,7 +3825,7 @@ int main(int argc, char* argv[]) {
                                   << "\033[34mETA:\033[0m " << eta_str
                                   << "  " << std::flush;
 
-                        return !g_shutdown.load(std::memory_order_relaxed);
+                        return !g_shutdown;
                     };
 
                     // Display professional search header
@@ -2667,7 +3966,7 @@ int main(int argc, char* argv[]) {
                               << "\033[34mETA:\033[0m " << eta_str
                               << "  " << std::flush;
 
-                    return !g_shutdown.load(std::memory_order_relaxed);
+                    return !g_shutdown;
                 };
 
                 // Display professional header for search
@@ -2707,17 +4006,11 @@ int main(int argc, char* argv[]) {
                     std::cout << "\n\n";
                     std::cout << "\033[1;32m";
                     std::cout << "+==============================================================+\n";
-                    std::cout << "|     PUZZLE SOLVED! (GPU Kangaroo Algorithm)                  |\n";
+                    std::cout << "|       PUZZLE SOLVED! (GPU Kangaroo Algorithm)               |\n";
                     std::cout << "+==============================================================+\033[0m\n";
-                    {
-                        std::ostringstream pk, dur, steps;
-                        pk << "  Private Key: " << key_hex;
-                        dur << "  Duration:    " << std::fixed << std::setprecision(3) << total_seconds << " sec";
-                        steps << "  Total Steps: " << format_number(gpu_result.total_steps);
-                        std::cout << "|" << std::left << std::setw(62) << pk.str() << "|\n";
-                        std::cout << "|" << std::left << std::setw(62) << dur.str() << "|\n";
-                        std::cout << "|" << std::left << std::setw(62) << steps.str() << "|\n";
-                    }
+                    std::cout << "|  Private Key: " << key_hex << "\n";
+                    std::cout << "|  Duration:    " << std::fixed << std::setprecision(3) << total_seconds << " sec\n";
+                    std::cout << "|  Total Steps: " << format_number(gpu_result.total_steps) << "\n";
                     std::cout << "+==============================================================+\n\n";
 
                     // Save to file
@@ -2808,43 +4101,25 @@ int main(int argc, char* argv[]) {
                 auto solve_time = std::chrono::system_clock::now();
                 auto solve_time_t = std::chrono::system_clock::to_time_t(solve_time);
                 char timestamp[64];
-                {
-                    struct tm tm_buf;
-#ifdef _WIN32
-                    localtime_s(&tm_buf, &solve_time_t);
-#else
-                    localtime_r(&solve_time_t, &tm_buf);
-#endif
-                    std::strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", &tm_buf);
-                }
+                std::strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S",
+                              std::localtime(&solve_time_t));
 
                 std::cout << "\n\n";
                 std::cout << "\033[1;32m";
                 std::cout << "+==============================================================+\n";
-                std::cout << "|       PUZZLE SOLVED! (Kangaroo Algorithm)                    |\n";
+                std::cout << "|         PUZZLE SOLVED! (Kangaroo Algorithm)                 |\n";
                 std::cout << "+==============================================================+\033[0m\n";
-                {
-                    auto pad62 = [](const std::string& s) -> std::string {
-                        if (s.length() >= 62) return s.substr(0, 62);
-                        return s + std::string(62 - s.length(), ' ');
-                    };
-                    std::ostringstream pz, pk, ad, sa, du, ts, al;
-                    pz << "  Puzzle:        #" << current_puzzle << " (" << bits << "-bit)";
-                    pk << "  Private Key:   " << key_hex;
-                    ad << "  Address:       " << target_address;
-                    sa << "  Solved At:     " << timestamp;
-                    du << "  Duration:      " << std::fixed << std::setprecision(3) << total_seconds << " sec";
-                    ts << "  Total Steps:   " << format_number(result.tame_steps + result.wild_steps);
-                    al << "  Algorithm:     Pollard's Kangaroo";
-                    std::cout << "|  \033[1;33mPuzzle:\033[0m" << pad62(pz.str()).substr(9) << "|\n";
-                    std::cout << "|  \033[1;33mPrivate Key:\033[0m" << pad62(pk.str()).substr(14) << "|\n";
-                    std::cout << "|  \033[1;33mAddress:\033[0m" << pad62(ad.str()).substr(10) << "|\n";
-                    std::cout << "+--------------------------------------------------------------+\n";
-                    std::cout << "|  \033[1;36mSolved At:\033[0m" << pad62(sa.str()).substr(12) << "|\n";
-                    std::cout << "|  \033[1;36mDuration:\033[0m" << pad62(du.str()).substr(11) << "|\n";
-                    std::cout << "|  \033[1;36mTotal Steps:\033[0m" << pad62(ts.str()).substr(14) << "|\n";
-                    std::cout << "|  \033[1;36mAlgorithm:\033[0m" << pad62(al.str()).substr(12) << "|\n";
-                }
+                std::cout << "|  \033[1;33mPuzzle:\033[0m        #" << std::setw(3) << current_puzzle
+                          << " (" << bits << "-bit)                              |\n";
+                std::cout << "|  \033[1;33mPrivate Key:\033[0m   " << std::setw(42) << key_hex << " |\n";
+                std::cout << "|  \033[1;33mAddress:\033[0m       " << std::setw(42) << target_address << " |\n";
+                std::cout << "+--------------------------------------------------------------+\n";
+                std::cout << "|  \033[1;36mSolved At:\033[0m     " << std::setw(42) << timestamp << " |\n";
+                std::cout << "|  \033[1;36mDuration:\033[0m      " << std::fixed << std::setprecision(3)
+                          << std::setw(38) << total_seconds << " sec |\n";
+                std::cout << "|  \033[1;36mTotal Steps:\033[0m   " << std::setw(42)
+                          << format_number(result.tame_steps + result.wild_steps) << " |\n";
+                std::cout << "|  \033[1;36mAlgorithm:\033[0m     " << std::setw(42) << "Pollard's Kangaroo" << " |\n";
                 std::cout << "+==============================================================+\n\n";
 
                 // Save to file
@@ -2935,41 +4210,29 @@ int main(int argc, char* argv[]) {
             uint64_t current_lo, current_hi;
             uint64_t zone_checked = 0;
 
-            // Try to load saved state for this puzzle (FIX 4: validate loaded state)
+            // Try to load saved state for this puzzle
             auto saved_state = SearchStateManager::load_puzzle_state(current_puzzle);
             if (saved_state.valid && saved_state.total_checked > 0) {
-                // Additional validation: ensure zone_idx is in bounds
-                if (saved_state.zone_idx >= NUM_ZONES) {
-                    std::cerr << "[!] Warning: saved state for puzzle " << current_puzzle
-                              << " has invalid zone index (" << saved_state.zone_idx
-                              << "). Starting fresh.\n";
-                    saved_state.valid = false;
-                } else {
-                    std::cout << "[*] Resuming from saved state:\n";
-                    std::cout << "    Last saved: " << saved_state.timestamp << "\n";
-                    std::cout << "    Keys checked: " << format_number(saved_state.total_checked) << "\n";
-                    std::cout << "    Zone: " << (saved_state.zone_idx + 1) << "/" << NUM_ZONES << "\n\n";
+                std::cout << "[*] Resuming from saved state:\n";
+                std::cout << "    Last saved: " << saved_state.timestamp << "\n";
+                std::cout << "    Keys checked: " << format_number(saved_state.total_checked) << "\n";
+                std::cout << "    Zone: " << (saved_state.zone_idx + 1) << "/" << NUM_ZONES << "\n\n";
 
-                    current_zone_idx = saved_state.zone_idx;
-                    current_lo = saved_state.position_lo;
-                    current_hi = saved_state.position_hi;
-                    total_checked = saved_state.total_checked;
-                    zone_checked = saved_state.zone_checked;
+                current_zone_idx = saved_state.zone_idx;
+                current_lo = saved_state.position_lo;
+                current_hi = saved_state.position_hi;
+                total_checked = saved_state.total_checked;
+                zone_checked = saved_state.zone_checked;
 
-                    // Calculate zone boundaries for the restored zone
-                    calc_zone_position(start_lo, start_hi, end_lo, end_hi,
-                                      PUZZLE_ZONES[current_zone_idx].start_pct, zone_start_lo, zone_start_hi);
-                    calc_zone_position(start_lo, start_hi, end_lo, end_hi,
-                                      PUZZLE_ZONES[current_zone_idx].end_pct, zone_end_lo, zone_end_hi);
+                // Calculate zone boundaries for the restored zone
+                calc_zone_position(start_lo, start_hi, end_lo, end_hi,
+                                  PUZZLE_ZONES[current_zone_idx].start_pct, zone_start_lo, zone_start_hi);
+                calc_zone_position(start_lo, start_hi, end_lo, end_hi,
+                                  PUZZLE_ZONES[current_zone_idx].end_pct, zone_end_lo, zone_end_hi);
 
-                    std::cout << "[*] Continuing Zone " << (current_zone_idx + 1) << ": "
-                              << PUZZLE_ZONES[current_zone_idx].name << "\n";
-                }
-            } else if (!saved_state.valid && SearchStateManager::has_saved_state(current_puzzle)) {
-                std::cerr << "[!] Warning: saved state for puzzle " << current_puzzle
-                          << " is corrupted or invalid. Starting fresh.\n";
-            }
-            if (!saved_state.valid || saved_state.total_checked == 0) {
+                std::cout << "[*] Continuing Zone " << (current_zone_idx + 1) << ": "
+                          << PUZZLE_ZONES[current_zone_idx].name << "\n";
+            } else {
                 // Initialize first zone from scratch
                 calc_zone_position(start_lo, start_hi, end_lo, end_hi,
                                   PUZZLE_ZONES[0].start_pct, zone_start_lo, zone_start_hi);
@@ -2981,7 +4244,7 @@ int main(int argc, char* argv[]) {
                 std::cout << "[*] Starting Zone 1: " << PUZZLE_ZONES[0].name << "\n";
             }
 
-            while (!g_shutdown.load(std::memory_order_relaxed) && !found) {
+            while (!g_shutdown && !found) {
                 // Check if we've completed current zone
                 if (current_hi > zone_end_hi || (current_hi == zone_end_hi && current_lo >= zone_end_lo)) {
                     std::cout << "\n[*] Zone " << (current_zone_idx + 1) << " complete ("
@@ -3029,20 +4292,13 @@ int main(int argc, char* argv[]) {
 
                     // Format timestamp
                     char timestamp[64];
-                    {
-                        struct tm tm_buf;
-#ifdef _WIN32
-                        localtime_s(&tm_buf, &solve_time_t);
-#else
-                        localtime_r(&solve_time_t, &tm_buf);
-#endif
-                        std::strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", &tm_buf);
-                    }
+                    std::strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S",
+                                  std::localtime(&solve_time_t));
 
                     std::cout << "\n\n";
                     std::cout << "\033[1;32m"; // Bright green
                     std::cout << "+==============================================================+\n";
-                    std::cout << "|        PUZZLE SOLVED! (GPU Accelerated)                      |\n";
+                    std::cout << "|        PUZZLE SOLVED! (GPU Accelerated)                     |\n";
                     std::cout << "+==============================================================+\033[0m\n";
 
                     // Format key as hex
@@ -3054,32 +4310,19 @@ int main(int argc, char* argv[]) {
                         snprintf(key_hex, sizeof(key_hex), "0x%llx", (unsigned long long)found_key_lo);
                     }
 
-                    {
-                        auto pad62 = [](const std::string& s) -> std::string {
-                            if (s.length() >= 62) return s.substr(0, 62);
-                            return s + std::string(62 - s.length(), ' ');
-                        };
-                        std::ostringstream pz, pk, ad, sa, du, kc, ac;
-                        pz << "  Puzzle:        #" << current_puzzle << " (" << bits << "-bit)";
-                        pk << "  Private Key:   " << key_hex;
-                        ad << "  Address:       " << target_address;
-                        sa << "  Solved At:     " << timestamp;
-                        du << "  Duration:      " << std::fixed << std::setprecision(3) << elapsed << " sec";
-                        kc << "  Keys Checked:  " << format_number_human(total_checked);
-                        ac << "  Accelerator:   " << gpu_solver.num_gpus() << "x CUDA GPUs";
-                        std::cout << "|  \033[1;33mPuzzle:\033[0m" << pad62(pz.str()).substr(9) << "|\n";
-                        std::cout << "|  \033[1;33mPrivate Key:\033[0m" << pad62(pk.str()).substr(14) << "|\n";
-                        std::cout << "|  \033[1;33mAddress:\033[0m" << pad62(ad.str()).substr(10) << "|\n";
-                        std::cout << "+--------------------------------------------------------------+\n";
-                        std::cout << "|  \033[1;36mSolved At:\033[0m" << pad62(sa.str()).substr(12) << "|\n";
-                        std::cout << "|  \033[1;36mDuration:\033[0m" << pad62(du.str()).substr(11) << "|\n";
-                        std::cout << "|  \033[1;36mKeys Checked:\033[0m" << pad62(kc.str()).substr(15) << "|\n";
-                        std::cout << "|  \033[1;36mAccelerator:\033[0m" << pad62(ac.str()).substr(14) << "|\n";
-                        if (puzzle && puzzle->btc_reward > 0) {
-                            std::ostringstream rw;
-                            rw << "  BTC Reward:    " << std::fixed << std::setprecision(1) << puzzle->btc_reward << " BTC";
-                            std::cout << "|  \033[1;35mBTC Reward:\033[0m" << pad62(rw.str()).substr(13) << "|\n";
-                        }
+                    std::cout << "|  \033[1;33mPuzzle:\033[0m        #" << std::setw(3) << current_puzzle
+                              << " (" << bits << "-bit)                              |\n";
+                    std::cout << "|  \033[1;33mPrivate Key:\033[0m   " << std::setw(42) << key_hex << " |\n";
+                    std::cout << "|  \033[1;33mAddress:\033[0m       " << std::setw(42) << target_address << " |\n";
+                    std::cout << "+--------------------------------------------------------------+\n";
+                    std::cout << "|  \033[1;36mSolved At:\033[0m     " << std::setw(42) << timestamp << " |\n";
+                    std::cout << "|  \033[1;36mDuration:\033[0m      " << std::fixed << std::setprecision(3)
+                              << std::setw(38) << elapsed << " sec |\n";
+                    std::cout << "|  \033[1;36mKeys Checked:\033[0m  " << std::setw(42) << format_number_human(total_checked) << " |\n";
+                    std::cout << "|  \033[1;36mAccelerator:\033[0m   " << std::setw(39) << gpu_solver.num_gpus() << "x CUDA GPUs |\n";
+                    if (puzzle && puzzle->btc_reward > 0) {
+                        std::cout << "|  \033[1;35mBTC Reward:\033[0m    " << std::fixed << std::setprecision(1)
+                                  << std::setw(39) << puzzle->btc_reward << " BTC |\n";
                     }
                     std::cout << "+==============================================================+\n\n";
 
@@ -3173,13 +4416,15 @@ int main(int argc, char* argv[]) {
                 }
             }
 
+            // Track-f F-03: emit the deferred shutdown message from
+            // main-thread context (idempotent; no-op on the !g_shutdown path
+            // and on the second-or-later call).
+            if (g_shutdown.load(std::memory_order_acquire)) {
+                emit_shutdown_message_from_main();
+            }
+
             // Save state on shutdown for resume
             if (g_shutdown) {
-                // Deferred signal logging (safe here in main thread context)
-                if (g_signal_received != 0) {
-                    LOG_INFO("Signal received: " + std::to_string(g_signal_received) + " (SIGINT=" + std::to_string(SIGINT) + ", SIGTERM=" + std::to_string(SIGTERM) + ")");
-                }
-
                 collider::PuzzleSearchState state;
                 state.puzzle_number = current_puzzle;
                 state.zone_idx = current_zone_idx;
@@ -3208,19 +4453,12 @@ int main(int argc, char* argv[]) {
 
             std::cout << "\n\n";
             std::cout << "+==============================================================+\n";
-            std::cout << "|              GPU PUZZLE SEARCH RESULTS                       |\n";
+            std::cout << "|                GPU PUZZLE SEARCH RESULTS                     |\n";
             std::cout << "+==============================================================+\n";
-            {
-                std::ostringstream sd, sc, tc, sr;
-                sd << "  Session Duration: " << std::fixed << std::setprecision(2) << elapsed_sec << " seconds";
-                sc << "  Session Checked:  " << format_number_human(session_checked);
-                tc << "  Total Checked:    " << format_number_human(total_checked);
-                sr << "  Session Rate:     " << format_rate(session_rate);
-                std::cout << "|" << std::left << std::setw(62) << sd.str() << "|\n";
-                std::cout << "|" << std::left << std::setw(62) << sc.str() << "|\n";
-                std::cout << "|" << std::left << std::setw(62) << tc.str() << "|\n";
-                std::cout << "|" << std::left << std::setw(62) << sr.str() << "|\n";
-            }
+            std::cout << "|  Session Duration: " << std::fixed << std::setprecision(2) << std::setw(10) << elapsed_sec << " seconds                  |\n";
+            std::cout << "|  Session Checked:  " << std::setw(15) << format_number_human(session_checked) << "                    |\n";
+            std::cout << "|  Total Checked:    " << std::setw(15) << format_number_human(total_checked) << "                    |\n";
+            std::cout << "|  Session Rate:     " << std::setw(12) << format_rate(session_rate) << "                         |\n";
             std::cout << "+==============================================================+\n";
 
             return 0;
@@ -3314,20 +4552,13 @@ int main(int argc, char* argv[]) {
 
                     // Format timestamp
                     char timestamp[64];
-                    {
-                        struct tm tm_buf;
-#ifdef _WIN32
-                        localtime_s(&tm_buf, &solve_time_t);
-#else
-                        localtime_r(&solve_time_t, &tm_buf);
-#endif
-                        std::strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", &tm_buf);
-                    }
+                    std::strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S",
+                                  std::localtime(&solve_time_t));
 
                     std::cout << "\n\n";
                     std::cout << "\033[1;32m"; // Bright green
                     std::cout << "+==============================================================+\n";
-                    std::cout << "|                    PUZZLE SOLVED!                            |\n";
+                    std::cout << "|            🎉  PUZZLE SOLVED!  🎉                            |\n";
                     std::cout << "+==============================================================+\033[0m\n";
 
                     // Format key as hex
@@ -3339,30 +4570,18 @@ int main(int argc, char* argv[]) {
                         snprintf(key_hex, sizeof(key_hex), "0x%llx", (unsigned long long)key_lo);
                     }
 
-                    {
-                        auto pad62 = [](const std::string& s) -> std::string {
-                            if (s.length() >= 62) return s.substr(0, 62);
-                            return s + std::string(62 - s.length(), ' ');
-                        };
-                        std::ostringstream pz, pk, ad, sa, du, kc;
-                        pz << "  Puzzle:        #" << current_puzzle << " (" << bits << "-bit)";
-                        pk << "  Private Key:   " << key_hex;
-                        ad << "  Address:       " << target_address;
-                        sa << "  Solved At:     " << timestamp;
-                        du << "  Duration:      " << std::fixed << std::setprecision(3) << elapsed << " sec";
-                        kc << "  Keys Checked:  " << format_number_human(total_checked);
-                        std::cout << "|  \033[1;33mPuzzle:\033[0m" << pad62(pz.str()).substr(9) << "|\n";
-                        std::cout << "|  \033[1;33mPrivate Key:\033[0m" << pad62(pk.str()).substr(14) << "|\n";
-                        std::cout << "|  \033[1;33mAddress:\033[0m" << pad62(ad.str()).substr(10) << "|\n";
-                        std::cout << "+--------------------------------------------------------------+\n";
-                        std::cout << "|  \033[1;36mSolved At:\033[0m" << pad62(sa.str()).substr(12) << "|\n";
-                        std::cout << "|  \033[1;36mDuration:\033[0m" << pad62(du.str()).substr(11) << "|\n";
-                        std::cout << "|  \033[1;36mKeys Checked:\033[0m" << pad62(kc.str()).substr(15) << "|\n";
-                        if (puzzle && puzzle->btc_reward > 0) {
-                            std::ostringstream rw;
-                            rw << "  BTC Reward:    " << std::fixed << std::setprecision(1) << puzzle->btc_reward << " BTC";
-                            std::cout << "|  \033[1;35mBTC Reward:\033[0m" << pad62(rw.str()).substr(13) << "|\n";
-                        }
+                    std::cout << "|  \033[1;33mPuzzle:\033[0m        #" << std::setw(3) << current_puzzle
+                              << " (" << bits << "-bit)                              |\n";
+                    std::cout << "|  \033[1;33mPrivate Key:\033[0m   " << std::setw(42) << key_hex << " |\n";
+                    std::cout << "|  \033[1;33mAddress:\033[0m       " << std::setw(42) << target_address << " |\n";
+                    std::cout << "+--------------------------------------------------------------+\n";
+                    std::cout << "|  \033[1;36mSolved At:\033[0m     " << std::setw(42) << timestamp << " |\n";
+                    std::cout << "|  \033[1;36mDuration:\033[0m      " << std::fixed << std::setprecision(3)
+                              << std::setw(38) << elapsed << " sec |\n";
+                    std::cout << "|  \033[1;36mKeys Checked:\033[0m  " << std::setw(42) << format_number_human(total_checked) << " |\n";
+                    if (puzzle && puzzle->btc_reward > 0) {
+                        std::cout << "|  \033[1;35mBTC Reward:\033[0m    " << std::fixed << std::setprecision(1)
+                                  << std::setw(39) << puzzle->btc_reward << " BTC |\n";
                     }
                     std::cout << "+==============================================================+\n\n";
 
@@ -3451,6 +4670,12 @@ int main(int argc, char* argv[]) {
 
         search_done:
 
+        // Track-f F-03: emit deferred shutdown print/log if we got here via
+        // a SIGINT/SIGTERM. Idempotent - no-op if no signal arrived.
+        if (g_shutdown.load(std::memory_order_acquire)) {
+            emit_shutdown_message_from_main();
+        }
+
         // Final stats
         auto end_time = std::chrono::steady_clock::now();
         double elapsed_sec = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count() / 1000.0;
@@ -3460,15 +4685,9 @@ int main(int argc, char* argv[]) {
         std::cout << "+==============================================================+\n";
         std::cout << "|                   PUZZLE SEARCH RESULTS                      |\n";
         std::cout << "+==============================================================+\n";
-        {
-            std::ostringstream d_line, k_line, r_line;
-            d_line << "  Duration:        " << std::fixed << std::setprecision(2) << elapsed_sec << " seconds";
-            k_line << "  Keys Checked:    " << format_number_human(total_checked);
-            r_line << "  Average Rate:    " << format_rate(final_rate);
-            std::cout << "|" << std::left << std::setw(62) << d_line.str() << "|\n";
-            std::cout << "|" << std::left << std::setw(62) << k_line.str() << "|\n";
-            std::cout << "|" << std::left << std::setw(62) << r_line.str() << "|\n";
-        }
+        std::cout << "|  Duration:        " << std::fixed << std::setprecision(2) << std::setw(10) << elapsed_sec << " seconds                   |\n";
+        std::cout << "|  Keys Checked:    " << std::setw(15) << format_number_human(total_checked) << "                    |\n";
+        std::cout << "|  Average Rate:    " << std::setw(12) << format_rate(final_rate) << "                         |\n";
         std::cout << "+==============================================================+\n";
 
         // Time to complete estimates (for puzzles we know the range size)
@@ -3477,34 +4696,26 @@ int main(int argc, char* argv[]) {
         double time_to_complete_sec = remaining_approx / std::max(1.0, final_rate);
         double days_to_complete = time_to_complete_sec / 86400;
 
-        {
-            std::ostringstream rs_line, eta_line;
-            rs_line << "  Range Size:      2^" << (bits - 1) << " keys";
-            std::cout << "|" << std::left << std::setw(62) << rs_line.str() << "|\n";
-
-            if (days_to_complete < 1) {
-                eta_line << "  ETA (current):   " << std::fixed << std::setprecision(1)
-                         << (time_to_complete_sec / 3600) << " hours";
-            } else if (days_to_complete < 365) {
-                eta_line << "  ETA (current):   " << std::fixed << std::setprecision(1)
-                         << days_to_complete << " days";
-            } else if (days_to_complete < 1e6) {
-                eta_line << "  ETA (current):   " << std::fixed << std::setprecision(1)
-                         << (days_to_complete / 365) << " years";
-            } else {
-                eta_line << "  ETA (current):   " << std::scientific << std::setprecision(2)
-                         << (days_to_complete / 365) << " years";
-            }
-            std::cout << "|" << std::left << std::setw(62) << eta_line.str() << "|\n";
+        std::cout << "|  Range Size:      2^" << std::setw(3) << (bits - 1) << " keys                           |\n";
+        if (days_to_complete < 1) {
+            std::cout << "|  ETA (current):   " << std::setw(10) << std::fixed << std::setprecision(1)
+                      << (time_to_complete_sec / 3600) << " hours                       |\n";
+        } else if (days_to_complete < 365) {
+            std::cout << "|  ETA (current):   " << std::setw(10) << std::fixed << std::setprecision(1)
+                      << days_to_complete << " days                        |\n";
+        } else if (days_to_complete < 1e6) {
+            std::cout << "|  ETA (current):   " << std::setw(10) << std::fixed << std::setprecision(1)
+                      << (days_to_complete / 365) << " years                       |\n";
+        } else {
+            std::cout << "|  ETA (current):   " << std::setw(10) << std::scientific << std::setprecision(2)
+                      << (days_to_complete / 365) << " years                 |\n";
         }
 
         std::cout << "+==============================================================+\n\n";
 
-        // For large unsolved puzzles, suggest pool mode
-        if (!puzzle->solved && puzzle->bits >= 50) {
-            std::cout << "[*] Tip: For puzzles this size, pool mining is recommended.\n";
-            std::cout << "    Run: collider --worker <your_btc_address>\n";
-        }
+        std::cout << "[!] Note: Puzzle mode is using CPU simulation.\n";
+        std::cout << "    Real GPU performance will be significantly higher.\n";
+        std::cout << "    Once GPU pipeline is integrated, expect ~1B+ keys/sec per GPU.\n";
 
         } // End of puzzle iteration for loop
 
@@ -3514,25 +4725,15 @@ int main(int argc, char* argv[]) {
             std::cout << "+==============================================================+\n";
             std::cout << "|          AUTO-PROGRESSION COMPLETE                           |\n";
             std::cout << "+==============================================================+\n";
-            {
-                std::ostringstream ap_done;
-                ap_done << "  All " << puzzles_to_solve.size() << " puzzles have been processed.";
-                std::cout << "|" << std::left << std::setw(62) << ap_done.str() << "|\n";
-            }
+            std::cout << "|  All " << puzzles_to_solve.size() << " puzzles have been processed.                        |\n";
             std::cout << "+==============================================================+\n\n";
         }
 
         return 0;
-#else // !COLLIDER_HAS_SOLO
-        // This should never be reached due to argument parsing gates, but safety check
-        std::cerr << "[*] Solo puzzle solver requires collider pro — collisionprotocol.com/pro\n";
-        std::cerr << "    Use the free edition to join pools: collider --worker <your_btc_address>\n";
-        return 1;
-#endif // COLLIDER_HAS_SOLO
     }
 
-    // No valid mode specified
-    std::cerr << "[!] Error: No mode specified. Use --worker <your_btc_address> to join the pool.\n";
+    // Puzzle mode is required - if we reach here, something went wrong
+    std::cerr << "[!] Error: No mode specified. Use --puzzle <number> or --benchmark.\n";
     print_usage();
     return 1;
 }

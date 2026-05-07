@@ -1,0 +1,376 @@
+# League of Legends Terms and Champions
+summoners rift
+howling abyss
+aram
+ranked
+solo queue
+duo queue
+flex queue
+iron
+bronze
+silver
+gold
+platinum
+emerald
+diamond
+master
+grandmaster
+challenger
+lp
+league points
+mmr
+matchmaking rating
+promos
+promotion series
+demote
+decay
+dodge
+remake
+ff
+surrender
+open mid
+int
+intentional feeding
+run it down
+soft int
+hard int
+grief
+troll
+afk
+afk farming
+proxy
+split push
+teamfight
+skirmish
+objective
+dragon
+drake
+infernal
+mountain
+ocean
+cloud
+hextech
+chemtech
+elder dragon
+baron
+baron nashor
+rift herald
+herald
+shelly
+turret
+tower
+inhib
+inhibitor
+nexus
+base
+fountain
+laser
+execute
+minion
+creep
+cs
+creep score
+farm
+last hit
+freeze
+slow push
+fast push
+crash
+bounce
+wave management
+jungle
+jg
+jungler
+gank
+counter gank
+invade
+vertical jungle
+pathing
+clear
+full clear
+three camp
+level two gank
+level three gank
+scuttle
+crab
+skuttle crab
+river
+bush
+brush
+ward
+vision
+control ward
+pink ward
+sweeper
+oracle
+fog of war
+face check
+cheese
+level one
+five man
+four man
+roam
+rotate
+collapse
+peel
+engage
+disengage
+kite
+orb walk
+animation cancel
+flash
+ignite
+heal
+barrier
+exhaust
+teleport
+tp
+ghost
+cleanse
+smite
+red smite
+blue smite
+summoner spell
+ability
+passive
+q
+w
+e
+r
+ultimate
+ult
+combo
+one shot
+burst
+sustained damage
+poke
+all in
+trade
+short trade
+extended trade
+cooldown
+cd
+mana
+energy
+rage
+fury
+health
+hp
+armor
+magic resist
+mr
+attack damage
+ad
+ability power
+ap
+attack speed
+as
+critical strike
+crit
+lethality
+magic penetration
+magic pen
+armor penetration
+armor pen
+lifesteal
+omnivamp
+spell vamp
+ability haste
+cdr
+cooldown reduction
+movement speed
+ms
+tenacity
+slow resist
+grievous wounds
+anti heal
+shield
+dash
+blink
+cc
+crowd control
+stun
+root
+snare
+silence
+blind
+charm
+taunt
+fear
+flee
+knock up
+knock back
+suppression
+airborne
+immobilize
+ground
+cripple
+disarm
+nearsight
+drowsy
+sleep
+ahri
+akali
+akshan
+alistar
+amumu
+anivia
+annie
+aphelios
+ashe
+aurelion sol
+azir
+bard
+bel veth
+blitzcrank
+brand
+braum
+briar
+caitlyn
+camille
+cassiopeia
+cho gath
+corki
+darius
+diana
+draven
+dr mundo
+ekko
+elise
+evelynn
+ezreal
+fiddlesticks
+fiora
+fizz
+galio
+gangplank
+garen
+gnar
+gragas
+graves
+gwen
+hecarim
+heimerdinger
+illaoi
+irelia
+ivern
+janna
+jarvan iv
+jax
+jayce
+jhin
+jinx
+kai sa
+kalista
+karma
+karthus
+kassadin
+katarina
+kayle
+kayn
+kennen
+kha zix
+kindred
+kled
+kog maw
+k sante
+leblanc
+lee sin
+leona
+lillia
+lissandra
+lucian
+lulu
+lux
+malphite
+malzahar
+maokai
+master yi
+milio
+miss fortune
+mordekaiser
+morgana
+naafiri
+nami
+nasus
+nautilus
+neeko
+nidalee
+nilah
+nocturne
+nunu
+olaf
+orianna
+ornn
+pantheon
+poppy
+pyke
+qiyana
+quinn
+rakan
+rammus
+rek sai
+rell
+renata glasc
+renekton
+rengar
+riven
+rumble
+ryze
+samira
+sejuani
+senna
+seraphine
+sett
+shaco
+shen
+shyvana
+singed
+sion
+sivir
+skarner
+smolder
+sona
+soraka
+swain
+sylas
+syndra
+tahm kench
+taliyah
+talon
+taric
+teemo
+thresh
+tristana
+trundle
+tryndamere
+twisted fate
+twitch
+udyr
+urgot
+varus
+vayne
+veigar
+velkoz
+vex
+vi
+viego
+viktor
+vladimir
+volibear
+warwick
+wukong
+xayah
+xerath
+xin zhao
+yasuo
+yone
+yorick
+yuumi
+zac
+zed
+zeri
+ziggs
+zilean
+zoe
+zyra

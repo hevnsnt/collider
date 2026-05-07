@@ -1,7 +1,7 @@
 {
   "name": "collider",
   "version": "1.0.0",
-  "dependencies": [
-    "openssl"
-  ]
+  "description": "GPU-accelerated Bitcoin puzzle solver",
+  "builtin-baseline": "c82f74667287d3dc386bce81e44964370c91a289",
+  "dependencies": ["openssl", "curl"]
 }

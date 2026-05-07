@@ -1,110 +1,147 @@
-# collider
+<p align="center">
+  <img src="docs/assets/logo.png" alt="theCollider Logo" width="200" />
+</p>
 
-A GPU-accelerated solver for the Bitcoin Puzzle Challenge, implementing Pollard's Kangaroo algorithm on secp256k1.
+<h1 align="center">theCollider</h1>
 
+<p align="center">
+  <strong>The Most Advanced GPU-Accelerated Bitcoin Puzzle Solver & Brain Wallet Scanner</strong>
+</p>
+
+<p align="center">
+  <a href="#features">Features</a> •
+  <a href="#performance">Performance</a> •
+  <a href="#quick-start">Quick Start</a> •
+  <a href="#documentation">Documentation</a> •
+  <a href="#pool">Pool Mining</a>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/version-1.1.0-blue.svg" alt="Version 1.1.0" />
+  <img src="https://img.shields.io/badge/CUDA-12.x-76B900.svg?logo=nvidia" alt="CUDA 12.x" />
+  <img src="https://img.shields.io/badge/Windows-0078D6?logo=windows" alt="Windows" />
+  <img src="https://img.shields.io/badge/macOS-000000?logo=apple" alt="macOS" />
+  <img src="https://img.shields.io/badge/Linux-FCC624?logo=linux&logoColor=black" alt="Linux" />
+  <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT License" />
+</p>
+
+---
+
+## Why theCollider?
+
+The **Bitcoin Puzzle Challenge** offers 1000 BTC across 256 addresses with progressively harder private key ranges. **Brain wallets** represent millions of Bitcoin addresses derived from weak passphrases. Both challenges require specialized tools that combine raw GPU power with intelligent algorithms.
+
+**theCollider** is the definitive solution—integrating the fastest Kangaroo solver (K=1.15), a fused GPU brain wallet pipeline, and intelligent passphrase generation into a single, unified tool.
+
+```mermaid
+graph LR
+    subgraph "theCollider"
+        A[🎯 Puzzle Solver] --> D[Multi-GPU Engine]
+        B[🧠 Brain Wallet] --> D
+        C[🌐 Pool Mining] --> D
+    end
+    D --> E[💰 Solutions]
+    
+    style A fill:#4a9eff,color:#fff
+    style B fill:#22c55e,color:#fff
+    style C fill:#8b5cf6,color:#fff
+    style E fill:#f59e0b,color:#fff
 ```
-$ ./collider --worker bc1qYourAddress
-[*] GPU: NVIDIA GeForce RTX 4090
-[*] Backend: CUDA 12.4
-[*] Connecting to pool: collisionprotocol.com:17403
 
-Pool: 47.2% | Speed: 8.14 GKeys/s | DPs: 1.2M | Sent: 847K | ETA: ~2.3 years
-```
-
-## The Bitcoin Puzzle
-
-In 2015, someone created 160 Bitcoin addresses with private keys of increasing difficulty. The first 70 have been solved, along with every 5th puzzle up to #130. Puzzle #135 holds **13.5 BTC** and requires finding a 135-bit private key.
-
-The math: 135-bit keyspace = 2^135 possibilities. Brute force at 10 billion keys/second would take longer than the age of the universe.
-
-**Pollard's Kangaroo** reduces this to O(√n) operations. Instead of 2^135 operations, we need ~2^67.5. Still astronomical for one GPU, but tractable for a distributed pool.
-
-That's where collider comes in.
-
-## How It Works
-
-The Kangaroo algorithm works by launching two types of "kangaroos" that jump around the keyspace:
-
-1. **Tame kangaroos** start from a known point and record their path
-2. **Wild kangaroos** start from the target public key
-
-When a wild kangaroo lands on a tame kangaroo's path, we can compute the private key from the collision. The trick is using "Distinguished Points" (DPs), points with special properties that we actually store and compare.
-
-Our implementation achieves **K=1.15** efficiency, meaning we solve puzzles in approximately 1.15x the theoretical minimum operations. Most public implementations run at K=1.6 or worse.
+---
 
 ## Features
 
-- **CUDA acceleration** for NVIDIA GPUs (Compute 6.0+)
-- **Metal backend** for Apple Silicon
-- **Multi-GPU support** with linear scaling
-- **Pool mining** via the JLP protocol
-- **Solo mode** via command line flags
-- **Benchmark mode** to test your hardware
+<table>
+<tr>
+<td width="50%">
 
-## Download Pre-built Binaries
+### 🚀 Kangaroo Solver (K=1.15)
+State-of-the-art Pollard's Kangaroo with symmetry exploitation. **40-80% faster** than competing implementations.
 
-The easiest way to get started. Download from [GitHub Releases](https://github.com/hevnsnt/collider/releases):
+### 🧠 Brain Wallet Scanner  
+Fused GPU pipeline: SHA256 → secp256k1 → RIPEMD160 → Bloom. **10B+ keys/second** on 4x RTX 5090.
 
-- **Windows**: `collider.exe`
-- **Linux**: `collider`
-- **macOS (Apple Silicon)**: `collider-macos-arm64`
+### 🎯 PCFG Generation
+Learn password patterns from wordlists. Test `bitcoin123` before `xq7$mZpK`.
 
-No installation needed. Just download and run.
+</td>
+<td width="50%">
 
-## Building from Source
+### 🔗 Markov Chains
+Character-level probability models generate password-like candidates not in your wordlists.
 
-Platform-specific build guides:
+### 🔐 WarpWallet/Scrypt
+Full scrypt implementation for WarpWallet-style brain wallets with email salt.
 
-- [**Windows Build Guide**](docs/BUILD-WINDOWS.md)
-- [**Linux Build Guide**](docs/BUILD-LINUX.md)
-- [**macOS Build Guide**](docs/BUILD-MACOS.md)
+### 🌐 Pool Integration
+Native Collision Protocol client for distributed puzzle solving.
 
-Requires an NVIDIA GPU (CUDA) or Apple Silicon (Metal). See the platform-specific guides for prerequisites and step-by-step instructions.
+</td>
+</tr>
+</table>
 
-## Usage
+---
 
-### Pool Mining (Recommended)
+## Performance
 
-Pool mining distributes the work across many GPUs, making otherwise intractable puzzles solvable.
-
-```bash
-# Basic pool connection
-./collider --worker bc1qYourBitcoinAddress
-
-# Or with explicit pool URL
-./collider --pool collisionprotocol.com:17403 --worker bc1qYourBitcoinAddress
+```mermaid
+xychart-beta
+    title "Brain Wallet Performance (Keys/Second)"
+    x-axis ["RTX 5090 x4", "RTX 5090", "RTX 4090", "RTX 3090", "RTX 3060", "Apple M2"]
+    y-axis "Billions" 0 --> 12
+    bar [10, 2.5, 1.8, 1.0, 0.4, 0.1]
 ```
 
-Your Bitcoin address is your identity and payout destination. When the puzzle is solved, rewards are distributed proportionally based on Distinguished Points contributed.
+| Mode | Hardware | Performance | Notes |
+|------|----------|-------------|-------|
+| **Kangaroo** | RTX 4090 | 8 GKeys/s | K=1.15 optimal |
+| **Kangaroo** | RTX 3090 | 4 GKeys/s | K=1.15 optimal |
+| **Brain Wallet** | 4× RTX 5090 | 10B+ keys/s | Target config |
+| **Brain Wallet** | 1× RTX 4090 | 1.8B keys/s | High-end consumer |
+| **Brain Wallet** | Apple M2 | 100M keys/s | Metal backend |
 
-**Pool fee:** 5% (covers infrastructure, development, and coordination)
+---
 
-### Solo Mode
+## Quick Start
 
-If you want to solve directly without the pool:
-
-```bash
-# Target a specific puzzle
-./collider --puzzle 135
-```
-
-The solver automatically selects the best algorithm based on whether the puzzle's public key is known (Kangaroo) or not (brute force). Solo mode works but is impractical for high-bit puzzles without a large GPU farm.
-
-### Benchmarking
+### Interactive Mode (Recommended)
 
 ```bash
-./collider --benchmark
+# Windows
+collider.exe
+
+# Linux / macOS
+./collider
 ```
 
-Expected performance (Kangaroo mode):
+```
++==============================================================+
+|                       theCollider v1.1                       |
++==============================================================+
 
-| GPU | Keys/Second |
-|-----|-------------|
-| RTX 5090 | ~12 GKeys/s |
-| RTX 4090 | ~8 GKeys/s |
-| RTX 3090 | ~4 GKeys/s |
-| RTX 3060 | ~1.5 GKeys/s |
-| Apple M2 | ~400 MKeys/s |
+What would you like to do?
+
+  [1] Solve Bitcoin Puzzle Challenge
+  [2] Brain Wallet Scanner
+  [3] Run Benchmark
+  [4] Show Help
+
+Enter choice (1-4):
+```
+
+### Command Line
+
+```bash
+# Join the puzzle-solving pool
+./collider --pool jlp://pool.collisionprotocol.com:17403 --worker YOUR_BTC_ADDRESS
+
+# Scan for brain wallets
+./collider --brainwallet --bloom funded.blf --wordlist rockyou.txt
+
+# Solve a specific puzzle
+./collider --puzzle 135 --kangaroo
+```
 
 ### Configuration File
 
@@ -112,123 +149,217 @@ Create `config.yml` for persistent settings:
 
 ```yaml
 pool:
-  url: "collisionprotocol.com:17403"
+  url: "jlp://pool.collisionprotocol.com:17403"
   worker: "bc1qYourBitcoinAddress"
 
+brainwallet:
+  wordlist: "./processed/combined.txt"
+  
 gpu:
-  devices: []  # Empty = use all available GPUs
+  devices: []  # Empty = all GPUs
 ```
 
-```bash
-./collider --config config.yml
-```
-
-## Command Reference
-
-```
-Usage: collider [options]
-
-Pool Options:
-  --worker, -w <address>    Your Bitcoin address for rewards
-  --pool <host:port>        Pool server (default: collisionprotocol.com:17403)
-
-Solo Options:
-  --puzzle <number>         Target puzzle number (1-160)
-  --dp-bits <n>             Distinguished point bits (default: auto)
-
-GPU Options:
-  --gpus, -g <ids>          GPU device IDs (default: all)
-
-Other:
-  --benchmark               Run performance benchmark
-  --config, -c <file>       Load configuration file
-  --verbose, -v             Verbose output
-  --help, -h                Show help
-```
-
-## Security Considerations
-
-**This software is designed for legitimate puzzle solving and security research.**
-
-The Bitcoin Puzzle addresses have no legitimate owner claiming them. They were created specifically as a cryptographic challenge. The same cannot be said for other Bitcoin addresses.
-
-**Do not use this tool to:**
-- Attempt to crack wallets you don't own
-- Target addresses with known owners
-- Engage in any form of theft
-
-Using cryptographic tools against systems without authorization is illegal in most jurisdictions.
-
-**Operational security:**
-- The pool connection uses TLS encryption
-- Your private keys are never transmitted, only Distinguished Points
-- The pool cannot solve puzzles without contributors; it's a coordination mechanism, not a key escrow
-
-## Architecture
-
-```
-src/
-├── main.cpp              # Entry point and CLI handling
-├── core/                 # Core types, config, puzzle database
-├── gpu/                  # CUDA kernels and GPU management
-│   ├── kangaroo_*.cu     # Kangaroo algorithm implementation
-│   └── rckangaroo/       # RCKangaroo backend (K=1.15)
-├── pool/                 # Pool client (JLP protocol)
-├── platform/             # Platform abstraction (CUDA/Metal)
-└── ui/                   # Terminal UI and progress display
-```
-
-The hot path is the GPU kernel that performs elliptic curve point additions. We use projective coordinates and batch inversions to minimize expensive modular inversions.
-
-## Protocol
-
-collider implements the JLP (Jean-Luc Pons) protocol for pool communication:
-
-- Binary protocol over TCP with optional TLS
-- 8-byte header: `KANG` magic + type + flags + length
-- Message types: AUTH, WORK_REQ, WORK_ASN, DP_SUBMIT, DP_BATCH
-
-See the source code in `src/pool/` for implementation details.
-
-## Contributing
-
-Issues and pull requests are welcome. For major changes, please open an issue first to discuss.
-
-Areas where contributions would be particularly valuable:
-- OpenCL backend for AMD GPUs
-- Performance optimizations for specific GPU architectures
-- Additional test coverage
-
-## Pro Version
-
-Need more features? [collider pro](https://collisionprotocol.com/pro) includes:
-
-- **Opportunistic brainwallet**: Every key generated during pool mining is checked against 50M+ funded addresses for free bonus hits
-- **Dedicated brain wallet cracker**: Targeted passphrase cracking mode
-- **Bloom filter**: 50M+ funded address database included
-- **PCFG generation**: Learn password patterns from wordlists
-- **Markov chains**: Character-level probability models
-- **Rule engine**: Transform candidates (leetspeak, case mutations, etc.)
-- **Interactive menu**: Auto-configuration and guided setup
-
-One-time purchase: $49.99 per major version.
-
-## Links
-
-- Website: [collisionprotocol.com](https://collisionprotocol.com)
-- Pool stats: [collisionprotocol.com/pool](https://collisionprotocol.com/pool)
-- Pro version: [collisionprotocol.com/pro](https://collisionprotocol.com/pro)
-
-## Acknowledgments
-
-- [RetiredCoder](https://github.com/RetiredCoder): RCKangaroo implementation
-- [Jean-Luc Pons](https://github.com/JeanLucPons): Original Kangaroo GPU work
-- bitcoin-core/secp256k1: Reference implementation
-
-## License
-
-MIT License. See [LICENSE](LICENSE) for details.
+📖 **[Full Configuration Guide →](docs/CONFIGURATION.md)**
 
 ---
 
-*"The puzzle is the prize."*
+## Architecture
+
+```mermaid
+flowchart TB
+    subgraph Input["📥 Input Layer"]
+        WL[Wordlists]
+        PCFG[PCFG Model]
+        MRK[Markov Model]
+        RULES[Rule Engine]
+    end
+
+    subgraph Core["⚙️ Core Engines"]
+        RCK[RCKangaroo<br/>K=1.15]
+        BWP[Brain Wallet<br/>Pipeline]
+        BLM[Bloom Filter<br/>50M Addresses]
+    end
+
+    subgraph GPU["🖥️ GPU Layer"]
+        direction LR
+        G0[GPU 0]
+        G1[GPU 1]
+        GN[GPU N]
+    end
+
+    subgraph Output["📤 Output"]
+        SOL[Solutions]
+        POOL[Pool DPs]
+    end
+
+    WL --> BWP
+    PCFG --> BWP
+    MRK --> BWP
+    RULES --> BWP
+    
+    RCK --> GPU
+    BWP --> GPU
+    BLM --> GPU
+    
+    G0 --> SOL
+    G1 --> SOL
+    GN --> SOL
+    G0 --> POOL
+    G1 --> POOL
+    GN --> POOL
+
+    style RCK fill:#4a9eff
+    style BWP fill:#22c55e
+    style BLM fill:#8b5cf6
+```
+
+📖 **[Full Architecture Documentation →](docs/ARCHITECTURE.md)**
+
+---
+
+## Pool Mining
+
+**Solo solving Puzzle #135 would take ~195 years** with 4× RTX 4090. The only realistic path is collaborative computation.
+
+```mermaid
+sequenceDiagram
+    participant W as Your GPU
+    participant P as Collision Protocol
+    participant R as 💰 Reward
+
+    W->>P: Connect & Submit DPs
+    P->>P: Detect Collisions
+    P->>R: Solution Found!
+    R->>W: Proportional Payout
+```
+
+### Pool Economics
+
+| Component | Details |
+|-----------|---------|
+| **Fee** | 5% (infrastructure, development, support) |
+| **Payout** | Proportional to Distinguished Points contributed |
+| **Verification** | 72-hour period, then payout within 7 days |
+
+**Example: Puzzle #135 (13.5 BTC)**
+```
+Net Distribution:    12.825 BTC (after 5% fee)
+Your Contribution:   2.4M DPs (24% of pool)
+Your Payout:         3.078 BTC
+```
+
+📖 **[Pool Economics Deep Dive →](docs/POOL-ECONOMICS.md)**
+
+---
+
+## Comparison
+
+| Feature | theCollider | BitCrack | VanitySearch | KeyHunt |
+|---------|:-----------:|:--------:|:------------:|:-------:|
+| Kangaroo (K=1.15) | ✅ | ❌ | ❌ | ⚠️ K=1.6+ |
+| Brain Wallet | ✅ | ❌ | ❌ | ⚠️ Limited |
+| PCFG Generation | ✅ | ❌ | ❌ | ❌ |
+| Markov Chains | ✅ | ❌ | ❌ | ❌ |
+| WarpWallet/Scrypt | ✅ | ❌ | ❌ | ❌ |
+| Bloom Filter | ✅ | ❌ | ❌ | ❌ |
+| macOS (Metal) | ✅ | ❌ | ❌ | ⚠️ |
+| Pool Integration | ✅ | ❌ | ❌ | ❌ |
+| Interactive Mode | ✅ | ❌ | ❌ | ❌ |
+
+---
+
+## Documentation
+
+| Document | Description |
+|----------|-------------|
+| 📖 [Installation Guide](docs/INSTALL.md) | Build instructions for all platforms |
+| 📖 [Usage Guide](docs/USAGE.md) | Complete command reference |
+| 📖 [Architecture](docs/ARCHITECTURE.md) | Technical deep-dive |
+| 📖 [Configuration](docs/CONFIGURATION.md) | config.yml reference |
+| 📖 [Bitcoin Puzzle Strategy](docs/BITCOIN-PUZZLE-STRATEGY.md) | Puzzle-solving approach |
+| 📖 [PCFG Integration](docs/PCFG-INTEGRATION.md) | Password pattern learning |
+| 📖 [Changelog](docs/CHANGELOG.md) | Version history |
+
+---
+
+## System Requirements
+
+### Minimum
+- NVIDIA GPU (Compute 6.0+) or Apple Silicon
+- 8 GB GPU VRAM
+- 16 GB System RAM
+- CUDA 11.0+ or macOS 12+
+
+### Recommended
+- NVIDIA RTX 3090/4090/5090 or multiple GPUs
+- 24+ GB GPU VRAM
+- 64 GB System RAM
+- NVMe storage for wordlists
+
+---
+
+## What's New in v1.1
+
+<details>
+<summary><strong>🆕 Click to expand version 1.1.0 highlights</strong></summary>
+
+### New Features
+- **PCFG Training**: Learn password patterns, generate candidates by probability
+- **WarpWallet/Scrypt**: Full scrypt support for WarpWallet brain wallets
+- **Markov Chains**: Character-level probability models for smart generation
+- **Parallel Bloom Loading**: N-1x speedup for N GPUs
+- **True Double Buffering**: Up to 2x throughput improvement
+
+### Bug Fixes
+- Fixed brainwallet mode incorrectly activating pool mode
+- Fixed MSVC compilation errors (extern "C" linkage)
+- Fixed Kangaroo tames generation
+- Removed compiler warnings
+
+📖 **[Full Changelog →](docs/CHANGELOG.md)**
+
+</details>
+
+---
+
+## Legal & Ethics
+
+theCollider is designed for:
+- ✅ Security research and education
+- ✅ Authorized penetration testing  
+- ✅ Recovery of your own wallets
+- ✅ Academic cryptographic research
+
+⚠️ **Do not use this tool to access wallets you do not own.**
+
+---
+
+## Acknowledgments
+
+- **[RetiredCoder](https://github.com/RetiredCoder)** - RCKangaroo implementation
+- **[JeanLucPons](https://github.com/JeanLucPons)** - Original Kangaroo GPU work
+- **[ryancdotorg](https://github.com/ryancdotorg)** - Brainflayer concepts
+- **bitcoin-core/secp256k1** - Reference EC implementation
+
+---
+
+## License
+
+MIT License - see [LICENSE](LICENSE) for details.
+
+Third-party components:
+- RCKangaroo: GPLv3 (RetiredCoder)
+- secp256k1 primitives: MIT
+
+---
+
+<p align="center">
+  <strong>theCollider</strong> — Because some problems are worth solving.
+</p>
+
+<p align="center">
+  <a href="https://collisionprotocol.com">Website</a> •
+  <a href="docs/INSTALL.md">Install</a> •
+  <a href="docs/USAGE.md">Documentation</a> •
+  <a href="https://github.com/hevnsnt/theCollider/issues">Issues</a>
+</p>

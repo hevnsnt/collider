@@ -1,7 +1,7 @@
 /**
  * Interactive Mode - User-Friendly Menu System
  *
- * Provides interactive prompts and menus for collider when launched
+ * Provides interactive prompts and menus for theCollider when launched
  * without command-line arguments.
  */
 
@@ -13,7 +13,6 @@
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
-#include "../core/edition.hpp"
 
 #ifdef _WIN32
 #include <conio.h>
@@ -30,6 +29,7 @@ namespace ui {
  */
 enum class MainMenuChoice {
     PUZZLE_MODE = 1,
+    BRAINWALLET_MODE = 2,
     BENCHMARK_MODE = 3,
     SHOW_HELP = 4,
     EXIT = 0
@@ -255,38 +255,43 @@ public:
 
     /**
      * Display the main menu and get user choice.
+     * In free builds the Brain Wallet Scanner option is hidden; the remaining
+     * options are renumbered so the menu stays compact.
      */
     static MainMenuChoice display_main_menu(const std::string& version) {
-        // Free Edition Menu
-        display_header("collider", version);
-        
+        display_header("theCollider", version);
+
         std::cout << "\n";
-        std::cout << colors::BRIGHT_WHITE << "Open Source GPU Solver" << colors::RESET << "\n\n";
-        
         std::cout << colors::BRIGHT_WHITE << "What would you like to do?" << colors::RESET << "\n\n";
 
         std::cout << "  " << colors::BRIGHT_GREEN << "[1]" << colors::RESET
-                  << " Pool Solver\n";
+                  << " Solve Bitcoin Puzzle Challenge\n";
+#ifdef COLLIDER_PRO
         std::cout << "  " << colors::BRIGHT_GREEN << "[2]" << colors::RESET
-                  << " Benchmark\n";
+                  << " Brain Wallet Scanner\n";
         std::cout << "  " << colors::BRIGHT_GREEN << "[3]" << colors::RESET
-                  << " Help\n";
-        std::cout << "\n";
-        std::cout << colors::YELLOW << "  Upgrade to Pro:" << colors::RESET << "\n";
-        std::cout << colors::DIM << "  collisionprotocol.com/pro" << colors::RESET << "\n";
+                  << " Run Benchmark\n";
+        std::cout << "  " << colors::BRIGHT_GREEN << "[4]" << colors::RESET
+                  << " Show Help\n";
         std::cout << "\n";
         std::cout << "  " << colors::DIM << "[0]" << colors::RESET
                   << colors::DIM << " Exit" << colors::RESET << "\n";
-
+        int choice = prompt_menu_choice(0, 4);
+        return static_cast<MainMenuChoice>(choice);
+#else
+        std::cout << "  " << colors::BRIGHT_GREEN << "[2]" << colors::RESET
+                  << " Run Benchmark\n";
+        std::cout << "  " << colors::BRIGHT_GREEN << "[3]" << colors::RESET
+                  << " Show Help\n";
+        std::cout << "\n";
+        std::cout << "  " << colors::DIM << "[0]" << colors::RESET
+                  << colors::DIM << " Exit" << colors::RESET << "\n";
         int choice = prompt_menu_choice(0, 3);
-        // Map free edition choices to the enum
-        switch (choice) {
-            case 1: return MainMenuChoice::PUZZLE_MODE; // Pool mode only
-            case 2: return MainMenuChoice::BENCHMARK_MODE;
-            case 3: return MainMenuChoice::SHOW_HELP;
-            case 0: return MainMenuChoice::EXIT;
-            default: return MainMenuChoice::EXIT;
-        }
+        // Map free-build choices to MainMenuChoice (Brain Wallet is never returned).
+        if (choice == 2) return MainMenuChoice::BENCHMARK_MODE;
+        if (choice == 3) return MainMenuChoice::SHOW_HELP;
+        return static_cast<MainMenuChoice>(choice);  // 0=EXIT, 1=PUZZLE_MODE
+#endif
     }
 
     /**
@@ -392,18 +397,14 @@ public:
         std::cout << "\n";
         display_section("Pool Configuration");
 
-        // Pool URL
-        if (!default_url.empty()) {
-            std::cout << "Pool URL [" << colors::CYAN << default_url << colors::RESET << "]: ";
+        // Pool URL - use official pool as fallback default when none is configured.
+        const std::string effective_default = default_url.empty()
+            ? "jlps://collisionprotocol.com:17403"
+            : default_url;
+        std::cout << "Pool URL [" << colors::CYAN << effective_default << colors::RESET << "]: ";
+        {
             std::string input = read_line();
-            pool_url = input.empty() ? default_url : input;
-        } else {
-            std::cout << "Pool URL (e.g., jlp://pool.example.com:17403): ";
-            pool_url = read_line();
-            if (pool_url.empty()) {
-                error_message("Pool URL is required");
-                return false;
-            }
+            pool_url = input.empty() ? effective_default : input;
         }
 
         // Worker name (Bitcoin address)

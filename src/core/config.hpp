@@ -83,19 +83,16 @@ struct UserConfig {
             while (!key.empty() && (key.back() == ' ' || key.back() == '\t')) key.pop_back();
             while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) value.erase(0, 1);
 
-            try {
-                if (key == "default_puzzle") {
-                    default_puzzle = std::stoi(value);
-                } else if (key == "save_progress") {
-                    save_progress = (value == "true" || value == "1");
-                } else if (key == "calibration_done") {
-                    calibration_done = (value == "true" || value == "1");
-                } else if (key.length() > 10 && key.substr(0, 10) == "gpu_batch_") {
-                    int device_id = std::stoi(key.substr(10));
-                    gpu_batch_sizes[device_id] = std::stoull(value);
-                }
-            } catch (const std::exception&) {
-                std::cerr << "[Config] Warning: invalid value for " << key << ": " << value << "\n";
+            if (key == "default_puzzle") {
+                default_puzzle = std::stoi(value);
+            } else if (key == "save_progress") {
+                save_progress = (value == "true" || value == "1");
+            } else if (key == "calibration_done") {
+                calibration_done = (value == "true" || value == "1");
+            } else if (key.length() > 10 && key.substr(0, 10) == "gpu_batch_") {
+                // Parse gpu_batch_<device_id>=<batch_size>
+                int device_id = std::stoi(key.substr(10));
+                gpu_batch_sizes[device_id] = std::stoull(value);
             }
         }
 

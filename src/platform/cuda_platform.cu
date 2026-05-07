@@ -16,9 +16,7 @@
 #if defined(COLLIDER_BACKEND_CUDA)
 
 #include <cuda_runtime.h>
-#include <cstdio>
 #include <vector>
-#include <mutex>
 
 namespace collider {
 namespace platform {
@@ -78,42 +76,13 @@ public:
             info.compute_major = prop.major;
             info.compute_minor = prop.minor;
 
-            // Architecture detection -- mutually exclusive else-if chain
-            // Blackwell Desktop: SM 12.0+ (RTX 5090, PRO 6000, PRO 6000 Max-Q)
-            // Hopper: SM 9.0 (H100)
+            // Architecture detection
+            // Blackwell: SM 10.0+ (RTX 5090)
             // Ada Lovelace: SM 8.9 (RTX 4090)
             // Ampere: SM 8.0-8.6 (RTX 3060, 3070, 3080, 3090)
-            // Turing: SM 7.5 (RTX 2060, 2070, 2080)
-            // NOTE: SM 10.0 is datacenter Blackwell (B100/B200), not desktop
-            info.is_blackwell = false;
-            info.is_hopper = false;
-            info.is_ada = false;
-            info.is_ampere = false;
-            info.is_turing = false;
+            info.is_blackwell = (prop.major >= 10);
+            info.is_ampere = (prop.major == 8 && prop.minor <= 6);
             info.is_apple_silicon = false;
-
-            if (prop.major >= 12) {
-                info.is_blackwell = true;
-            } else if (prop.major == 9) {
-                info.is_hopper = true;
-            } else if (prop.major == 8 && prop.minor >= 9) {
-                info.is_ada = true;
-            } else if (prop.major == 8) {
-                info.is_ampere = true;
-            } else if (prop.major == 7 && prop.minor >= 5) {
-                info.is_turing = true;
-            }
-
-            // VRAM tier determines scaling of EC tables, batch sizes, L2 persistence
-            size_t vram = prop.totalGlobalMem;
-            if (vram >= 48ULL * 1024 * 1024 * 1024)
-                info.vram_tier = VRAMTier::Maximum;
-            else if (vram >= 16ULL * 1024 * 1024 * 1024)
-                info.vram_tier = VRAMTier::Enhanced;
-            else if (vram >= 8ULL * 1024 * 1024 * 1024)
-                info.vram_tier = VRAMTier::Standard;
-            else
-                info.vram_tier = VRAMTier::Minimal;
 
             info.supports_fp16 = (prop.major >= 6);
             info.supports_int8 = (prop.major >= 6);
@@ -123,26 +92,6 @@ public:
             info.warp_size = prop.warpSize;
             info.shared_memory_per_block = prop.sharedMemPerBlock;
             info.l2_cache_size = prop.l2CacheSize;
-        }
-
-        // Log VRAM budget for each device
-        for (int i = 0; i < count; i++) {
-            auto cfg = AdaptiveConfig::for_device(device_infos_[i]);
-            const char* tier_name = "Unknown";
-            switch (device_infos_[i].vram_tier) {
-                case VRAMTier::Minimal:  tier_name = "Minimal (<8GB)"; break;
-                case VRAMTier::Standard: tier_name = "Standard (8-16GB)"; break;
-                case VRAMTier::Enhanced: tier_name = "Enhanced (16-48GB)"; break;
-                case VRAMTier::Maximum:  tier_name = "Maximum (48+GB)"; break;
-            }
-            fprintf(stderr, "[GPU %d] %s | VRAM: %zu MB | Tier: %s | EC: %d-bit (%zu KB) | Batch budget: %zu MB\n",
-                    i,
-                    device_infos_[i].name.c_str(),
-                    device_infos_[i].total_memory / (1024 * 1024),
-                    tier_name,
-                    cfg.ec_window_bits,
-                    cfg.ec_table_size_bytes / 1024,
-                    cfg.vram_batch_buffers / (1024 * 1024));
         }
 
         // Set default device (prefer highest compute capability)
@@ -198,10 +147,11 @@ public:
         }
         allocated_events_.clear();
 
-        // Do not call cudaDeviceReset() here -- this runs from the destructor
-        // during static singleton destruction, when other threads may still be
-        // using CUDA resources. The CUDA runtime handles cleanup at process exit.
-        // Use shutdown_devices() for explicit cleanup before exit if needed.
+        // Reset all devices
+        for (int i = 0; i < device_count_; i++) {
+            cudaSetDevice(i);
+            cudaDeviceReset();
+        }
 
         initialized_ = false;
     }
@@ -253,7 +203,7 @@ public:
         }
 
         // Allocate pinned host memory if requested
-        if ((flags & MemoryFlags::Pinned) && !(flags & MemoryFlags::HostVisible)) {
+        if (flags & MemoryFlags::Pinned && !(flags & MemoryFlags::HostVisible)) {
             CUDA_CHECK(cudaMallocHost(&buffer.host_ptr, aligned_size));
         }
 
@@ -408,38 +358,10 @@ public:
         return {ErrorCode::Success, ""};
     }
 
-    // NOTE: synchronize_device() only syncs current_device_, not all GPUs.
-    // Use synchronize_all_devices() to flush work on every GPU.
     Result synchronize_device() override {
         CUDA_CHECK(cudaSetDevice(current_device_));
         CUDA_CHECK(cudaDeviceSynchronize());
         return {ErrorCode::Success, ""};
-    }
-
-    /**
-     * Synchronize all GPU devices. In multi-GPU setups, this ensures all
-     * outstanding work across every device is complete before returning.
-     */
-    Result synchronize_all_devices() {
-        for (int i = 0; i < device_count_; i++) {
-            CUDA_CHECK(cudaSetDevice(i));
-            CUDA_CHECK(cudaDeviceSynchronize());
-        }
-        // Restore the active device
-        CUDA_CHECK(cudaSetDevice(current_device_));
-        return {ErrorCode::Success, ""};
-    }
-
-    /**
-     * Explicitly reset all CUDA devices. Call this only after all threads
-     * using CUDA have been joined, before process exit.
-     */
-    void shutdown_devices() {
-        for (int i = 0; i < device_count_; i++) {
-            cudaSetDevice(i);
-            cudaDeviceSynchronize();
-            cudaDeviceReset();
-        }
     }
 
     // Event management
@@ -531,19 +453,14 @@ private:
     std::vector<Event> allocated_events_;
 };
 
-// Factory function -- thread-safe initialization via std::call_once
+// Factory function
 IPlatform& get_platform() {
     static CUDAPlatform platform;
-    static std::once_flag init_flag;
-
-    std::call_once(init_flag, []() {
-        auto result = platform.initialize();
-        if (result.code != ErrorCode::Success) {
-            fprintf(stderr, "[CUDA] Platform initialization failed: %s\n",
-                    result.message.c_str());
-            // Platform remains uninitialized. Callers must check is_initialized().
-        }
-    });
+    static bool initialized = false;
+    if (!initialized) {
+        platform.initialize();
+        initialized = true;
+    }
     return platform;
 }
 

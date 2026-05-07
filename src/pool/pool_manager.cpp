@@ -4,7 +4,6 @@
 #include <iostream>
 #include <sstream>
 #include <iomanip>
-#include <cstring>
 #include <regex>
 
 namespace collider {
@@ -38,7 +37,11 @@ bool PoolManager::connect() {
         disconnect();
     }
 
-    // Create appropriate client
+    // Create appropriate client.
+    // NOTE: HTTP pool path was DELETED in Wave 4 (Track D security audit, finding D-C1).
+    // The HTTP client silently downgraded https:// URLs to plaintext, leaking the
+    // worker's Bitcoin address (= payout address) and API tokens in the clear. JLP+TLS
+    // (jlps://) is the only supported pool protocol going forward.
     if (config_.type == POOL_TYPE_JLP) {
         auto jlp_client = std::make_unique<JLPPoolClient>();
         jlp_client->set_timeout(config_.timeout_ms);
@@ -48,13 +51,16 @@ bool PoolManager::connect() {
         jlp_client->set_verify_cert(config_.verify_cert);
         client_ = std::move(jlp_client);
     } else if (config_.type == POOL_TYPE_HTTP) {
-        auto http_client = std::make_unique<HTTPPoolClient>();
-        if (!config_.api_key.empty()) {
-            http_client->set_api_key(config_.api_key);
-        }
-        client_ = std::move(http_client);
+        std::cerr << "[PoolManager] HTTP pool deprecated; use jlp:// or jlps://"
+                  << std::endl;
+        std::cerr << "[PoolManager]   The HTTP pool transport was removed in the "
+                     "2026-05-04 security review (silent plaintext credential leak)."
+                  << std::endl;
+        return false;
     } else {
-        std::cerr << "[PoolManager] Unknown pool type: " << config_.type << std::endl;
+        std::cerr << "[PoolManager] Unknown pool type: '" << config_.type
+                  << "'. Only 'jlp' is supported (use jlp:// or jlps:// URLs)."
+                  << std::endl;
         return false;
     }
 
@@ -67,12 +73,9 @@ bool PoolManager::connect() {
     });
 
     client_->set_work_callback([this](const WorkAssignment& work) {
-        {
-            std::lock_guard<std::mutex> lock(work_mutex_);
-            current_work_ = work;
-            has_work_ = true;
-        }
-        work_cv_.notify_all();
+        std::lock_guard<std::mutex> lock(work_mutex_);
+        current_work_ = work;
+        has_work_ = true;
         std::cout << "[PoolManager] Received new work: " << work.puzzle_name
                   << " (DP bits: " << work.dp_bits << ")" << std::endl;
     });
@@ -148,12 +151,7 @@ void PoolManager::submit_dp(const DistinguishedPoint& dp) {
         return;
     }
 
-    {
-        std::lock_guard<std::mutex> lock(client_mutex_);
-        if (client_) {
-            client_->submit_dp(dp);
-        }
-    }
+    client_->submit_dp(dp);
     submitted_count_++;
 }
 
@@ -217,29 +215,29 @@ void PoolManager::dp_callback_hook(void* user_data, const uint8_t* x, const uint
 }
 
 // Parse pool URL
+//
+// Supported schemes (Wave 4 security review):
+//   jlp://host:port    - JLP without TLS (closed-test only; will warn)
+//   jlps://host:port   - JLP with TLS (REQUIRED for any external/Internet pool)
+//   host:port          - shorthand, defaults to jlp://
+//
+// REJECTED schemes:
+//   http://, https://  - HTTP pool transport was deleted in Wave 4 (D-C1: silent
+//                        credential leak). Hard-fails with a clear migration message.
 bool parse_pool_url(const std::string& url, PoolConfig& config) {
-    // Patterns:
-    // jlp://host:port       - JLP without TLS
-    // jlps://host:port      - JLP with TLS
-    // http://host:port/path - HTTP without TLS
-    // https://host:port/path - HTTP with TLS
-    // host:port (defaults to JLP without TLS)
-    // jlp://[::1]:port      - IPv6 literal
-    // [::1]:port             - IPv6 literal without scheme
-
-    // Regex handles both IPv4/hostname and IPv6 bracket-literal addresses
-    std::regex url_regex(R"(^(?:([a-z]+)://)?(?:\[([^\]]+)\]|([^:/\[]+))(?::(\d+))?(/.*)?$)");
+    std::regex url_regex(R"(^(?:([a-z]+)://)?([^:/]+)(?::(\d+))?(/.*)?$)");
     std::smatch match;
 
     if (!std::regex_match(url, match, url_regex)) {
+        std::cerr << "[PoolManager] Malformed pool URL: '" << url << "'"
+                  << std::endl;
         return false;
     }
 
     std::string scheme = match[1].str();
-    // IPv6 in brackets (group 2) or hostname/IPv4 (group 3)
-    config.host = match[2].str().empty() ? match[3].str() : match[2].str();
-    std::string port_str = match[4].str();
-    std::string path = match[5].str();
+    config.host = match[2].str();
+    std::string port_str = match[3].str();
+    std::string path = match[4].str();
 
     // Determine type and TLS from scheme
     config.use_tls = false;
@@ -249,24 +247,40 @@ bool parse_pool_url(const std::string& url, PoolConfig& config) {
     } else if (scheme == "jlps" || scheme == "kangaroos") {
         config.type = POOL_TYPE_JLP;
         config.use_tls = true;
-    } else if (scheme == "http") {
-        config.type = POOL_TYPE_HTTP;
-        config.use_tls = false;
-    } else if (scheme == "https") {
-        config.type = POOL_TYPE_HTTP;
-        config.use_tls = true;
+    } else if (scheme == "http" || scheme == "https") {
+        // HTTP pool path was DELETED in the 2026-05-04 security review (D-C1).
+        // The previous client silently downgraded https:// to plaintext TCP, leaking
+        // the worker name (= Bitcoin payout address) and any auth token.
+        std::cerr << "[PoolManager] HTTP pool deprecated; use jlp:// or jlps:// "
+                     "(input was: " << url << ")" << std::endl;
+        std::cerr << "[PoolManager]   The HTTP transport was removed because the "
+                     "previous implementation leaked credentials." << std::endl;
+        std::cerr << "[PoolManager]   Migration: replace 'http://host:port' with "
+                     "'jlp://host:17403' or, for TLS, 'jlps://host:17403'."
+                  << std::endl;
+        return false;
     } else {
+        std::cerr << "[PoolManager] Unknown URL scheme: '" << scheme
+                  << "' (supported: jlp://, jlps://)" << std::endl;
         return false;
     }
 
-    // Set port with validation
+    // Set port with validation. std::stoi may throw on overflow (D-L1); guard it.
     if (!port_str.empty()) {
-        int port_val = std::stoi(port_str);
-        if (port_val <= 0 || port_val > 65535) {
-            std::cerr << "[PoolManager] Invalid port number: " << port_val << std::endl;
+        int port_value = 0;
+        try {
+            port_value = std::stoi(port_str);
+        } catch (const std::exception& e) {
+            std::cerr << "[PoolManager] Invalid port '" << port_str
+                      << "': " << e.what() << std::endl;
             return false;
         }
-        config.port = static_cast<uint16_t>(port_val);
+        if (port_value < 1 || port_value > 65535) {
+            std::cerr << "[PoolManager] Invalid port: " << port_value
+                      << " (must be 1-65535)" << std::endl;
+            return false;
+        }
+        config.port = static_cast<uint16_t>(port_value);
     } else {
         config.port = PoolConfig::default_port(config.type);
     }

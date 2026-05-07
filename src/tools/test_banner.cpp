@@ -29,6 +29,8 @@ int main(int argc, char* argv[]) {
             config.enable_color = false;
         } else if (arg == "--puzzle") {
             config.mode = OperationMode::PUZZLE_SEARCH;
+        } else if (arg == "--brain") {
+            config.mode = OperationMode::BRAIN_WALLET;
         } else if (arg == "--benchmark") {
             config.mode = OperationMode::BENCHMARK;
         } else if (arg == "--fast") {
@@ -39,6 +41,7 @@ int main(int argc, char* argv[]) {
             std::cout << "  --no-animation  Disable animation\n";
             std::cout << "  --no-color      Disable colors\n";
             std::cout << "  --puzzle        Show puzzle mode banner\n";
+            std::cout << "  --brain         Show brain wallet mode banner\n";
             std::cout << "  --benchmark     Show benchmark mode banner\n";
             std::cout << "  --fast          Fast animation (1 cycle, 50ms)\n";
             return 0;
@@ -51,6 +54,8 @@ int main(int argc, char* argv[]) {
     stats.gpu_names = "Apple M3 Max";
     stats.backend = "Metal";
     stats.estimated_speed = 200'000'000ULL;  // 200M/s
+    stats.bloom_file = "funded_addresses.blf";
+    stats.bloom_entries = 47'000'000;
     stats.version = "1.0.0";
 
     // Puzzle-specific
