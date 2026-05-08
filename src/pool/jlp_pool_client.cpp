@@ -905,7 +905,11 @@ void JLPPoolClient::receiver_loop() {
 }
 
 void JLPPoolClient::sender_loop() {
-    std::vector<JLPDistinguishedPoint> batch;
+    // v2 wire format: every DP carries the worker's claimed work_id so the
+    // server can match it to the chunk currently assigned to this worker.
+    // The server still accepts v1 submissions from older clients deployed
+    // in the field; freshly-built binaries always emit v2.
+    std::vector<JLPDistinguishedPointV2> batch;
     batch.reserve(100);
 
     // Keepalive: the server's per-message read timeout is 30s. With
@@ -924,6 +928,16 @@ void JLPPoolClient::sender_loop() {
                           - STATS_INTERVAL_SECONDS;  // fire once on first iteration
 
     while (running_) {
+        // Snapshot the work_id once per drain iteration. current_work_ is
+        // protected by work_mutex_ and updated when WORK_ASN arrives; we
+        // copy the 64-bit field out so the sender doesn't have to hold
+        // work_mutex_ for the duration of the queue scan or network send.
+        uint64_t current_work_id = 0;
+        {
+            std::lock_guard<std::mutex> wlock(work_mutex_);
+            current_work_id = current_work_.work_id;
+        }
+
         {
             std::unique_lock<std::mutex> lock(dp_mutex_);
             dp_cv_.wait_for(lock, std::chrono::milliseconds(100), [this] {
@@ -933,7 +947,8 @@ void JLPPoolClient::sender_loop() {
             // Collect batch
             while (!dp_queue_.empty() && batch.size() < 100) {
                 const auto& dp = dp_queue_.front();
-                JLPDistinguishedPoint jlp_dp;
+                JLPDistinguishedPointV2 jlp_dp;
+                jlp_dp.work_id = current_work_id;
                 memcpy(jlp_dp.x, dp.x, 32);
                 memcpy(jlp_dp.d, dp.d, 32);
                 jlp_dp.type = dp.type;
@@ -947,15 +962,13 @@ void JLPPoolClient::sender_loop() {
         // these and we'd be sending plaintext DPs to an unauthenticated channel).
         if (!batch.empty() && connected_
             && auth_state_.load() == AuthState::AUTH_OK) {
-            // Wire format expected by the pool: [count:u32 LE][dp1:66][dp2:66]...
-            // The server's decode_dp_batch reads the leading uint32 as the
-            // batch count and rejects anything > 10000. Without the prefix,
-            // the first 4 bytes of the first DP's X coordinate get interpreted
-            // as the count -- ~uniformly random in [0, 2^32) -- and the
-            // server tears down the connection with "Batch count N exceeds
-            // max 10000".
+            // Wire format expected by the pool: [count:u32 LE][dp1:74][dp2:74]...
+            // (DP_BATCH_V2 uses 74-byte v2 entries; the leading u32 count is
+            // capped at 10000 server-side, so without it the first 4 bytes of
+            // the first DP get interpreted as the count and the server tears
+            // down the connection with "Batch count N exceeds max 10000".)
             std::vector<uint8_t> payload;
-            payload.reserve(4 + batch.size() * sizeof(JLPDistinguishedPoint));
+            payload.reserve(4 + batch.size() * sizeof(JLPDistinguishedPointV2));
             uint32_t count = static_cast<uint32_t>(batch.size());
             payload.insert(payload.end(),
                            reinterpret_cast<uint8_t*>(&count),
@@ -963,8 +976,8 @@ void JLPPoolClient::sender_loop() {
             payload.insert(payload.end(),
                            reinterpret_cast<uint8_t*>(batch.data()),
                            reinterpret_cast<uint8_t*>(batch.data())
-                               + batch.size() * sizeof(JLPDistinguishedPoint));
-            send_message(JLPMessageType::DP_BATCH, payload.data(), payload.size());
+                               + batch.size() * sizeof(JLPDistinguishedPointV2));
+            send_message(JLPMessageType::DP_BATCH_V2, payload.data(), payload.size());
             last_send = std::chrono::steady_clock::now();
 
             std::lock_guard<std::mutex> lock(stats_mutex_);

@@ -59,10 +59,20 @@ enum class JLPMessageType : uint8_t {
     WORK_REQ  = 0x10,
     WORK_ASN  = 0x11,
 
-    // Distinguished points
+    // Distinguished points (v1 - no chunk attestation)
     DP_SUBMIT = 0x20,
     DP_ACK    = 0x21,
     DP_BATCH  = 0x22,
+
+    // Distinguished points v2 - identical fields plus an 8-byte work_id
+    // prefix attesting which assigned chunk the DP came from. The server
+    // verifies the claimed work_id matches this worker's current
+    // assignment and rejects the submission otherwise (catches the
+    // wrong-chunk submission attack class). v2 wire layout matches
+    // collision-protocol/src/jlp_protocol.py DistinguishedPointV2:
+    //   struct.pack('<Q32s32sBB', work_id, x, d, type, dp_bits)
+    DP_SUBMIT_V2 = 0x23,
+    DP_BATCH_V2  = 0x24,
 
     // Statistics
     STATS_REQ = 0x30,
@@ -118,6 +128,20 @@ struct JLPDistinguishedPoint {
 // DP_BATCH payload is then [count:u32 LE][dp1:66][dp2:66]...
 static_assert(sizeof(JLPDistinguishedPoint) == 66,
               "JLPDistinguishedPoint must be 66 bytes on the wire");
+
+// v2 distinguished point: 74-byte wire layout. The 8-byte work_id prefix
+// attests which assigned chunk the DP came from. Matches the server's
+// DistinguishedPointV2.to_bytes() (struct.pack('<Q32s32sBB', work_id, x,
+// d, type, dp_bits)). DP_BATCH_V2 payload is [count:u32 LE][dp1:74][dp2:74]...
+struct JLPDistinguishedPointV2 {
+    uint64_t work_id;        // 8 bytes  - chunk id from WorkAssignment (low 64 bits, LE)
+    uint8_t  x[32];          // 32 bytes - X coordinate
+    uint8_t  d[32];          // 32 bytes - Distance
+    uint8_t  type;           // 1 byte   - Tame (0) or Wild (1)
+    uint8_t  dp_bits;        // 1 byte   - Number of leading-zero bits used
+};
+static_assert(sizeof(JLPDistinguishedPointV2) == 74,
+              "JLPDistinguishedPointV2 must be 74 bytes on the wire");
 #pragma pack(pop)
 
 // Connection / authentication state machine.

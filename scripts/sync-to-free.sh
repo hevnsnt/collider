@@ -108,6 +108,11 @@ PRESERVE_PATHS=(
     "docs/BUILD-WINDOWS.md"
     "src/core/edition.hpp"
     ".github/workflows/build-release.yml"
+    # README.md is public-only: the public Free repo's landing page is
+    # written for the Free audience and does not advertise Pro features.
+    # The private repo's README pitches the full Pro/Free product, so
+    # blindly overwriting public's would re-introduce false claims.
+    "README.md"
 )
 
 # -----------------------------------------------------------------------------
