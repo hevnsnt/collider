@@ -60,10 +60,18 @@ enum class JLPMessageType : uint8_t {
     WORK_REQ = 0x10,       // Request work (0 bytes)
     WORK_ASN = 0x11,       // Work assignment (102 bytes)
 
-    // Distinguished points
+    // Distinguished points (v1 - no chunk attestation)
     DP_SUBMIT = 0x20,      // Single DP (66 bytes)
     DP_ACK = 0x21,         // DP acknowledged (4 bytes: count)
     DP_BATCH = 0x22,       // Batch of DPs (4 + N*66 bytes)
+
+    // Distinguished points v2 - identical fields plus an 8-byte work_id
+    // prefix attesting which assigned chunk the DP came from. The server
+    // verifies the claimed work_id matches the worker's current
+    // assignment and rejects the submission otherwise (catches the
+    // wrong-chunk submission attack class).
+    DP_SUBMIT_V2 = 0x23,   // Single v2 DP (74 bytes)
+    DP_BATCH_V2 = 0x24,    // Batch of v2 DPs (4 + N*74 bytes)
 
     // Statistics
     STATS_REQ = 0x30,      // Request stats (0 bytes)
@@ -116,11 +124,27 @@ struct JLPDistinguishedPoint {
     // Total: 66 bytes
 };
 
+// Distinguished point v2 - 74 bytes. Adds an 8-byte work_id prefix.
+// Layout MUST match the Python server's struct '<Q32s32sBB':
+//   work_id (uint64 LE) + x[32] + d[32] + type[1] + dp_bits[1]
+struct JLPDistinguishedPointV2 {
+    uint64_t work_id;        // 8 bytes - chunk id from WorkAssignment (low 64 bits)
+    uint8_t x[32];           // 32 bytes - X coordinate (big-endian)
+    uint8_t d[32];           // 32 bytes - Distance traveled (big-endian)
+    uint8_t type;            // 1 byte  - 0 = tame, 1 = wild
+    uint8_t dp_bits;         // 1 byte  - Number of leading zero bits
+    // Total: 74 bytes
+};
+
 // DP batch header
 struct JLPDPBatchHeader {
     uint32_t count;          // Number of DPs in batch
 };
 #pragma pack(pop)
+static_assert(sizeof(JLPDistinguishedPoint) == 66,
+              "JLPDistinguishedPoint must be 66 bytes");
+static_assert(sizeof(JLPDistinguishedPointV2) == 74,
+              "JLPDistinguishedPointV2 must be 74 bytes");
 
 class JLPPoolClient : public PoolClient {
 public:

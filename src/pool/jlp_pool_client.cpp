@@ -630,10 +630,24 @@ void JLPPoolClient::receiver_loop() {
 }
 
 void JLPPoolClient::sender_loop() {
-    std::vector<JLPDistinguishedPoint> batch;
+    // Build v2 DPs (with work_id attestation) so the server can match
+    // every submission to the chunk currently assigned to this worker.
+    // The server still accepts v1 messages from older clients; a fresh
+    // build always sends v2.
+    std::vector<JLPDistinguishedPointV2> batch;
     batch.reserve(100);
 
     while (running_) {
+        // Snapshot the current work_id once per drain. current_work_ is
+        // protected by work_mutex_; we copy the 64-bit field out so the
+        // sender doesn't have to hold work_mutex_ for the duration of
+        // the queue scan or the network send.
+        uint64_t current_work_id = 0;
+        {
+            std::lock_guard<std::mutex> wlock(work_mutex_);
+            current_work_id = current_work_.work_id;
+        }
+
         {
             std::unique_lock<std::mutex> lock(dp_mutex_);
             dp_cv_.wait_for(lock, std::chrono::milliseconds(100), [this] {
@@ -643,7 +657,8 @@ void JLPPoolClient::sender_loop() {
             // Collect batch
             while (!dp_queue_.empty() && batch.size() < 100) {
                 const auto& dp = dp_queue_.front();
-                JLPDistinguishedPoint jlp_dp;
+                JLPDistinguishedPointV2 jlp_dp;
+                jlp_dp.work_id = current_work_id;
                 memcpy(jlp_dp.x, dp.x, 32);
                 memcpy(jlp_dp.d, dp.d, 32);
                 jlp_dp.type = dp.type;
@@ -653,22 +668,25 @@ void JLPPoolClient::sender_loop() {
             }
         }
 
-        // Send batch
+        // Send batch using v2 message types.
         if (!batch.empty() && connected_) {
             if (batch.size() == 1) {
-                // Single DP - use DP_SUBMIT (66 bytes)
-                send_message(JLPMessageType::DP_SUBMIT, &batch[0], sizeof(JLPDistinguishedPoint));
+                // Single DP - DP_SUBMIT_V2 (74 bytes)
+                send_message(JLPMessageType::DP_SUBMIT_V2,
+                             &batch[0], sizeof(JLPDistinguishedPointV2));
             } else {
-                // Multiple DPs - use DP_BATCH with count header
-                // Format: count (4 bytes) + DPs (66 bytes each)
+                // Batch - DP_BATCH_V2 with count header
+                // Format: count (4 bytes) + DPs (74 bytes each)
                 std::vector<uint8_t> batch_data;
-                batch_data.resize(4 + batch.size() * sizeof(JLPDistinguishedPoint));
-                
+                batch_data.resize(4 + batch.size() * sizeof(JLPDistinguishedPointV2));
+
                 uint32_t count = static_cast<uint32_t>(batch.size());
                 memcpy(batch_data.data(), &count, 4);
-                memcpy(batch_data.data() + 4, batch.data(), batch.size() * sizeof(JLPDistinguishedPoint));
-                
-                send_message(JLPMessageType::DP_BATCH, batch_data.data(), batch_data.size());
+                memcpy(batch_data.data() + 4, batch.data(),
+                       batch.size() * sizeof(JLPDistinguishedPointV2));
+
+                send_message(JLPMessageType::DP_BATCH_V2,
+                             batch_data.data(), batch_data.size());
             }
 
             std::lock_guard<std::mutex> lock(stats_mutex_);
