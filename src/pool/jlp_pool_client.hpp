@@ -14,11 +14,14 @@
 #endif
 
 #include "pool_client.hpp"
+#include "pool_config.hpp"
 #include <thread>
 #include <mutex>
 #include <queue>
 #include <condition_variable>
 #include <atomic>
+#include <array>
+#include <limits>
 
 // TLS support via OpenSSL
 #ifdef COLLIDER_HAS_OPENSSL
@@ -100,11 +103,23 @@ struct JLPHeader {
     uint16_t payload_size;   // Size of payload (2 bytes, little-endian)
 };  // Total: 8 bytes
 
-struct JLPClientHello {
-    char worker_name[64];    // Worker identifier (Bitcoin address)
-    uint32_t gpu_count;      // Number of GPUs
-    uint64_t speed;          // Keys per second capability
+// v1.4.1 B.2: AUTH wire format (120 bytes) -- pre-1.4.1 the client
+// sent JLPClientHello (76 bytes) but the Python server decoded
+// 96 bytes (name + password) and silently mis-aligned gpu_count/speed
+// onto the password slot. The new format is name + password + a
+// timestamp_ms + a 16-byte nonce so the server can reject replays of
+// captured AUTH packets and enforce client-clock drift bounds.
+//
+// Field order matches collision-protocol/src/jlp_protocol.py
+// (struct.pack equivalent: '<64s32sQ16s').
+struct JLPClientHelloV2 {
+    char     worker_name[64];   // Worker identifier (Bitcoin address)
+    char     password[32];      // Optional pool password
+    uint64_t timestamp_ms;      // Wall-clock time in ms (LE)
+    uint8_t  nonce[16];         // Per-AUTH random nonce
 };
+static_assert(sizeof(JLPClientHelloV2) == 120,
+              "JLPClientHelloV2 must be 120 bytes on the wire");
 
 // Work assignment structure - must match collision-protocol/src/jlp_protocol.py ServerConfig
 // Python: struct.pack('<33s32s32sIQ', public_key, range_start, range_end, dp_bits, work_id)
@@ -129,24 +144,29 @@ struct JLPDistinguishedPoint {
 static_assert(sizeof(JLPDistinguishedPoint) == 66,
               "JLPDistinguishedPoint must be 66 bytes on the wire");
 
-// v2 distinguished point: 74-byte wire layout. The 8-byte work_id prefix
-// attests which assigned chunk the DP came from. Matches the server's
-// DistinguishedPointV2.to_bytes() (struct.pack('<Q32s32sBB', work_id, x,
-// d, type, dp_bits)). DP_BATCH_V2 payload is [count:u32 LE][dp1:74][dp2:74]...
+// v2 distinguished point: 78-byte wire layout (was 74 pre-1.4.1). The
+// 8-byte work_id prefix attests which assigned chunk the DP came from;
+// the 4-byte sequence (v1.4.1 B.1) is a per-(worker, work_id) monotonic
+// counter. The server tracks an expected window and rejects out-of-
+// window sequences as replays. Matches the server's
+// DistinguishedPointV2.to_bytes() (struct.pack('<QI32s32sBB',
+// work_id, sequence, x, d, type, dp_bits)).
+// DP_BATCH_V2 payload is [count:u32 LE][dp1:78][dp2:78]...
 struct JLPDistinguishedPointV2 {
-    uint64_t work_id;        // 8 bytes  - chunk id from WorkAssignment (low 64 bits, LE)
+    uint64_t work_id;        // 8 bytes  - chunk id from WorkAssignment (LE)
+    uint32_t sequence;       // 4 bytes  - v1.4.1 B.1 monotonic per-chunk counter (LE)
     uint8_t  x[32];          // 32 bytes - X coordinate
     uint8_t  d[32];          // 32 bytes - Distance
     uint8_t  type;           // 1 byte   - Tame (0) or Wild (1)
     // Wire format pins this to 1 byte (struct.pack 'B' on the server side
-    // gives 74-byte total). The abstract DistinguishedPoint::dp_bits in
+    // gives 78-byte total). The abstract DistinguishedPoint::dp_bits in
     // pool_client.hpp is uint64_t for API ergonomics; the sender narrows
     // to uint8_t here. Realistic values are 1..50, so truncation is safe.
     // (Gemini PR review pointed out the type difference; deliberate.)
     uint8_t  dp_bits;        // 1 byte   - Number of leading-zero bits used
 };
-static_assert(sizeof(JLPDistinguishedPointV2) == 74,
-              "JLPDistinguishedPointV2 must be 74 bytes on the wire");
+static_assert(sizeof(JLPDistinguishedPointV2) == 78,
+              "JLPDistinguishedPointV2 must be 78 bytes on the wire");
 #pragma pack(pop)
 
 // Connection / authentication state machine.
@@ -232,9 +252,10 @@ private:
     std::mutex auth_cv_mutex_;
     std::condition_variable auth_cv_;
 
-    // Reconnection with exponential backoff
+    // Reconnection with exponential backoff. The cap MAX_RECONNECT_BACKOFF_MS
+    // is defined in pool_config.hpp and shared with PoolManager so the two
+    // reconnect paths agree on the upper bound.
     static constexpr uint32_t RECONNECT_BASE_DELAY_MS = 1000;    // Start at 1 second
-    static constexpr uint32_t RECONNECT_MAX_DELAY_MS = 60000;    // Cap at 60 seconds
     static constexpr double RECONNECT_BACKOFF_MULTIPLIER = 2.0;  // Double each time
     uint32_t reconnect_delay_ms_ = RECONNECT_BASE_DELAY_MS;
     uint32_t reconnect_attempts_ = 0;
@@ -276,21 +297,44 @@ private:
 
     // Worker info
     std::string worker_name_;
+    std::string password_;       // v1.4.1 B.2: optional pool password
     uint32_t gpu_count_;
     uint64_t speed_;
 
     // Current work
     WorkAssignment current_work_;
     bool work_received_ = false;  // true once WORK_ASN arrives (work_id==0 is a valid chunk)
+    // v1.4.1 B.1: per-(worker, work_id) monotonic DP counter. Reset to
+    // 0 every time the server hands out a new chunk; incremented on
+    // each DP submitted in DP_BATCH_V2. The server tracks the expected
+    // window per (worker_name, work_id) and rejects out-of-window
+    // sequences as replays. The counter lives next to current_work_
+    // because both are reset together when WORK_ASN arrives.
+    uint32_t dp_sequence_next_ = 0;
     std::mutex work_mutex_;
 
     // Statistics
     PoolStats stats_;
     std::mutex stats_mutex_;
 
-    // Callbacks
+    // Callbacks. v1.4.1 C.3: protected by callbacks_mutex_ so that
+    // set_*_callback can race against an inbound message handler
+    // without tearing the function pointer, and so the dedup state
+    // (last_solution_pubkey_, last_work_id_fired_) is consistent
+    // across threads. Pre-1.4.1 the SOLUTION handler read
+    // solution_callback_ directly without a lock and called the
+    // callback inside the read; if a SOLUTION message arrived twice
+    // (server retry, bug, malicious replay) the callback fired twice,
+    // which on a privacy-sensitive pool would expose the recovered key
+    // to two writers (e.g., logged + filed twice).
     SolutionCallback solution_callback_;
-    WorkCallback work_callback_;
+    WorkCallback     work_callback_;
+    mutable std::mutex callbacks_mutex_;
+    std::array<uint8_t, 32> last_solution_pubkey_{};  // zero = none seen
+    bool     solution_fired_ = false;
+    uint64_t last_work_id_fired_ = std::numeric_limits<uint64_t>::max();
+    void fire_solution_callback(const uint8_t* pubkey_bytes);
+    void fire_work_callback(const WorkAssignment& work);
 
     // Receiver thread
     std::thread receiver_thread_;
@@ -312,7 +356,17 @@ private:
     // Wave 4 B-LOW-6 helper: safely (re)assign a std::thread by joining the
     // existing one if joinable. Plain `t = std::thread(...)` on a joinable
     // thread invokes std::terminate per [thread.thread.assign]/p2.
-    static void replace_thread(std::thread& t, std::thread new_thread);
+    //
+    // v1.4.1 P-T2: noexcept. The body catches every exception path
+    // (join's std::system_error, detach's std::system_error, anything
+    // else from std::cerr) and std::thread::operator= is itself
+    // noexcept per the standard, so the function never propagates an
+    // exception. Marking it noexcept lets the compiler tighten code
+    // generation in the reconnect-error path that called this --
+    // pre-1.4.1 the implicit "potentially-throwing" classification on
+    // a function used during error recovery is the kind of latent
+    // hazard that can cause std::terminate during cleanup.
+    static void replace_thread(std::thread& t, std::thread new_thread) noexcept;
 
     // Platform init
     static bool init_sockets();

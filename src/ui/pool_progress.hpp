@@ -5,7 +5,9 @@
  * pool backends (CUDA RCKangaroo, Apple Metal Kangaroo, CPU
  * KangarooSolver) print while running. Owns:
  *   - a baseline capture of pool-wide and worker-lifetime DP counts so
- *     the "Session share %" reflects this run rather than all-time
+ *     the worker's lifetime share is computed cumulatively (your_total /
+ *     pool_total) so a long-running worker sees their share rise as they
+ *     contribute more, and fall when more workers come online
  *     totals;
  *   - rate formatting that auto-picks units (KKeys / MKeys / GKeys /
  *     TKeys) based on magnitude, via collider::ui::format_rate;
@@ -78,18 +80,14 @@ public:
         }
         last_paint_ = now;
 
-        if (!baseline_captured_ && pool_total > 0) {
-            baseline_pool_dps_ = pool_total;
-            baseline_your_dps_ = your_total;
-            baseline_captured_ = true;
-        }
-        const uint64_t pool_delta = (pool_total > baseline_pool_dps_)
-            ? (pool_total - baseline_pool_dps_) : 0;
-        const uint64_t your_delta = (your_total > baseline_your_dps_)
-            ? (your_total - baseline_your_dps_) : 0;
-        const double share_pct = (pool_delta > 0)
-            ? (100.0 * static_cast<double>(your_delta)
-                      / static_cast<double>(pool_delta))
+        // v1.4.1: cumulative-lifetime share, not session delta. Operator
+        // wants their address's standing relative to the whole pool
+        // history. As more workers come online the value falls; as this
+        // worker contributes more it rises. Session deltas were
+        // misleading on freshly-restarted clients (briefly showed ~100%).
+        const double share_pct = (pool_total > 0)
+            ? (100.0 * static_cast<double>(your_total)
+                      / static_cast<double>(pool_total))
             : 0.0;
 
         const char* CY    = use_color_ ? "\033[36m" : "";
@@ -109,7 +107,7 @@ public:
                   << YE << "Sent:"         << RESET << " " << ProfessionalUI::format_number_short(sent_dps) << " | "
                   << CY << "Your total:"   << RESET << " " << ProfessionalUI::format_number_short(your_total) << " | "
                   << BL << "Pool total:"   << RESET << " " << ProfessionalUI::format_number_short(pool_total) << " | "
-                  << MA << "Session share:"<< RESET << " " << std::fixed << std::setprecision(1) << share_pct << "%";
+                  << MA << "Your share:"   << RESET << " " << std::fixed << std::setprecision(2) << share_pct << "%";
         if (use_repaint_) {
             std::cout << "  " << std::flush;
         } else {
@@ -121,9 +119,6 @@ private:
     static constexpr int kMinRepaintMs = 100;  // ~10 Hz max repaint rate
 
     std::chrono::steady_clock::time_point last_paint_{};
-    bool     baseline_captured_ = false;
-    uint64_t baseline_pool_dps_ = 0;
-    uint64_t baseline_your_dps_ = 0;
     bool     use_color_   = true;
     bool     use_repaint_ = true;
 };

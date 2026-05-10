@@ -35,8 +35,11 @@ static_assert(sizeof(jlp_wire::DistinguishedPoint) == 66,
 
 static_assert(sizeof(JLPDistinguishedPointV2) == sizeof(jlp_wire::DistinguishedPointV2),
               "DP v2 layout has diverged");
-static_assert(sizeof(jlp_wire::DistinguishedPointV2) == 74,
-              "DP v2 wire size is 74 by spec");
+// v1.4.1 B.1: bumped from 74 to 78 by adding a 4-byte LE sequence
+// field between work_id and x for per-(worker, work_id) replay
+// detection. See protocol/jlp.yaml DistinguishedPointV2 wire_size.
+static_assert(sizeof(jlp_wire::DistinguishedPointV2) == 78,
+              "DP v2 wire size is 78 by spec (post-1.4.1 B.1 sequence)");
 
 static_assert(sizeof(JLPServerConfig) == sizeof(jlp_wire::WorkAssignment),
               "WorkAssignment layout has diverged");
@@ -114,6 +117,9 @@ void test_header_layout() {
 void test_dp_v2_layout() {
     jlp_wire::DistinguishedPointV2 dp{};
     dp.work_id = 0x1122334455667788ULL;
+    // v1.4.1 B.1: sequence is a uint32 LE at offset 8, sliding x/d/
+    // type/dp_bits forward by 4 bytes (DP V2 wire is now 78 bytes).
+    dp.sequence = 0xDEADBEEFu;
     for (int i = 0; i < 32; ++i) dp.x[i] = static_cast<uint8_t>(i);
     for (int i = 0; i < 32; ++i) dp.d[i] = static_cast<uint8_t>(0x80 | i);
     dp.type = 1;
@@ -122,20 +128,26 @@ void test_dp_v2_layout() {
     uint8_t buf[sizeof(jlp_wire::DistinguishedPointV2)];
     std::memcpy(buf, &dp, sizeof(buf));
 
-    // work_id must be the first 8 bytes, little-endian
+    // work_id must be the first 8 bytes, little-endian.
     CHECK(buf[0] == 0x88 && buf[1] == 0x77 && buf[2] == 0x66 && buf[3] == 0x55 &&
           buf[4] == 0x44 && buf[5] == 0x33 && buf[6] == 0x22 && buf[7] == 0x11,
           "dp_v2 work_id position + endianness");
-    CHECK(buf[8] == 0x00 && buf[9] == 0x01, "dp_v2 x[] follows work_id");
-    CHECK(buf[40] == 0x80, "dp_v2 d[] follows x[]");
-    CHECK(buf[72] == 1, "dp_v2 type at offset 72");
-    CHECK(buf[73] == 24, "dp_v2 dp_bits at offset 73");
+    // sequence: 4 bytes LE between work_id and x (offsets 8..11).
+    CHECK(buf[8] == 0xEF && buf[9] == 0xBE && buf[10] == 0xAD && buf[11] == 0xDE,
+          "dp_v2 sequence position + endianness (v1.4.1 B.1)");
+    CHECK(buf[12] == 0x00 && buf[13] == 0x01, "dp_v2 x[] follows sequence");
+    CHECK(buf[44] == 0x80, "dp_v2 d[] follows x[]");
+    CHECK(buf[76] == 1, "dp_v2 type at offset 76");
+    CHECK(buf[77] == 24, "dp_v2 dp_bits at offset 77");
 }
 
 void test_legacy_to_generated_memcpy() {
-    // A legacy JLPDistinguishedPointV2 must be byte-equivalent.
+    // A legacy JLPDistinguishedPointV2 must be byte-equivalent to the
+    // codegen one. v1.4.1 B.1 added a sequence field on both sides
+    // (struct.pack '<QI32s32sBB'), so memcpy preserves all six fields.
     JLPDistinguishedPointV2 legacy{};
     legacy.work_id = 0x1122334455667788ULL;
+    legacy.sequence = 0xCAFEBABEu;
     for (int i = 0; i < 32; ++i) legacy.x[i] = static_cast<uint8_t>(i);
     for (int i = 0; i < 32; ++i) legacy.d[i] = static_cast<uint8_t>(0x80 | i);
     legacy.type = 1;
@@ -145,6 +157,7 @@ void test_legacy_to_generated_memcpy() {
     std::memcpy(&gen, &legacy, sizeof(gen));
 
     CHECK(gen.work_id == legacy.work_id, "memcpy preserves work_id");
+    CHECK(gen.sequence == legacy.sequence, "memcpy preserves sequence (v1.4.1 B.1)");
     CHECK(gen.type == legacy.type, "memcpy preserves type");
     CHECK(gen.dp_bits == legacy.dp_bits, "memcpy preserves dp_bits");
     CHECK(std::memcmp(gen.x, legacy.x, 32) == 0, "memcpy preserves x[]");

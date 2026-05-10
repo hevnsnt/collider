@@ -16,6 +16,8 @@
 #include <sstream>
 #include <iomanip>
 
+#include "box_render.hpp"
+
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -39,7 +41,7 @@ enum class OperationMode {
 struct BannerConfig {
     bool enable_animation = true;
     bool enable_color = true;
-    int animation_frames = 2;      // Number of full shine sweeps
+    int animation_frames = 1;      // Number of full shine sweeps (one is plenty; two doubled the perceived startup latency)
     int frame_delay_ms = 40;       // Delay between shine positions
     bool show_stats = true;
     OperationMode mode = OperationMode::UNKNOWN;
@@ -322,98 +324,75 @@ private:
     }
 
     /**
-     * Create context-aware status box.
+     * Create context-aware status box. Uses ui::box for consistent
+     * borders and alignment across long values (e.g. multi-GPU names).
      */
     std::string create_stats_box(const BannerStats& stats) {
+        namespace boxui = ::collider::ui::box;
         std::ostringstream out;
 
         out << "\n";
 
-        if (config_.enable_color) out << ansi::CYAN;
-        out << "  +---------------------------------------------------------------+\n";
+        const std::string color_open = config_.enable_color
+            ? std::string(boxui::ansi::CYAN) : std::string{};
+        const std::string color_label_white = config_.enable_color
+            ? std::string(boxui::ansi::BRIGHT_WHITE) : std::string{};
+        const std::string color_label_green = config_.enable_color
+            ? std::string(boxui::ansi::BRIGHT_GREEN) : std::string{};
+        const std::string color_label_yellow = config_.enable_color
+            ? std::string(boxui::ansi::BRIGHT_YELLOW) : std::string{};
+        const std::string color_label_magenta = config_.enable_color
+            ? std::string(boxui::ansi::BRIGHT_MAGENTA) : std::string{};
 
-        // Mode-specific header
-        out << "  |";
-        if (config_.enable_color) out << ansi::BRIGHT_WHITE;
+        if (!color_open.empty()) out << color_open;
+        boxui::top(out, '-');
 
+        // Mode-specific header (centered)
         std::string mode_text;
         switch (config_.mode) {
-            case OperationMode::PUZZLE_SEARCH:
-                mode_text = "  BITCOIN PUZZLE CHALLENGE";
-                break;
-            case OperationMode::BRAIN_WALLET:
-                mode_text = "  BRAIN WALLET RECOVERY";
-                break;
-            case OperationMode::BENCHMARK:
-                mode_text = "  PERFORMANCE BENCHMARK";
-                break;
-            default:
-                mode_text = "  SYSTEM STATUS";
-                break;
+            case OperationMode::PUZZLE_SEARCH: mode_text = "BITCOIN PUZZLE CHALLENGE"; break;
+            case OperationMode::BRAIN_WALLET:  mode_text = "BRAIN WALLET RECOVERY";    break;
+            case OperationMode::BENCHMARK:     mode_text = "PERFORMANCE BENCHMARK";    break;
+            default:                           mode_text = "SYSTEM STATUS";            break;
         }
-        out << std::left << std::setw(62) << mode_text;
-        if (config_.enable_color) out << ansi::CYAN;
-        out << "|\n";
-        out << "  +---------------------------------------------------------------+\n";
+        boxui::centered(out, mode_text, color_label_white);
+        boxui::sep(out);
 
-        // Hardware line - show what's actually being used
-        out << "  |  ";
-        if (config_.enable_color) out << ansi::BRIGHT_GREEN;
-        out << "Hardware";
-        if (config_.enable_color) out << ansi::RESET << ansi::CYAN;
-        out << ": ";
-
+        // Hardware line. Long multi-GPU strings auto-truncate with "...".
         std::string hw_info;
-        if (stats.backend == "CUDA") {
-            hw_info = "CUDA - " + stats.gpu_names;
-        } else if (stats.backend == "Metal") {
-            hw_info = "Metal - " + stats.gpu_names;
-        } else {
-            hw_info = "CPU (reference mode)";
-        }
-        out << std::left << std::setw(48) << hw_info << "|\n";
+        if      (stats.backend == "CUDA")  hw_info = "CUDA - "  + stats.gpu_names;
+        else if (stats.backend == "Metal") hw_info = "Metal - " + stats.gpu_names;
+        else                               hw_info = "CPU (reference mode)";
+        boxui::kv(out, "Hardware", hw_info, color_label_green);
 
         // Speed estimate
         if (stats.estimated_speed > 0) {
-            out << "  |  ";
-            if (config_.enable_color) out << ansi::BRIGHT_YELLOW;
-            out << "Speed";
-            if (config_.enable_color) out << ansi::RESET << ansi::CYAN;
-            out << ":    " << std::left << std::setw(48)
-                << format_rate(static_cast<double>(stats.estimated_speed)) << "|\n";
+            boxui::kv(out, "Speed",
+                      format_rate(static_cast<double>(stats.estimated_speed)),
+                      color_label_yellow);
         }
 
         // Mode-specific info
         if (config_.mode == OperationMode::PUZZLE_SEARCH && stats.puzzle_number > 0) {
-            out << "  |  ";
-            if (config_.enable_color) out << ansi::BRIGHT_MAGENTA;
-            out << "Target";
-            if (config_.enable_color) out << ansi::RESET << ansi::CYAN;
-
             std::ostringstream puzzle_info;
             puzzle_info << "Puzzle #" << stats.puzzle_number << " (" << stats.puzzle_bits << "-bit";
             if (stats.puzzle_reward > 0) {
-                puzzle_info << ", " << std::fixed << std::setprecision(1) << stats.puzzle_reward << " BTC";
+                puzzle_info << ", " << std::fixed << std::setprecision(1)
+                            << stats.puzzle_reward << " BTC";
             }
             puzzle_info << ")";
-            out << ":   " << std::left << std::setw(48) << puzzle_info.str() << "|\n";
+            boxui::kv(out, "Target", puzzle_info.str(), color_label_magenta);
         } else if (config_.mode == OperationMode::BRAIN_WALLET && !stats.bloom_file.empty()) {
-            out << "  |  ";
-            if (config_.enable_color) out << ansi::BRIGHT_MAGENTA;
-            out << "Bloom";
-            if (config_.enable_color) out << ansi::RESET << ansi::CYAN;
-
             std::string bloom_info = stats.bloom_file;
             if (stats.bloom_entries > 0) {
                 bloom_info += " (" + std::to_string(stats.bloom_entries / 1'000'000) + "M)";
             }
-            out << ":    " << std::left << std::setw(48) << bloom_info << "|\n";
+            boxui::kv(out, "Bloom", bloom_info, color_label_magenta);
         }
 
-        out << "  +---------------------------------------------------------------+\n";
+        boxui::bottom(out, '-');
 
-        if (config_.enable_color) out << ansi::RESET;
-
+        if (config_.enable_color) out << boxui::ansi::RESET;
         return out.str();
     }
 
@@ -644,14 +623,11 @@ public:
      * Render a "Found!" celebration banner.
      */
     static void render_found_banner(const std::string& what = "KEY FOUND") {
+        namespace boxui = ::collider::ui::box;
         std::cout << "\n";
-        std::cout << ansi::BRIGHT_GREEN;
-        std::cout << "+" << std::string(62, '=') << "+\n";
-        int padding = (62 - static_cast<int>(what.length())) / 2;
-        std::cout << "|" << std::string(padding, ' ') << what
-                  << std::string(62 - padding - static_cast<int>(what.length()), ' ') << "|\n";
-        std::cout << "+" << std::string(62, '=') << "+\n";
-        std::cout << ansi::RESET;
+        boxui::top(std::cout);
+        boxui::centered(std::cout, what, boxui::ansi::BRIGHT_GREEN);
+        boxui::bottom(std::cout);
     }
 
     /**

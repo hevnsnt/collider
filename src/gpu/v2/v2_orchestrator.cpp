@@ -95,7 +95,12 @@ bool hex_to_bytes_be(std::string_view hex, uint8_t out[32]) {
 //   - top-level object
 //   - one array under "puzzles" or "solve_history"
 //   - each entry an object with string/number fields
-// Comments not allowed; unicode escapes not handled.
+// Comments not allowed; supports the standard JSON string escapes
+// including \uXXXX (BMP code points; surrogate pairs concatenated to
+// form non-BMP characters before UTF-8 emission). v1.4.1 C.4 added the
+// escape handling -- pre-1.4.1 the captured string body was returned
+// verbatim, which silently mis-rendered any operator-authored entry
+// that used a \\u escape (e.g. "\\u00ad" appearing in a key field).
 // ---------------------------------------------------------------------------
 
 class TinyJson {
@@ -212,8 +217,118 @@ next_object:;
         }
     }
 
+    // v1.4.1 C.4: decode the standard JSON string escapes.
+    //
+    // \\, \", \/  -> the literal char.
+    // \b \f \n \r \t -> the corresponding control byte.
+    // \uXXXX -> UTF-8 encoding of the BMP code point. A high-surrogate
+    //           (0xD800-0xDBFF) immediately followed by \uXXXX with a
+    //           low-surrogate (0xDC00-0xDFFF) is combined into a non-
+    //           BMP code point and emitted as a 4-byte UTF-8 sequence.
+    //           Lone surrogates emit their replacement character so we
+    //           never produce invalid UTF-8.
+    //
+    // Returns false on any malformed escape (e.g. \\uXY with non-hex
+    // digits) so callers can surface a parse error rather than silently
+    // mis-render the string.
+    static bool decode_string_escapes(std::string_view raw, std::string& out) {
+        auto hex_nibble = [](char c, int& v) {
+            if (c >= '0' && c <= '9') { v = c - '0'; return true; }
+            if (c >= 'a' && c <= 'f') { v = 10 + (c - 'a'); return true; }
+            if (c >= 'A' && c <= 'F') { v = 10 + (c - 'A'); return true; }
+            return false;
+        };
+        auto emit_utf8 = [&](uint32_t cp) {
+            if (cp < 0x80) {
+                out.push_back(static_cast<char>(cp));
+            } else if (cp < 0x800) {
+                out.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+                out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+            } else if (cp < 0x10000) {
+                out.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+                out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+                out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+            } else {
+                out.push_back(static_cast<char>(0xF0 | (cp >> 18)));
+                out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+                out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+                out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+            }
+        };
+        auto parse_u4 = [&](size_t& i, uint32_t& cp_out) -> bool {
+            if (i + 4 > raw.size()) return false;
+            uint32_t cp = 0;
+            for (int k = 0; k < 4; ++k) {
+                int v;
+                if (!hex_nibble(raw[i + k], v)) return false;
+                cp = (cp << 4) | static_cast<uint32_t>(v);
+            }
+            i += 4;
+            cp_out = cp;
+            return true;
+        };
+        out.clear();
+        out.reserve(raw.size());
+        size_t i = 0;
+        while (i < raw.size()) {
+            const char c = raw[i];
+            if (c != '\\') { out.push_back(c); ++i; continue; }
+            if (i + 1 >= raw.size()) return false;
+            const char esc = raw[i + 1];
+            i += 2;
+            switch (esc) {
+                case '"':  out.push_back('"');  break;
+                case '\\': out.push_back('\\'); break;
+                case '/':  out.push_back('/');  break;
+                case 'b':  out.push_back('\b'); break;
+                case 'f':  out.push_back('\f'); break;
+                case 'n':  out.push_back('\n'); break;
+                case 'r':  out.push_back('\r'); break;
+                case 't':  out.push_back('\t'); break;
+                case 'u': {
+                    uint32_t cp = 0;
+                    if (!parse_u4(i, cp)) return false;
+                    if (cp >= 0xD800 && cp <= 0xDBFF) {
+                        // High surrogate; expect immediately following \\uXXXX low surrogate.
+                        if (i + 2 <= raw.size() && raw[i] == '\\' && raw[i + 1] == 'u') {
+                            i += 2;
+                            uint32_t low = 0;
+                            if (!parse_u4(i, low)) return false;
+                            if (low >= 0xDC00 && low <= 0xDFFF) {
+                                cp = 0x10000
+                                   + ((cp - 0xD800) << 10)
+                                   + (low - 0xDC00);
+                                emit_utf8(cp);
+                                break;
+                            }
+                            // Low not a low-surrogate: emit replacement
+                            // for the high surrogate and re-emit the
+                            // non-low \\u as itself.
+                            emit_utf8(0xFFFD);
+                            emit_utf8(low);
+                            break;
+                        }
+                        emit_utf8(0xFFFD);  // lone high surrogate
+                        break;
+                    }
+                    if (cp >= 0xDC00 && cp <= 0xDFFF) {
+                        emit_utf8(0xFFFD);  // lone low surrogate
+                        break;
+                    }
+                    emit_utf8(cp);
+                    break;
+                }
+                default:
+                    return false;  // unrecognized escape
+            }
+        }
+        return true;
+    }
+
     // Get a string-typed field's value (without surrounding quotes).
-    // Returns false if not found or not a string.
+    // Returns false if not found, not a string, or contains a malformed
+    // escape -- callers surface a parse error rather than silently
+    // mis-render.
     static bool get_string(std::string_view obj, std::string_view key,
                            std::string& out) {
         const std::string needle = "\"" + std::string(key) + "\"";
@@ -233,8 +348,8 @@ next_object:;
             ++i;
         }
         if (i >= obj.size()) return false;
-        out.assign(obj.data() + v_start, i - v_start);
-        return true;
+        std::string_view raw(obj.data() + v_start, i - v_start);
+        return decode_string_escapes(raw, out);
     }
 
     // Get a number-typed field. Accepts decimal int.

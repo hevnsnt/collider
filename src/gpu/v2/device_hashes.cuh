@@ -18,6 +18,8 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
+#include "../hash_rounds.cuh"
+
 namespace collider {
 namespace gpu {
 namespace v2 {
@@ -43,8 +45,13 @@ namespace device {
 __device__ __constant__ static const uint32_t kSha256_K[64] =
     COLLIDER_SHA256_K_INIT;
 
+// SHA-256 right-rotate: forward to the canonical primitive in
+// hash_rounds.cuh. Kept as a TU-local alias (rather than a using-decl)
+// because this is a header -- a using inside the header would leak the
+// name into every TU that includes it. The sha512_rotr below is a
+// distinct 64-bit primitive and stays local.
 __device__ __forceinline__ uint32_t sha256_rotr(uint32_t x, int n) {
-    return (x >> n) | (x << (32 - n));
+    return ::collider::gpu::sha256::rotr(x, n);
 }
 
 // `__noinline__` for the same reason as sha512_compress below: the W[64]

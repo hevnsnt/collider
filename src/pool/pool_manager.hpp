@@ -129,7 +129,9 @@ private:
 
     static constexpr uint32_t kMaxReconnectAttempts = 16;
     static constexpr uint32_t kInitialBackoffMs     = 1000;
-    static constexpr uint32_t kMaxBackoffMs         = 60000;
+    // The cap on reconnect backoff lives in pool_config.hpp as
+    // MAX_RECONNECT_BACKOFF_MS, shared with JLPPoolClient so the two
+    // reconnect paths can never disagree on the upper bound.
 
     void start_supervisor();
     void stop_supervisor();

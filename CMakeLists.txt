@@ -345,6 +345,33 @@ set(CORE_SOURCES
     src/core/kangaroo_backend_factory.cpp
     src/generators/passphrase_generator.cpp
     src/generators/priority_queue.cpp
+    # v1.4.1 A.3: CLI argument parsing extracted from main.cpp so the
+    # runtime drivers and the tests/test_cli_parser target can share a
+    # single source of truth for Arguments / parse_args / print_usage.
+    src/cli/cli_parser.cpp
+    # v1.4.1 A.3: top-level interactive flow (banner + main menu + per-mode
+    # submenus + Windows ANSI enabler) extracted from main.cpp. The brain
+    # wallet submenu inside is gated on COLLIDER_PRO at the call-site, but
+    # the file itself compiles in both editions.
+    src/ui/interactive_ui.cpp
+    # v1.4.1 A.3: pool-mode runtime driver extracted from main.cpp. Free +
+    # Pro both build it; the bloom-filter feature inside is #ifdef-gated.
+    src/runtime/pool_solver.cpp
+    # v1.4.1 A.3 (5/6): puzzle-mode + benchmark runtime drivers extracted
+    # from main.cpp. Available in BOTH Free and Pro builds; the brain-wallet
+    # benchmark variant inside is gated by #ifdef COLLIDER_PRO at the call
+    # site (Pro-only includes from gpu/brain_wallet_gpu.hpp). The Free path
+    # uses the CPU + Metal/CUDA SHA-256 benchmark with no Pro symbols.
+    src/runtime/puzzle_solver.cpp
+    # v1.4.1 A.3 (6/6): GPU detection helper extracted from main.cpp so
+    # the dispatcher (main.cpp) and the runtime drivers can both link
+    # against detect_gpus() without main.cpp owning the body.
+    src/runtime/gpu_detection.cpp
+    # v1.4.1 UI: live BTC balance lookup against mempool.space for the
+    # solved-puzzle banner. libcurl-gated -- if CURL_FOUND was false at
+    # configure time, the function returns nullopt and the banner shows
+    # "balance unavailable (offline)".
+    src/ui/btc_balance.cpp
 )
 
 # Free-licensed Metal SHA-256 benchmark (Mac only). Available in BOTH
@@ -369,6 +396,32 @@ if(APPLE AND COLLIDER_USE_METAL
     if(EXISTS "${CMAKE_SOURCE_DIR}/src/gpu/metal_kangaroo_backend.mm")
         list(APPEND CORE_SOURCES src/gpu/metal_kangaroo_backend.mm)
         set_source_files_properties(src/gpu/metal_kangaroo_backend.mm
+            PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+    endif()
+    # v1.4.1: Metal-backed MultiGPUKangarooManager for standalone puzzle
+    # solving. Pre-1.4.1 the standalone path's MultiGPU class was a
+    # no-CUDA stub on Mac that returned false from init() and silently
+    # fell back to CPU kangaroo. This file implements the full surface
+    # on top of KangarooMetalSolver with host-side collision detection.
+    if(EXISTS "${CMAKE_SOURCE_DIR}/src/gpu/metal_multi_gpu_kangaroo.mm")
+        list(APPEND CORE_SOURCES src/gpu/metal_multi_gpu_kangaroo.mm)
+        set_source_files_properties(src/gpu/metal_multi_gpu_kangaroo.mm
+            PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+    endif()
+    # v1.4.1: Metal-backed brute-force puzzle solver. Pre-1.4.1 the Mac
+    # build of `collider --puzzle N` (no --kangaroo) hit the no-CUDA stub
+    # of MultiGPUPuzzleSolver and silently fell back to the CPU reference
+    # at ~30 KKeys/s. puzzle_metal.mm is the per-device dispatcher;
+    # metal_multi_gpu_puzzle.mm bridges it to the MultiGPUPuzzleSolver
+    # surface that puzzle_solver.cpp consumes.
+    if(EXISTS "${CMAKE_SOURCE_DIR}/src/gpu/puzzle_metal.mm")
+        list(APPEND CORE_SOURCES src/gpu/puzzle_metal.mm)
+        set_source_files_properties(src/gpu/puzzle_metal.mm
+            PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+    endif()
+    if(EXISTS "${CMAKE_SOURCE_DIR}/src/gpu/metal_multi_gpu_puzzle.mm")
+        list(APPEND CORE_SOURCES src/gpu/metal_multi_gpu_puzzle.mm)
+        set_source_files_properties(src/gpu/metal_multi_gpu_puzzle.mm
             PROPERTIES COMPILE_FLAGS "-fobjc-arc")
     endif()
     # Bake the MSL source into a generated C++ header so neither the
@@ -404,6 +457,21 @@ if(APPLE AND COLLIDER_USE_METAL
             "${CMAKE_BINARY_DIR}/generated"
             CACHE INTERNAL "Generated kangaroo MSL header dir")
     endif()
+    # Same embedding pattern for the puzzle MSL source. The .h.in template
+    # at cmake/puzzle_metal_source.h.in is a near-clone of the kangaroo
+    # one; intentionally separate so a future refactor can change one
+    # without touching the other.
+    if(EXISTS "${CMAKE_SOURCE_DIR}/src/gpu/puzzle.metal")
+        set(_puzzle_metal_src "${CMAKE_SOURCE_DIR}/src/gpu/puzzle.metal")
+        set(_puzzle_metal_hdr "${CMAKE_BINARY_DIR}/generated/puzzle_metal_source.h")
+        file(READ "${_puzzle_metal_src}" PUZZLE_METAL_SOURCE_BODY)
+        configure_file(
+            "${CMAKE_SOURCE_DIR}/cmake/puzzle_metal_source.h.in"
+            "${_puzzle_metal_hdr}"
+            @ONLY)
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+                     "${_puzzle_metal_src}")
+    endif()
 endif()
 
 # Pro-only host-side sources for the brain wallet pipeline.
@@ -411,6 +479,20 @@ endif()
 # the file simply is not handed to the compiler).
 if(COLLIDER_PRO)
     list(APPEND CORE_SOURCES src/gpu/brain_wallet_gpu.cpp)
+    # v1.4.1 C.1/C.2: pimpl bodies for the brain-wallet generators. Both
+    # headers are #include'd from main.cpp only inside its COLLIDER_PRO
+    # block; the .cpp companions match that gating so the free build
+    # never compiles them.
+    list(APPEND CORE_SOURCES src/generators/streaming_brain_wallet.cpp)
+    list(APPEND CORE_SOURCES src/generators/brain_wallet_engine.cpp)
+    # v1.4.1 A.3: brain wallet runtime driver extracted from main.cpp.
+    # Whole TU is COLLIDER_PRO-gated; the file itself wraps everything
+    # in #ifdef COLLIDER_PRO defense-in-depth.
+    list(APPEND CORE_SOURCES src/runtime/brain_wallet_runner.cpp)
+    # v1.4.1 A.3 (6/6): pre-dispatch license activation + startup
+    # validation. PRO-only because the underlying license/license_check.hpp
+    # is PRO-only; the .cpp wraps everything in #ifdef COLLIDER_PRO too.
+    list(APPEND CORE_SOURCES src/runtime/license_gate.cpp)
     # gpu_rules.cpp is fully #ifdef-guarded; on non-CUDA backends it
     # provides stub implementations of GPURuleEngine that return false /
     # 0 / "". Without it, main.cpp's references to GPURuleEngine fail to
@@ -450,6 +532,13 @@ if(CORE_SOURCES)
         Threads::Threads
     )
     target_include_directories(collider_core PUBLIC ${XXHASH_INCLUDE_DIR})
+    # v1.4.1 UI: btc_balance.cpp uses libcurl when available. Define
+    # COLLIDER_HAVE_CURL=1 so the header's #ifdef chooses the live
+    # mempool.space code path; otherwise the stub returns nullopt.
+    if(CURL_FOUND)
+        target_link_libraries(collider_core CURL::libcurl)
+        target_compile_definitions(collider_core PRIVATE COLLIDER_HAVE_CURL=1)
+    endif()
     if(KANGAROO_METAL_GENERATED_INCLUDE_DIR)
         target_include_directories(collider_core PUBLIC
             ${KANGAROO_METAL_GENERATED_INCLUDE_DIR})
@@ -596,7 +685,14 @@ if(COLLIDER_BACKEND STREQUAL "CUDA")
         src/gpu/sha256.cu
         src/gpu/secp256k1.cu
         src/gpu/ripemd160.cu
-        src/gpu/bloom_filter.cu
+        # v1.4.1 BW-DEDUP-3: bloom_filter.cu (impl A, double-hash on
+        # raw bytes) was deleted in favour of h160_bloom_filter.cu
+        # (impl B, MurmurHash3) which matches build_bloom's .blf
+        # format. Bench picked B-texture as winner (3.29x on Ampere
+        # 3060). See docs/v1.4.1-mod-inv-audit.md for the parallel
+        # decision on mod_inv (kept multiple impls there because of
+        # algorithmic divergence; bloom impls were genuinely
+        # interchangeable so consolidation made sense).
         src/gpu/h160_bloom_filter.cu
         src/gpu/pipeline.cu
         src/gpu/fused_pipeline.cu
@@ -962,6 +1058,28 @@ if(COLLIDER_BUILD_TESTS)
         set_tests_properties(MetalKangarooSmoke PROPERTIES SKIP_RETURN_CODE 77)
     endif()
 
+    # Metal fused puzzle pipeline KAT (v1.4.1). Runs privkey=1 / privkey=2
+    # through the puzzle_search kernel and checks the recovered hash160
+    # matches the published Bitcoin puzzle 1 / 2 vectors. A passing run
+    # validates EC scalar mul, mod_inv, compress, SHA-256, RIPEMD-160,
+    # and the compare-and-CAS logic end-to-end. Returns 77 if no Metal
+    # device is present; ctest is configured with SKIP_RETURN_CODE=77.
+    if(APPLE AND COLLIDER_USE_METAL
+       AND EXISTS "${CMAKE_SOURCE_DIR}/tests/test_metal_puzzle_kat.mm"
+       AND EXISTS "${CMAKE_SOURCE_DIR}/src/gpu/puzzle_metal.mm")
+        add_executable(test_metal_puzzle_kat
+            tests/test_metal_puzzle_kat.mm)
+        set_source_files_properties(tests/test_metal_puzzle_kat.mm
+            PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+        target_link_libraries(test_metal_puzzle_kat
+            collider_core
+            ${METAL_LIBRARY} ${FOUNDATION_LIBRARY})
+        target_include_directories(test_metal_puzzle_kat
+            PRIVATE ${CMAKE_SOURCE_DIR}/src)
+        add_test(NAME MetalPuzzleKAT COMMAND test_metal_puzzle_kat)
+        set_tests_properties(MetalPuzzleKAT PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+
     # Brain Wallet v2 host-side orchestrator test (Phase 9 follow-up).
     # Pure C++ test; we link collider_gpu too because v2_orchestrator.cpp
     # (compiled into collider_core) references kernels from collider_gpu
@@ -1244,6 +1362,14 @@ if(COLLIDER_BUILD_BENCHMARKS AND COLLIDER_BACKEND STREQUAL "CUDA")
             CUDA::cudart
         )
     endif()
+
+    # v1.4.1 BW-DEDUP-3: bench_bloom_ab.cu was used to pick between
+    # the two bloom impls. After the verdict (B-texture wins), the
+    # losing impl was deleted and the bench retired -- its purpose
+    # is served. A future B-global-vs-B-texture bench would be a
+    # different harness (h160_bloom_filter.cu has no CUDA insert
+    # wrapper, so the throughput-only comparison would look quite
+    # different).
 endif()
 
 # ============================================================================

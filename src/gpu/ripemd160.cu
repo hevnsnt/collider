@@ -7,8 +7,18 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 
+#include "ripemd160_device.cuh"
+
 namespace collider {
 namespace gpu {
+
+// v1.4.1 D.2: round primitives now live in ripemd160_device.cuh.
+using collider::gpu::ripemd160::rotl;
+using collider::gpu::ripemd160::f0;
+using collider::gpu::ripemd160::f1;
+using collider::gpu::ripemd160::f2;
+using collider::gpu::ripemd160::f3;
+using collider::gpu::ripemd160::f4;
 
 // RIPEMD160 constants
 static __constant__ uint32_t KL[5] = {
@@ -59,32 +69,6 @@ static __constant__ int SR[80] = {
 static __constant__ uint32_t RIPEMD160_H0[5] = {
     0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0
 };
-
-// Bit rotation
-__device__ __forceinline__ uint32_t rotl(uint32_t x, int n) {
-    return (x << n) | (x >> (32 - n));
-}
-
-// Boolean functions
-__device__ __forceinline__ uint32_t f0(uint32_t x, uint32_t y, uint32_t z) {
-    return x ^ y ^ z;
-}
-
-__device__ __forceinline__ uint32_t f1(uint32_t x, uint32_t y, uint32_t z) {
-    return (x & y) | (~x & z);
-}
-
-__device__ __forceinline__ uint32_t f2(uint32_t x, uint32_t y, uint32_t z) {
-    return (x | ~y) ^ z;
-}
-
-__device__ __forceinline__ uint32_t f3(uint32_t x, uint32_t y, uint32_t z) {
-    return (x & z) | (y & ~z);
-}
-
-__device__ __forceinline__ uint32_t f4(uint32_t x, uint32_t y, uint32_t z) {
-    return x ^ (y | ~z);
-}
 
 /**
  * RIPEMD160 hash of a 32-byte input (SHA256 output).

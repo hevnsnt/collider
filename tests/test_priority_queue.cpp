@@ -9,6 +9,8 @@
 #include <cassert>
 #include <chrono>
 #include <random>
+#include <set>
+#include <string>
 
 using namespace collider;
 
@@ -239,6 +241,58 @@ void test_performance() {
               << "pop all in " << pop_ms << "ms\n";
 }
 
+// v1.4.1 BW-B4: generate_variations now routes through the hashcat-compatible
+// RuleEngine instead of baked-in case/digit/swap loops. These tests pin the
+// behavior the brain wallet feedback loop depends on:
+//   1. enough distinct outputs for the feedback queue to be worth populating
+//   2. every output is a non-empty ASCII-printable string (no junk)
+//   3. the original passphrase is included (the ":" identity rule)
+//   4. leetspeak coverage exists (the missing pre-1.4.1 case)
+void test_feedback_variations_size_and_quality() {
+    auto variations = CandidatePriorityQueue::generate_variations("password");
+
+    // Quality: every output is non-empty and ASCII-printable.
+    for (const auto& v : variations) {
+        assert(!v.empty());
+        for (unsigned char c : v) {
+            // 0x20..0x7E covers space + visible ASCII.
+            assert(c >= 0x20 && c <= 0x7E);
+        }
+    }
+
+    // Distinctness: at least 5 distinct outputs (we emit ~22 rules, but
+    // dedup may collapse some; 5 is a generous floor that still catches
+    // a regression where the rule list is empty).
+    std::set<std::string> distinct(variations.begin(), variations.end());
+    assert(distinct.size() >= 5);
+
+    // Identity: the cracked passphrase itself MUST be in the output.
+    // The feedback queue depends on the original being re-tried after a
+    // hint surfaces (e.g. workers who started after the crack).
+    assert(distinct.count("password") == 1);
+
+    std::cout << "[PASS] Feedback variations size+quality (" << distinct.size()
+              << " distinct from 'password')\n";
+}
+
+void test_feedback_variations_leetspeak_and_digits() {
+    // Verify the rule engine actually wired through: leetspeak swaps and
+    // digit-append behavior the pre-1.4.1 inline loop did not produce.
+    auto variations = CandidatePriorityQueue::generate_variations("password");
+    std::set<std::string> distinct(variations.begin(), variations.end());
+
+    // sa@ should swap a -> @
+    assert(distinct.count("p@ssword") == 1);
+    // so0 should swap o -> 0
+    assert(distinct.count("passw0rd") == 1);
+    // ss5 should swap s -> 5
+    assert(distinct.count("pa55word") == 1);
+    // $1 should append "1"
+    assert(distinct.count("password1") == 1);
+
+    std::cout << "[PASS] Feedback variations leetspeak + digit-append\n";
+}
+
 int main() {
     std::cout << "=== Priority Queue Tests ===\n\n";
 
@@ -250,6 +304,8 @@ int main() {
     test_source_learning();
     test_bloom_filter();
     test_performance();
+    test_feedback_variations_size_and_quality();
+    test_feedback_variations_leetspeak_and_digits();
 
     std::cout << "\n=== All Tests Passed ===\n";
     return 0;

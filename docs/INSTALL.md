@@ -1,560 +1,378 @@
 # Installation Guide
 
-This guide covers building and installing thePuzzler on Linux, Windows, and macOS.
+This guide covers building theCollider from source on Linux, Windows, and macOS. For prebuilt binaries see the [GitHub Releases page](https://github.com/hevnsnt/collider/releases).
+
+This document covers the **free** edition. **(PRO VERSION ONLY)** builds are issued per-license to paying customers; see [collisionprotocol.com/pro](https://collisionprotocol.com/pro).
 
 ---
 
 ## Table of Contents
 
 - [Prerequisites](#prerequisites)
-- [Linux Installation](#linux-installation)
-- [Windows Installation](#windows-installation)
-- [macOS Installation](#macos-installation)
+- [Linux](#linux)
+- [Windows](#windows)
+- [macOS](#macos)
 - [Build Options](#build-options)
-- [Post-Installation Setup](#post-installation-setup)
+- [Verifying the Build](#verifying-the-build)
 - [Troubleshooting](#troubleshooting)
 
 ---
 
 ## Prerequisites
 
-### All Platforms
+### All platforms
 
-| Requirement | Version | Notes |
-|-------------|---------|-------|
-| CMake | 3.20+ | Build system |
-| Git | 2.0+ | Source control |
-| C++ Compiler | C++20 support | GCC 10+, Clang 12+, MSVC 2019+ |
+| Requirement  | Version       | Notes                                     |
+| ------------ | ------------- | ----------------------------------------- |
+| CMake        | 3.20 or newer | Build system                              |
+| Git          | any           | Source checkout                           |
+| C++ compiler | C++20         | MSVC 2022, GCC 11+, or Apple Clang 14+    |
+| Ninja        | recommended   | Faster builds than Make on every platform |
 
-### GPU Requirements
+### GPU backends
+
+theCollider auto-detects one of three backends. Auto-detection runs in this order:
+
+1. **Metal** on Apple Silicon (macOS arm64).
+2. **CUDA** on Linux or Windows when the CUDA Toolkit is found.
+3. **CPU** fallback (slow; correctness only).
 
 **NVIDIA (CUDA backend):**
-- NVIDIA GPU with Compute Capability 6.0 or higher
-- CUDA Toolkit 11.0 or newer (12.x recommended)
-- Latest NVIDIA drivers
+
+- NVIDIA GPU with Compute Capability 7.5 or higher (Turing or newer).
+- CUDA Toolkit 12.x. The codebase targets `--use_fast_math`, lambda-in-device support, and relaxed-constexpr; toolkits older than 12.0 will not compile every kernel.
+- Latest stable NVIDIA driver for your CUDA version.
 
 **Apple Silicon (Metal backend):**
-- Apple M1, M2, M3, or newer
-- macOS 12.0 (Monterey) or newer
-- Xcode Command Line Tools
 
-### Recommended Hardware
+- Apple M1, M2, M3, or M4 (any tier).
+- macOS 13 or newer (the Metal API surface used by the Jacobian kangaroo rewrite is 13+).
+- Xcode Command Line Tools (`xcode-select --install`).
 
-| Configuration | GPU | VRAM | System RAM |
-|---------------|-----|------|------------|
-| Minimum | GTX 1060 | 6 GB | 16 GB |
-| Recommended | RTX 3080 | 10 GB | 32 GB |
-| Optimal | RTX 4090 | 24 GB | 64 GB |
-| Multi-GPU | 4x RTX 4090/5090 | 96 GB+ | 128 GB |
+Intel Macs with eGPUs are **not supported**. Apple Silicon only.
 
 ---
 
-## Linux Installation
+## Linux
 
-### Step 1: Install System Dependencies
+### Step 1: install system dependencies
 
-**Ubuntu/Debian:**
+**Ubuntu / Debian:**
+
 ```bash
 sudo apt update
-sudo apt install -y build-essential cmake git libssl-dev
+sudo apt install -y build-essential cmake ninja-build git libssl-dev
 ```
 
-**Fedora/RHEL:**
+**Fedora / RHEL:**
+
 ```bash
-sudo dnf install -y gcc-c++ cmake git openssl-devel
+sudo dnf install -y gcc-c++ cmake ninja-build git openssl-devel
 ```
 
 **Arch Linux:**
+
 ```bash
-sudo pacman -S base-devel cmake git openssl
+sudo pacman -S base-devel cmake ninja git openssl
 ```
 
-### Step 2: Install CUDA Toolkit
+### Step 2: install CUDA Toolkit
 
-**Option A: Package Manager (Ubuntu/Debian)**
+**Option A: NVIDIA repository (Ubuntu / Debian).**
+
 ```bash
-# Add NVIDIA package repository
 wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
 sudo dpkg -i cuda-keyring_1.1-1_all.deb
 sudo apt update
-
-# Install CUDA Toolkit
 sudo apt install -y cuda-toolkit-12-4
 ```
 
-**Option B: NVIDIA Website**
+**Option B: NVIDIA installer.** Download from <https://developer.nvidia.com/cuda-downloads> and follow the on-screen instructions.
 
-1. Visit https://developer.nvidia.com/cuda-downloads
-2. Select your Linux distribution
-3. Download and run the installer
-4. Follow the on-screen instructions
+Verify:
 
-**Verify CUDA Installation:**
 ```bash
 nvcc --version
 nvidia-smi
 ```
 
-Expected output:
-```
-nvcc: NVIDIA (R) Cuda compiler driver
-Copyright (c) 2005-2024 NVIDIA Corporation
-Built on ...
-Cuda compilation tools, release 12.4, V12.4.xxx
-```
-
-### Step 3: Clone and Build
+### Step 3: clone and build
 
 ```bash
-# Clone the repository
-git clone https://github.com/yourusername/thepuzzler.git
-cd thepuzzler
+git clone https://github.com/hevnsnt/collider.git
+cd collider
 
-# Create build directory
-mkdir build && cd build
-
-# Configure with CMake
-cmake .. -DCMAKE_BUILD_TYPE=Release
-
-# Build (use all available cores)
-make -j$(nproc)
-
-# Verify build
-./thepuzzler --version
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
 ```
 
-**Expected CMake output:**
-```
--- Detected NVIDIA CUDA
--- CUDA Version: 12.4
--- Compiling for CUDA architectures: 60;70;75;80;86;89;90
--- thePuzzler backend: CUDA
--- Configuring done
--- Build files have been written to: .../thepuzzler/build
-```
-
-### Step 4: Install (Optional)
+To target a single CUDA architecture for faster compile times:
 
 ```bash
-# Install to system (requires sudo)
-sudo make install
-
-# Or install to user directory
-cmake .. -DCMAKE_INSTALL_PREFIX=$HOME/.local
-make install
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="89"
+cmake --build build --parallel
 ```
 
-### Step 5: Run Tests
+The default architecture list is `86;89;100` (Ampere, Ada, Blackwell).
+
+Output: `build/collider`.
+
+### Step 4: run the test suite
 
 ```bash
-# Run the test suite
+cd build
 ctest --output-on-failure
-
-# Run a quick benchmark
-./thepuzzler --benchmark
 ```
 
 ---
 
-## Windows Installation
+## Windows
 
-### Step 1: Install Visual Studio
+### Step 1: install Visual Studio
 
-1. Download Visual Studio 2019 or 2022 from https://visualstudio.microsoft.com/
-2. Run the installer
-3. Select "Desktop development with C++" workload
-4. Ensure these components are selected:
-   - MSVC v143 (or v142) C++ build tools
-   - Windows 10/11 SDK
-   - C++ CMake tools for Windows
+Install Visual Studio 2022 (Community or Build Tools) with the **Desktop development with C++** workload. Required components:
 
-### Step 2: Install CUDA Toolkit
+- MSVC v143 build tools.
+- Windows 10 / 11 SDK.
+- C++ CMake tools for Windows.
 
-1. Visit https://developer.nvidia.com/cuda-downloads
-2. Select Windows, your version (10 or 11), and exe (local)
-3. Download the installer (~3 GB)
-4. Run the installer with default options
-5. Restart your computer when prompted
+### Step 2: install the CUDA Toolkit
 
-**Verify Installation:**
+Download CUDA 12.x from <https://developer.nvidia.com/cuda-downloads>, run the installer, reboot when prompted.
 
-Open "x64 Native Tools Command Prompt for VS 2022" and run:
+Verify from "x64 Native Tools Command Prompt for VS 2022":
+
 ```cmd
 nvcc --version
 ```
 
-### Step 3: Install Git and CMake
+### Step 3: install Git and CMake
 
-**Option A: Winget (Windows 11)**
 ```cmd
 winget install Git.Git
 winget install Kitware.CMake
+winget install Ninja-build.Ninja
 ```
 
-**Option B: Manual Download**
-- Git: https://git-scm.com/download/win
-- CMake: https://cmake.org/download/
+### Step 4: clone and build
 
-### Step 4: Clone and Build
+From "x64 Native Tools Command Prompt for VS 2022":
 
-**Using Developer PowerShell for VS 2022:**
+```cmd
+git clone https://github.com/hevnsnt/collider.git
+cd collider
 
-```powershell
-# Clone the repository
-git clone https://github.com/yourusername/thepuzzler.git
-cd thepuzzler
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
+```
 
-# Create build directory
-mkdir build
+The CMake configure step auto-bootstraps vcpkg in `./vcpkg/` if `VCPKG_ROOT` is not already set. This downloads OpenSSL on first run.
+
+Output: `build\collider.exe`.
+
+### Step 5: run the test suite
+
+```cmd
 cd build
-
-# Configure with CMake
-cmake .. -DCMAKE_BUILD_TYPE=Release
-
-# Build
-cmake --build . --config Release --parallel
-
-# Verify build
-.\Release\thepuzzler.exe --version
-```
-
-**Using Visual Studio IDE:**
-
-1. Open Visual Studio
-2. Select "Clone a repository"
-3. Enter: `https://github.com/yourusername/thepuzzler.git`
-4. Visual Studio will detect CMakeLists.txt automatically
-5. Select "Release" configuration from the dropdown
-6. Build > Build All (Ctrl+Shift+B)
-
-### Step 5: Run Tests
-
-```powershell
-# From build directory
-ctest -C Release --output-on-failure
-
-# Quick benchmark
-.\Release\thepuzzler.exe --benchmark
+ctest --output-on-failure
 ```
 
 ---
 
-## macOS Installation
+## macOS
 
-### Apple Silicon (M1/M2/M3)
+theCollider on macOS uses **Apple Metal**. Apple Silicon (M1, M2, M3, M4) is required.
 
-thePuzzler uses Metal for GPU acceleration on Apple Silicon Macs.
-
-### Step 1: Install Xcode Command Line Tools
+### Step 1: install Xcode Command Line Tools
 
 ```bash
 xcode-select --install
 ```
 
-Click "Install" when prompted.
-
-### Step 2: Install Homebrew Dependencies
+### Step 2: install Homebrew dependencies
 
 ```bash
-# Install Homebrew if not present
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-
-# Install dependencies
-brew install cmake git openssl
+brew install cmake ninja openssl@3
 ```
 
-### Step 3: Clone and Build
+### Step 3: clone and build
+
+The canonical entry point on macOS is `./build_macos.sh`, which sets `OPENSSL_ROOT_DIR` from Homebrew, configures Metal, and runs Ninja with all CPU cores.
 
 ```bash
-# Clone the repository
-git clone https://github.com/yourusername/thepuzzler.git
-cd thepuzzler
-
-# Create build directory
-mkdir build && cd build
-
-# Configure with CMake (auto-detects Metal)
-cmake .. -DCMAKE_BUILD_TYPE=Release
-
-# Build
-make -j$(sysctl -n hw.ncpu)
-
-# Verify build
-./thepuzzler --version
+git clone https://github.com/hevnsnt/collider.git
+cd collider
+./build_macos.sh free
 ```
 
-**Expected CMake output:**
-```
--- Detected Apple Silicon (arm64)
--- Metal framework found
--- thePuzzler backend: METAL
--- Configuring done
--- Build files have been written to: .../thepuzzler/build
-```
-
-### Step 4: Run Tests
+For a clean rebuild:
 
 ```bash
-ctest --output-on-failure
-./thepuzzler --benchmark
+./build_macos.sh free clean
 ```
 
-### Intel Mac with NVIDIA eGPU
+Output: `build/collider`.
 
-If you have an Intel Mac with an external NVIDIA GPU:
-
-1. Install CUDA drivers (may require older macOS versions)
-2. Build with CUDA backend:
-```bash
-cmake .. -DCMAKE_BUILD_TYPE=Release -DSUPERFLAYER_USE_METAL=OFF
-```
-
-**Note:** NVIDIA support on macOS is limited to older macOS versions (pre-Catalina) and requires third-party drivers.
+For a deeper Mac-specific reference (CMake options, embedded Metal shaders, troubleshooting), see [BUILD-MACOS.md](BUILD-MACOS.md).
 
 ---
 
 ## Build Options
 
-### CMake Configuration Options
+CMake options recognized by the project:
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `SUPERFLAYER_USE_CUDA` | ON | Enable CUDA backend |
-| `SUPERFLAYER_USE_METAL` | ON | Enable Metal backend (macOS only) |
-| `SUPERFLAYER_USE_CPU` | ON | Enable CPU fallback |
-| `SUPERFLAYER_BUILD_TESTS` | ON | Build unit tests |
-| `SUPERFLAYER_BUILD_TOOLS` | ON | Build CLI tools |
-| `SUPERFLAYER_LTO` | ON | Enable Link-Time Optimization |
-| `CMAKE_BUILD_TYPE` | Release | Build type (Release/Debug/RelWithDebInfo) |
+| Option                      | Default     | Description                                                        |
+| --------------------------- | ----------- | ------------------------------------------------------------------ |
+| `COLLIDER_USE_CUDA`         | `ON`        | Enable the CUDA backend (Linux / Windows).                         |
+| `COLLIDER_USE_METAL`        | `ON`        | Enable the Metal backend (macOS).                                  |
+| `COLLIDER_USE_CPU`          | `ON`        | Enable the CPU fallback backend.                                   |
+| `COLLIDER_BUILD_TESTS`      | `ON`        | Build unit tests (`ctest` runs from `build/`).                     |
+| `COLLIDER_BUILD_BENCHMARKS` | `ON`        | Build the benchmark targets.                                       |
+| `COLLIDER_BUILD_TOOLS`      | `ON`        | Build CLI tools (`build_bloom`, `generate_license`, etc.).         |
+| `CMAKE_BUILD_TYPE`          | `Release`   | `Release`, `Debug`, or `RelWithDebInfo`.                           |
+| `CMAKE_CUDA_ARCHITECTURES`  | `86;89;100` | Target SM versions. Set to a single value for faster local builds. |
 
-### Example: Custom Build
+### CUDA architecture selection
+
+| GPU series | Compute capability | `CMAKE_CUDA_ARCHITECTURES` |
+| ---------- | ------------------ | -------------------------- |
+| RTX 2000   | sm_75              | `75`                       |
+| RTX 3000   | sm_86              | `86`                       |
+| RTX 4000   | sm_89              | `89`                       |
+| RTX 5000   | sm_100             | `100`                      |
+
+Example (RTX 4090 only):
 
 ```bash
-cmake .. \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DSUPERFLAYER_BUILD_TESTS=OFF \
-  -DSUPERFLAYER_LTO=ON \
-  -DCMAKE_CUDA_ARCHITECTURES="86;89"
-```
-
-### CUDA Architecture Selection
-
-By default, thePuzzler compiles for multiple GPU architectures. For faster builds targeting specific hardware:
-
-| GPU Series | Architecture | CMake Setting |
-|------------|--------------|---------------|
-| GTX 1000 | sm_60, sm_61 | `60;61` |
-| RTX 2000 | sm_75 | `75` |
-| RTX 3000 | sm_86 | `86` |
-| RTX 4000 | sm_89 | `89` |
-| RTX 5000 | sm_100 | `100` |
-
-Example for RTX 4090 only:
-```bash
-cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="89"
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="89"
 ```
 
 ---
 
-## Post-Installation Setup
-
-### 1. Verify GPU Detection
+## Verifying the Build
 
 ```bash
-./thepuzzler --list-gpus
-```
+# Quick benchmark (defaults to 30 seconds).
+./collider --benchmark
 
-Expected output:
-```
-Detected GPUs:
-  [0] NVIDIA GeForce RTX 4090 (24576 MB, SM 8.9, 128 SMs)
-  [1] NVIDIA GeForce RTX 3090 (24576 MB, SM 8.6, 82 SMs)
+# Help / CLI surface.
+./collider --help
 
-Total: 2 GPU(s) available
-```
-
-### 2. Build a Bloom Filter
-
-Before scanning for brain wallets, you need a bloom filter of target addresses:
-
-```bash
-# Download UTXO data (requires Bitcoin Core or utxo-dump)
-# See USAGE.md for detailed instructions
-
-# Build bloom filter from address list
-./build_bloom -i addresses.csv -o addresses.blf -m 100000
-
-# Or use pre-built filters from community sources
-```
-
-### 3. Prepare Wordlists
-
-thePuzzler includes a preprocessing script for wordlists:
-
-```bash
-# Process raw wordlist data
-python3 scripts/preprocess_data.py --data-dir data --output-dir processed
-
-# Output structure:
-# processed/
-#   passwords.txt    (15M passwords)
-#   phrases.txt      (1.1M phrases)
-#   wordlists.txt    (7.4M words)
-#   names.txt        (8.2M names)
-#   crypto.txt       (19K crypto terms)
-```
-
-### 4. Test Your Setup
-
-```bash
-# Run a quick brain wallet test
-echo "test passphrase" | ./thepuzzler --bloom addresses.blf --wordlist -
-
-# Run Kangaroo benchmark
-./thepuzzler --kangaroo --benchmark
-
-# Run full benchmark suite
-./thepuzzler --benchmark --all
+# Full unit-test suite.
+cd build
+ctest --output-on-failure
 ```
 
 ---
 
 ## Troubleshooting
 
-### CUDA Not Found
+### CUDA not found
 
-**Symptom:**
 ```
-CMake Error: Could not find CUDA
+CMake Error: Could not find CUDAToolkit
 ```
 
-**Solution:**
-1. Verify CUDA is installed: `nvcc --version`
-2. Add CUDA to PATH:
+1. Verify `nvcc --version` runs.
+2. Add CUDA to `PATH` and `LD_LIBRARY_PATH`:
+
    ```bash
    export PATH=/usr/local/cuda/bin:$PATH
    export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
    ```
-3. Set CUDA_HOME:
+
+3. Set `CUDAToolkit_ROOT` if CUDA is in a non-standard location:
+
    ```bash
-   export CUDA_HOME=/usr/local/cuda
+   cmake -B build -DCUDAToolkit_ROOT=/opt/cuda
    ```
 
-### GPU Not Detected
+### GPU not detected at runtime
 
-**Symptom:**
 ```
 No CUDA-capable device detected
 ```
 
-**Solution:**
-1. Verify drivers: `nvidia-smi`
-2. Check GPU compatibility (Compute Capability 6.0+)
-3. Update NVIDIA drivers to latest version
-4. Reboot after driver installation
+1. Verify `nvidia-smi` reports your GPU.
+2. Check Compute Capability is 7.5 or higher (Turing, Ampere, Ada, Blackwell, Hopper).
+3. Update the NVIDIA driver to a version compatible with your CUDA Toolkit.
+4. Reboot after driver installation.
 
-### Build Fails with Register Pressure
+### Build fails with "ptxas: too much local memory"
 
-**Symptom:**
 ```
 ptxas error: Entry function uses too much local data
 ```
 
-**Solution:**
+Reduce register pressure by capping the per-thread register allocation:
 
-Reduce optimization level or increase register allocation:
 ```bash
-cmake .. -DCMAKE_CUDA_FLAGS="-maxrregcount=128"
+cmake -B build -DCMAKE_CUDA_FLAGS="-maxrregcount=128"
 ```
 
-### Out of Memory During Build
+### Out of memory during build
 
-**Symptom:**
 ```
 c++: fatal error: Killed signal terminated program
 ```
 
-**Solution:**
+The CUDA kernels link-stage can use significant RAM with parallel jobs. Reduce parallelism:
 
-1. Reduce parallel jobs:
-   ```bash
-   make -j2  # Instead of -j$(nproc)
-   ```
+```bash
+cmake --build build --parallel 2
+```
 
-2. Add swap space:
-   ```bash
-   sudo fallocate -l 8G /swapfile
-   sudo chmod 600 /swapfile
-   sudo mkswap /swapfile
-   sudo swapon /swapfile
-   ```
+Add swap space if the host has under 16 GB RAM.
 
-### Metal Backend Issues (macOS)
+### Metal backend issues (macOS)
 
-**Symptom:**
 ```
 Metal framework not found
 ```
 
-**Solution:**
-1. Verify Xcode Command Line Tools: `xcode-select -p`
-2. Install if missing: `xcode-select --install`
-3. Accept Xcode license: `sudo xcodebuild -license accept`
+1. Verify Xcode Command Line Tools: `xcode-select -p`.
+2. Reinstall if missing: `xcode-select --install`.
+3. Accept the Xcode license: `sudo xcodebuild -license accept`.
 
-### Windows: CUDA Path Issues
+### Windows: nvcc not on PATH
 
-**Symptom:**
 ```
 'nvcc' is not recognized as an internal or external command
 ```
 
-**Solution:**
-1. Add CUDA to system PATH:
-   - Open System Properties > Environment Variables
-   - Add to PATH: `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\bin`
-2. Restart command prompt/IDE
+Open "x64 Native Tools Command Prompt for VS 2022" (this sets the MSVC plus CUDA environment in one step). Direct invocation from a plain `cmd` or PowerShell prompt will not have `vcvars64.bat` loaded.
 
-### Permission Denied on Linux
+### Linux: no CUDA device despite nvidia-smi working
 
-**Symptom:**
 ```
 CUDA_ERROR_NO_DEVICE: no CUDA-capable device is detected
 ```
 
-**Solution:**
+Add the running user to the `video` group:
 
-Add user to video group:
 ```bash
 sudo usermod -aG video $USER
-# Log out and back in
 ```
+
+Log out and back in.
 
 ---
 
 ## Getting Help
 
-If you encounter issues not covered here:
+If a build issue is not covered here, open an issue at <https://github.com/hevnsnt/collider/issues> with:
 
-1. Check the GitHub Issues page
-2. Search the Bitcoin Talk thread
-3. Review NVIDIA CUDA documentation
-4. Open a new issue with:
-   - Operating system and version
-   - GPU model and driver version
-   - CUDA version
-   - Complete error message
-   - Steps to reproduce
+- Operating system and version.
+- GPU model plus driver version.
+- CUDA Toolkit version (Linux / Windows) or macOS version (Mac).
+- Complete CMake configure log.
+- Steps to reproduce.
 
 ---
 
 ## Next Steps
 
-After successful installation:
-
-1. Read the **[Usage Guide](USAGE.md)** to learn thePuzzler commands
-2. Review **[BITCOIN-PUZZLE-STRATEGY.md](BITCOIN-PUZZLE-STRATEGY.md)** for puzzle solving tactics
-3. Build your bloom filter and start scanning
-
----
-
-*Installation complete. Time to solve some puzzles.*
+- Read the [README](../README.md) for the CLI surface and quick-start examples.
+- Read [CONFIGURATION.md](CONFIGURATION.md) for the full `config.yml` schema.
+- For pool mining, see the README's "Pool mode usage" section and [JLP-PROTOCOL.md](JLP-PROTOCOL.md) for the wire format.

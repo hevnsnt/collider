@@ -1,0 +1,17 @@
+// AUTO-GENERATED at CMake configure time from src/gpu/puzzle.metal.
+// Do not edit by hand.
+//
+// Embeds the MSL source as a raw string literal so the host dispatcher
+// (puzzle_metal.mm) can hand it to `[device newLibraryWithSource:...]`
+// without touching the filesystem at runtime. Single source of truth for
+// the shader content; the binary cannot be deployed missing or out-of-sync
+// with the .metal file. Mirrors the kangaroo_metal_source.h.in pattern.
+#pragma once
+
+namespace collider {
+namespace gpu {
+
+inline constexpr const char kPuzzleMetalSource[] = R"PUZZLE_METAL(@PUZZLE_METAL_SOURCE_BODY@)PUZZLE_METAL";
+
+}  // namespace gpu
+}  // namespace collider

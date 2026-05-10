@@ -206,23 +206,84 @@ public:
             // wrong results. Re-derive from the canonical CSV when
             // updating; do not edit one field without verifying the row.
 
-            // Solved puzzles 1-5 (solved at puzzle creation; sequential
-            // private keys 1, 3, 7, 8, 0x15 = 21).
+            // ALL solved puzzles 1-65 plus 66-70 plus 75/80/85/.../130
+            // (every multiple of 5 up to 130). 82 entries total. The
+            // canonical export at https://privatekeys.pw/puzzles/bitcoin-
+            // puzzle-tx tracks 82 confirmed solves; this list mirrors
+            // it. Source of truth: data/puzzle_history.json with the
+            // private keys; addresses + h160s + compressed pubkeys are
+            // DERIVED from the keys via scripts/gen_puzzle_table.py.
+            // Regenerate by running:
+            //   python scripts/gen_puzzle_table.py
+            // and pasting the output here. v1.4.1 expanded the bundle
+            // from "spot solved entries" to "every confirmed solve" so
+            // `--puzzle N` works for any N in [1, 65] without needing
+            // --puzzle-start / --puzzle-end overrides.
             {1, 1, "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH", "751e76e8199196d454941c45d1b3a323f1433bd6", true, "0x1", 0.0, "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"},
             {2, 2, "1CUNEBjYrCn2y1SdiUMohaKUi4wpP326Lb", "7dd65592d0ab2fe0d0257d571abf032cd9db93dc", true, "0x3", 0.0, "02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9"},
             {3, 3, "19ZewH8Kk1PDbSNdJ97FP4EiCjTRaZMZQA", "5dedfbf9ea599dd4e3ca6a80b333c472fd0b3f69", true, "0x7", 0.0, "025cbdf0646e5db4eaa398f365f2ea7a0e3d419b7e0330e39ce92bddedcac4f9bc"},
             {4, 4, "1EhqbyUMvvs7BfL8goY6qcPbD6YKfPqb7e", "9652d86bedf43ad264362e6e6eba6eb764508127", true, "0x8", 0.0, "022f01e5e15cca351daff3843fb70f3c2f0a1bdd05e5af888a67784ef3e10a2a01"},
             {5, 5, "1E6NuFjCi27W5zoXg8TRdcSRq84zJeBW3k", "8f9dff39a81ee4abcbad2ad8bafff090415a2be8", true, "0x15", 0.0, "02352bbf4a4cdd12564f93fa332ce333301d9ad40271f8107181340aef25be59d5"},
-
-            // Solved puzzles 66-70, 75, 80, 85-130. These all had
-            // outgoing transactions that exposed the public key, making
-            // Kangaroo ECDLP cracking viable. Solve dates from the
-            // canonical CSV are: 66=2024-09-12, 67=2025-02-21,
-            // 68=2025-04-06, 69=2025-04-30, 70=2019-06-09,
-            // 75=2019-06-10, 80=2019-06-11, 85=2019-06-17, 90=2019-07-01,
-            // 95=2019-07-06, 100=2019-07-08, 105=2019-09-23,
-            // 110=2020-05-30, 115=2020-06-16, 120=2023-02-27,
-            // 125=2023-07-09, 130=2024-09-23.
+            {6, 6, "1PitScNLyp2HCygzadCh7FveTnfmpPbfp8", "f93ec34e9e34a8f8ff7d600cdad83047b1bcb45c", true, "0x31", 0.0, "03f2dac991cc4ce4b9ea44887e5c7c0bce58c80074ab9d4dbaeb28531b7739f530"},
+            {7, 7, "1McVt1vMtCC7yn5b9wgX1833yCcLXzueeC", "e2192e8a7dd8dd1c88321959b477968b941aa973", true, "0x4c", 0.0, "0296516a8f65774275278d0d7420a88df0ac44bd64c7bae07c3fe397c5b3300b23"},
+            {8, 8, "1M92tSqNmQLYw33fuBvjmeadirh1ysMBxK", "dce76b2613052ea012204404a97b3c25eac31715", true, "0xe0", 0.0, "0308bc89c2f919ed158885c35600844d49890905c79b357322609c45706ce6b514"},
+            {9, 9, "1CQFwcjw1dwhtkVWBttNLDtqL7ivBonGPV", "7d0f6c64afb419bbd7e971e943d7404b0e0daab4", true, "0x1d3", 0.0, "0243601d61c836387485e9514ab5c8924dd2cfd466af34ac95002727e1659d60f7"},
+            {10, 10, "1LeBZP5QCwwgXRtmVUvTVrraqPUokyLHqe", "d7729816650e581d7462d52ad6f732da0e2ec93b", true, "0x202", 0.0, "03a7a4c30291ac1db24b4ab00c442aa832f7794b5a0959bec6e8d7fee802289dcd"},
+            {11, 11, "1PgQVLmst3Z314JrQn5TNiys8Hc38TcXJu", "f8c698da3164ef8fa4258692d118cc9a902c5acc", true, "0x483", 0.0, "038b05b0603abd75b0c57489e451f811e1afe54a8715045cdf4888333f3ebc6e8b"},
+            {12, 12, "1DBaumZxUkM4qMQRt2LVWyFJq5kDtSZQot", "85a1f9ba4da24c24e582d9b891dacbd1b043f971", true, "0xa7b", 0.0, "038b00fcbfc1a203f44bf123fc7f4c91c10a85c8eae9187f9d22242b4600ce781c"},
+            {13, 13, "1Pie8JkxBT6MGPz9Nvi3fsPkr2D8q3GBc1", "f932d0188616c964416b91fb9cf76ba9790a921e", true, "0x1460", 0.0, "03aadaaab1db8d5d450b511789c37e7cfeb0eb8b3e61a57a34166c5edc9a4b869d"},
+            {14, 14, "1ErZWg5cFCe4Vw5BzgfzB74VNLaXEiEkhk", "97f9281a1383879d72ac52a6a3e9e8b9a4a4f655", true, "0x2930", 0.0, "03b4f1de58b8b41afe9fd4e5ffbdafaeab86c5db4769c15d6e6011ae7351e54759"},
+            {15, 15, "1QCbW9HWnwQWiQqVo5exhAnmfqKRrCRsvW", "fe7c45126731f7384640b0b0045fd40bac72e2a2", true, "0x68f3", 0.0, "02fea58ffcf49566f6e9e9350cf5bca2861312f422966e8db16094beb14dc3df2c"},
+            {16, 16, "1BDyrQ6WoF8VN3g9SAS1iKZcPzFfnDVieY", "7025b4efb3ff42eb4d6d71fab6b53b4f4967e3dd", true, "0xc936", 0.0, "029d8c5d35231d75eb87fd2c5f05f65281ed9573dc41853288c62ee94eb2590b7a"},
+            {17, 17, "1HduPEXZRdG26SUT5Yk83mLkPyjnZuJ7Bm", "b67cb6edeabc0c8b927c9ea327628e7aa63e2d52", true, "0x1764f", 0.0, "033f688bae8321b8e02b7e6c0a55c2515fb25ab97d85fda842449f7bfa04e128c3"},
+            {18, 18, "1GnNTmTVLZiqQfLbAdp9DVdicEnB5GoERE", "ad1e852b08eba53df306ec9daa8c643426953f94", true, "0x3080d", 0.0, "020ce4a3291b19d2e1a7bf73ee87d30a6bdbc72b20771e7dfff40d0db755cd4af1"},
+            {19, 19, "1NWmZRpHH4XSPwsW6dsS3nrNWfL1yrJj4w", "ebfbe6819fcdebab061732ce91df7d586a037dee", true, "0x5749f", 0.0, "0385663c8b2f90659e1ccab201694f4f8ec24b3749cfe5030c7c3646a709408e19"},
+            {20, 20, "1HsMJxNiV7TLxmoF6uJNkydxPFDog4NQum", "b907c3a2a3b27789dfb509b730dd47703c272868", true, "0xd2c55", 0.0, "033c4a45cbd643ff97d77f41ea37e843648d50fd894b864b0d52febc62f6454f7c"},
+            {21, 21, "14oFNXucftsHiUMY8uctg6N487riuyXs4h", "29a78213caa9eea824acf08022ab9dfc83414f56", true, "0x1ba534", 0.0, "031a746c78f72754e0be046186df8a20cdce5c79b2eda76013c647af08d306e49e"},
+            {22, 22, "1CfZWK1QTQE3eS9qn61dQjV89KDjZzfNcv", "7ff45303774ef7a52fffd8011981034b258cb86b", true, "0x2de40f", 0.0, "023ed96b524db5ff4fe007ce730366052b7c511dc566227d929070b9ce917abb43"},
+            {23, 23, "1L2GM8eE7mJWLdo3HZS6su1832NX2txaac", "d0a79df189fe1ad5c306cc70497b358415da579e", true, "0x556e52", 0.0, "03f82710361b8b81bdedb16994f30c80db522450a93e8e87eeb07f7903cf28d04b"},
+            {24, 24, "1rSnXMr63jdCuegJFuidJqWxUPV7AtUf7", "0959e80121f36aea13b3bad361c15dac26189e2f", true, "0xdc2a04", 0.0, "036ea839d22847ee1dce3bfc5b11f6cf785b0682db58c35b63d1342eb221c3490c"},
+            {25, 25, "15JhYXn6Mx3oF4Y7PcTAv2wVVAuCFFQNiP", "2f396b29b27324300d0c59b17c3abc1835bd3dbb", true, "0x1fa5ee5", 0.0, "03057fbea3a2623382628dde556b2a0698e32428d3cd225f3bd034dca82dd7455a"},
+            {26, 26, "1JVnST957hGztonaWK6FougdtjxzHzRMMg", "bfebb73562d4541b32a02ba664d140b5a574792f", true, "0x340326e", 0.0, "024e4f50a2a3eccdb368988ae37cd4b611697b26b29696e42e06d71368b4f3840f"},
+            {27, 27, "128z5d7nN7PkCuX5qoA4Ys6pmxUYnEy86k", "0c7aaf6caa7e5424b63d317f0f8f1f9fa40d5560", true, "0x6ac3875", 0.0, "031a864bae3922f351f1b57cfdd827c25b7e093cb9c88a72c1cd893d9f90f44ece"},
+            {28, 28, "12jbtzBb54r97TCwW3G1gCFoumpckRAPdY", "1306b9e4ff56513a476841bac7ba48d69516b1da", true, "0xd916ce8", 0.0, "03e9e661838a96a65331637e2a3e948dc0756e5009e7cb5c36664d9b72dd18c0a7"},
+            {29, 29, "19EEC52krRUK1RkUAEZmQdjTyHT7Gp1TYT", "5a416cc9148f4a377b672c8ae5d3287adaafadec", true, "0x17e2551e", 0.0, "026caad634382d34691e3bef43ed4a124d8909a8a3362f91f1d20abaaf7e917b36"},
+            {30, 30, "1LHtnpd8nU5VHEMkG2TMYYNUjjLc992bps", "d39c4704664e1deb76c9331e637564c257d68a08", true, "0x3d94cd64", 0.0, "030d282cf2ff536d2c42f105d0b8588821a915dc3f9a05bd98bb23af67a2e92a5b"},
+            {31, 31, "1LhE6sCTuGae42Axu1L1ZB7L96yi9irEBE", "d805f6f251f7479ebd853b3d0f4b9b2656d92f1d", true, "0x7d4fe747", 0.0, "0387dc70db1806cd9a9a76637412ec11dd998be666584849b3185f7f9313c8fd28"},
+            {32, 32, "1FRoHA9xewq7DjrZ1psWJVeTer8gHRqEvR", "9e42601eeaedc244e15f17375adb0e2cd08efdc9", true, "0xb862a62e", 0.0, "0209c58240e50e3ba3f833c82655e8725c037a2294e14cf5d73a5df8d56159de69"},
+            {33, 33, "187swFMjz1G54ycVU56B7jZFHFTNVQFDiu", "4e15e5189752d1eaf444dfd6bff399feb0443977", true, "0x1a96ca8d8", 0.0, "03a355aa5e2e09dd44bb46a4722e9336e9e3ee4ee4e7b7a0cf5785b283bf2ab579"},
+            {34, 34, "1PWABE7oUahG2AFFQhhvViQovnCr4rEv7Q", "f6d67d7983bf70450f295c9cb828daab265f1bfa", true, "0x34a65911d", 0.0, "033cdd9d6d97cbfe7c26f902faf6a435780fe652e159ec953650ec7b1004082790"},
+            {35, 35, "1PWCx5fovoEaoBowAvF5k91m2Xat9bMgwb", "f6d8ce225ffbdecec170f8298c3fc28ae686df25", true, "0x4aed21170", 0.0, "02f6a8148a62320e149cb15c544fe8a25ab483a0095d2280d03b8a00a7feada13d"},
+            {36, 36, "1Be2UF9NLfyLFbtm3TCbmuocc9N1Kduci1", "74b1e012be1521e5d8d75e745a26ced845ea3d37", true, "0x9de820a7c", 0.0, "02b3e772216695845fa9dda419fb5daca28154d8aa59ea302f05e916635e47b9f6"},
+            {37, 37, "14iXhn8bGajVWegZHJ18vJLHhntcpL4dex", "28c30fb9118ed1da72e7c4f89c0164756e8a021d", true, "0x1757756a93", 0.0, "027d2c03c3ef0aec70f2c7e1e75454a5dfdd0e1adea670c1b3a4643c48ad0f1255"},
+            {38, 38, "1HBtApAFA9B2YZw3G2YKSMCtb3dVnjuNe2", "b190e2d40cfdeee2cee072954a2be89e7ba39364", true, "0x22382facd0", 0.0, "03c060e1e3771cbeccb38e119c2414702f3f5181a89652538851d2e3886bdd70c6"},
+            {39, 39, "122AJhKLEfkFBaGAd84pLp1kfE7xK3GdT8", "0b304f2a79a027270276533fe1ed4eff30910876", true, "0x4b5f8303e9", 0.0, "022d77cd1467019a6bf28f7375d0949ce30e6b5815c2758b98a74c2700bc006543"},
+            {40, 40, "1EeAxcprB2PpCnr34VfZdFrkUWuxyiNEFv", "95a156cd21b4a69de969eb6716864f4c8b82a82a", true, "0xe9ae4933d6", 0.0, "03a2efa402fd5268400c77c20e574ba86409ededee7c4020e4b9f0edbee53de0d4"},
+            {41, 41, "1L5sU9qvJeuwQUdt4y1eiLmquFxKjtHr3E", "d1562eb37357f9e6fc41cb2359f4d3eda4032329", true, "0x153869acc5b", 0.0, "03b357e68437da273dcf995a474a524439faad86fc9effc300183f714b0903468b"},
+            {42, 42, "1E32GPWgDyeyQac4aJxm9HVoLrrEYPnM4N", "8efb85f9c5b5db2d55973a04128dc7510075ae23", true, "0x2a221c58d8f", 0.0, "03eec88385be9da803a0d6579798d977a5d0c7f80917dab49cb73c9e3927142cb6"},
+            {43, 43, "1PiFuqGpG8yGM5v6rNHWS3TjsG6awgEGA1", "f92044c7924e5525c61207972c253c9fc9f086f7", true, "0x6bd3b27c591", 0.0, "02a631f9ba0f28511614904df80d7f97a4f43f02249c8909dac92276ccf0bcdaed"},
+            {44, 44, "1CkR2uS7LmFwc3T2jV8C1BhWb5mQaoxedF", "80df54e1f612f2fc5bdc05c9d21a83aa8d20791e", true, "0xe02b35a358f", 0.0, "025e466e97ed0e7910d3d90ceb0332df48ddf67d456b9e7303b50a3d89de357336"},
+            {45, 45, "1NtiLNGegHWE3Mp9g2JPkgx6wUg4TW7bbk", "f0225bfc68a6e17e87cd8b5e60ae3be18f120753", true, "0x122fca143c05", 0.0, "026ecabd2d22fdb737be21975ce9a694e108eb94f3649c586cc7461c8abf5da71a"},
+            {46, 46, "1F3JRMWudBaj48EhwcHDdpeuy2jwACNxjP", "9a012260d01c5113df66c8a8438c9f7a1e3d5dac", true, "0x2ec18388d544", 0.0, "03fd5487722d2576cb6d7081426b66a3e2986c1ce8358d479063fb5f2bb6dd5849"},
+            {47, 47, "1Pd8VvT49sHKsmqrQiP61RsVwmXCZ6ay7Z", "f828005d41b0f4fed4c8dca3b06011072cfb07d4", true, "0x6cd610b53cba", 0.0, "023a12bd3caf0b0f77bf4eea8e7a40dbe27932bf80b19ac72f5f5a64925a594196"},
+            {48, 48, "1DFYhaB2J9q1LLZJWKTnscPWos9VBqDHzv", "8661cb56d9df0a61f01328b55af7e56a3fe7a2b2", true, "0xade6d7ce3b9b", 0.0, "0291bee5cf4b14c291c650732faa166040e4c18a14731f9a930c1e87d3ec12debb"},
+            {49, 49, "12CiUhYVTTH33w3SPUBqcpMoqnApAV4WCF", "0d2f533966c6578e1111978ca698f8add7fffdf3", true, "0x174176b015f4d", 0.0, "02591d682c3da4a2a698633bf5751738b67c343285ebdc3492645cb44658911484"},
+            {50, 50, "1MEzite4ReNuWaL5Ds17ePKt2dCxWEofwk", "de081b76f840e462fa2cdf360173dfaf4a976a47", true, "0x22bd43c2e9354", 0.0, "03f46f41027bbf44fafd6b059091b900dad41e6845b2241dc3254c7cdd3c5a16c6"},
+            {51, 51, "1NpnQyZ7x24ud82b7WiRNvPm6N8bqGQnaS", "ef6419cffd7fad7027994354eb8efae223c2dbe7", true, "0x75070a1a009d4", 0.0, "028c6c67bef9e9eebe6a513272e50c230f0f91ed560c37bc9b033241ff6c3be78f"},
+            {52, 52, "15z9c9sVpu6fwNiK7dMAFgMYSK4GqsGZim", "36af659edbe94453f6344e920d143f1778653ae7", true, "0xefae164cb9e3c", 0.0, "0374c33bd548ef02667d61341892134fcf216640bc2201ae61928cd0874f6314a7"},
+            {53, 53, "15K1YKJMiJ4fpesTVUcByoz334rHmknxmT", "2f4870ef54fa4b048c1365d42594cc7d3d269551", true, "0x180788e47e326c", 0.0, "020faaf5f3afe58300a335874c80681cf66933e2a7aeb28387c0d28bb048bc6349"},
+            {54, 54, "1KYUv7nSvXx4642TKeuC2SNdTk326uUpFy", "cb66763cf7fde659869ae7f06884d9a0f879a092", true, "0x236fb6d5ad1f43", 0.0, "034af4b81f8c450c2c870ce1df184aff1297e5fcd54944d98d81e1a545ffb22596"},
+            {55, 55, "1LzhS3k3e9Ub8i2W1V8xQFdB8n2MYCHPCa", "db53d9bbd1f3a83b094eeca7dd970bd85b492fa2", true, "0x6abe1f9b67e114", 0.0, "0385a30d8413af4f8f9e6312400f2d194fe14f02e719b24c3f83bf1fd233a8f963"},
+            {56, 56, "17aPYR1m6pVAacXg1PTDDU7XafvK1dxvhi", "48214c5969ae9f43f75070cea1e2cb41d5bdcccd", true, "0x9d18b63ac4ffdf", 0.0, "033f2db2074e3217b3e5ee305301eeebb1160c4fa1e993ee280112f6348637999a"},
+            {57, 57, "15c9mPGLku1HuW9LRtBf4jcHVpBUt8txKz", "328660ef43f66abe2653fa178452a5dfc594c2a1", true, "0x1eb25c90795d61c", 0.0, "02a521a07e98f78b03fc1e039bc3a51408cd73119b5eb116e583fe57dc8db07aea"},
+            {58, 58, "1Dn8NF8qDyyfHMktmuoQLGyjWmZXgvosXf", "8c2a6071f89c90c4dab5ab295d7729d1b54ea60f", true, "0x2c675b852189a21", 0.0, "0311569442e870326ceec0de24eb5478c19e146ecd9d15e4666440f2f638875f42"},
+            {59, 59, "1HAX2n9Uruu9YDt4cqRgYcvtGvZj1rbUyt", "b14ed3146f5b2c9bde1703deae9ef33af8110210", true, "0x7496cbb87cab44f", 0.0, "0241267d2d7ee1a8e76f8d1546d0d30aefb2892d231cee0dde7776daf9f8021485"},
+            {60, 60, "1Kn5h2qpgw9mWE5jKpk8PP4qvvJ1QVy8su", "cdf8e5c7503a9d22642e3ecfc87817672787b9c5", true, "0xfc07a1825367bbe", 0.0, "0348e843dc5b1bd246e6309b4924b81543d02b16c8083df973a89ce2c7eb89a10d"},
+            {61, 61, "1AVJKwzs9AskraJLGHAZPiaZcrpDr1U6AB", "68133e19b2dfb9034edf9830a200cfdf38c90cbd", true, "0x13c96a3742f64906", 0.0, "0249a43860d115143c35c09454863d6f82a95e47c1162fb9b2ebe0186eb26f453f"},
+            {62, 62, "1Me6EfpwZK5kQziBwBfvLiHjaPGxCKLoJi", "e26646db84b0602f32b34b5a62ca3cae1f91b779", true, "0x363d541eb611abee", 0.0, "03231a67e424caf7d01a00d5cd49b0464942255b8e48766f96602bdfa4ea14fea8"},
+            {63, 63, "1NpYjtLira16LfGbGwZJ5JbDPh3ai9bjf4", "ef58afb697b094423ce90721fbb19a359ef7c50e", true, "0x7cce5efdaccf6808", 0.0, "0365ec2994b8cc0a20d40dd69edfe55ca32a54bcbbaa6b0ddcff36049301a54579"},
+            {64, 64, "16jY7qLJnxb7CHZyqBP8qca9d51gAjyXQN", "3ee4133d991f52fdf6a25c9834e0745ac74248a4", true, "0xf7051f27b09112d4", 0.0, "03100611c54dfef604163b8358f7b7fac13ce478e02cb224ae16d45526b25d9d4d"},
+            {65, 65, "18ZMbwUFLMHoZBbfpCjUJQTCMCbktshgpe", "52e763a7ddc1aa4fa811578c491c1bc7fd570137", true, "0x1a838b13505b26867", 0.0, "0230210c23b1a047bc9bdbb13448e67deddc108946de6de639bcc75d47c0216b1b"},
             {66, 66, "13zb1hQbWVsc2S7ZTZnP2G4undNNpdh5so", "20d45a6a762535700ce9e0b216e31994335db8a5", true, "0x2832ed74f2b5e35ee", 0.0, "024ee2be2d4e9f92d2f5a4a03058617dc45befe22938feed5b7a6b7282dd74cbdd"},
             {67, 67, "1BY8GQbnueYofwSuFAT3USAhGjPrkxDdW9", "739437bb3dd6d1983e66629c5f08c70e52769371", true, "0x730fc235c1942c1ae", 0.0, "0212209f5ec514a1580a2937bd833979d933199fc230e204c6cdc58872b7d46f75"},
             {68, 68, "1MVDYgVaSN6iKKEsbzRUAYFrYJadLYZvvZ", "e0b8a2baee1b77fc703455f39d51477451fc8cfc", true, "0xbebb3940cd0fc1491", 0.0, "031fe02f1d740637a7127cdfe8a77a8a0cfc6435f85e7ec3282cb6243c0a93ba1b"},

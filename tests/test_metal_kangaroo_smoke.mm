@@ -5,17 +5,24 @@
  * KangarooMetalSolver dispatcher, then asserts:
  *
  *   1. init / set_jump_table / seed_kangaroos succeed.
- *   2. Walk actually progresses: a kangaroo's x coordinate changes after
- *      a single round.
- *   3. With a small DP threshold (dp_bits = 4) and N rounds, at least one
+ *   2. With a small DP threshold (dp_bits = 4) and N rounds, at least one
  *      distinguished point is reported. Statistical sanity check that
  *      the DP detection logic is firing.
+ *   3. v1.4.1 JACOBIAN PATH VERIFICATION: every reported DP's affine X
+ *      satisfies the secp256k1 curve equation y^2 = x^3 + 7 (mod p)
+ *      AND has the dp_bits-leading-zero property. If the Jacobian
+ *      kernel is buggy (wrong point arithmetic, batch inversion off
+ *      by one, sentinel state leaking into output), one of these
+ *      checks catches it. The previous affine kernel passed both
+ *      trivially; with Jacobian + batch inversion this is the
+ *      integration gate.
  *
  * This does NOT solve a real puzzle -- the math KAT
  * (test_metal_secp256k1.mm) is the authoritative check on field
  * arithmetic. This test is the integration gate: it proves the host
  * dispatcher + .metal kernel link up correctly and the walk flow
- * produces distinguished points.
+ * produces distinguished points whose affine X coordinates are
+ * recovered correctly from Jacobian via batch inversion.
  *
  * Mac-only. ctest target name: MetalKangarooSmoke. SKIP_RETURN_CODE 77
  * is honored if no Metal device is available.
@@ -134,6 +141,7 @@ int main() {
         // fire within ~10 rounds with dp_bits=4 across 64 kangaroos *
         // 256 steps = 16384 ops/round; expected DPs = 16384 / 16 = ~1024.
         uint64_t total_dp = 0;
+        uint64_t dp_oncurve_checks = 0;
         const auto wall_start = std::chrono::steady_clock::now();
         for (int r = 0; r < 8; ++r) {
             auto dps = solver.step_round();
@@ -160,6 +168,81 @@ int main() {
                                  (unsigned)dp.type);
                     return 1;
                 }
+
+                // v1.4.1 Jacobian path verification: dp.x_be is the
+                // affine X coordinate recovered via threadgroup batch
+                // inversion. Two checks must hold:
+                //   (a) The dp_bits MSBs of x_be are zero (DP property).
+                //   (b) There exists a y on secp256k1 such that
+                //       y^2 = x^3 + 7 (mod p), i.e. x is on the curve.
+                // (a) catches a misaligned is_distinguished() check;
+                // (b) catches Jacobian arithmetic bugs (wrong batch
+                // inversion would produce off-curve x).
+                {
+                    // Check (a): dp_bits leading zero bits in big-endian X.
+                    const uint8_t* xb = dp.x_be;
+                    uint32_t bits_to_check = dp.dp_bits;
+                    uint32_t byte_off = 0;
+                    bool dp_property_ok = true;
+                    while (bits_to_check >= 8) {
+                        if (xb[byte_off] != 0) { dp_property_ok = false; break; }
+                        ++byte_off; bits_to_check -= 8;
+                    }
+                    if (dp_property_ok && bits_to_check > 0) {
+                        const uint8_t mask =
+                            static_cast<uint8_t>(0xFFu << (8u - bits_to_check));
+                        if ((xb[byte_off] & mask) != 0) dp_property_ok = false;
+                    }
+                    if (!dp_property_ok) {
+                        std::fprintf(stderr,
+                            "DP property failed: dp_bits=%u but X has nonzero "
+                            "leading bits (Jacobian->affine conversion likely "
+                            "buggy)\n", (unsigned)dp.dp_bits);
+                        return 1;
+                    }
+
+                    // Check (b): X must satisfy y^2 = x^3 + 7 mod p for some y.
+                    // Equivalently, x^3 + 7 must be a quadratic residue mod p.
+                    // We compute it and check via Euler's criterion: a is QR
+                    // iff a^((p-1)/2) == 1 (mod p). If x came out of a real
+                    // walk, x^3 + 7 is automatically a QR. If the Jacobian
+                    // arithmetic produced garbage, x^3+7 would be a QR with
+                    // probability ~1/2; over many DPs the test catches the
+                    // bug statistically. We also accept the special case
+                    // x^3 + 7 == 0 (would be a 2-torsion point; not on
+                    // secp256k1 since p is odd, so this should never fire).
+                    ::collider::cpu::uint256_t x_le;
+                    ::collider::be32_to_limbs_le(xb, x_le.d);
+
+                    ::collider::cpu::uint256_t x2_le, x3_le, rhs_le;
+                    ::collider::cpu::mod_mul(x2_le, x_le, x_le);
+                    ::collider::cpu::mod_mul(x3_le, x2_le, x_le);
+                    ::collider::cpu::mod_add(rhs_le, x3_le,
+                                             ::collider::cpu::uint256_t(7));
+
+                    // Euler's criterion exponent (p-1)/2 for secp256k1:
+                    // 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF7FFFFE17
+                    const ::collider::cpu::uint256_t euler_exp(
+                        0xFFFFFFFF7FFFFE17ULL,
+                        0xFFFFFFFFFFFFFFFFULL,
+                        0xFFFFFFFFFFFFFFFFULL,
+                        0x7FFFFFFFFFFFFFFFULL);
+                    ::collider::cpu::uint256_t legendre;
+                    ::collider::cpu::mod_pow(legendre, rhs_le, euler_exp);
+
+                    // QR iff legendre == 1. (legendre == p-1 means non-residue.)
+                    const bool is_qr =
+                        (legendre.d[0] == 1 && legendre.d[1] == 0 &&
+                         legendre.d[2] == 0 && legendre.d[3] == 0);
+                    if (!is_qr) {
+                        std::fprintf(stderr,
+                            "DP off-curve: x^3+7 is NOT a quadratic residue "
+                            "mod p. Jacobian->affine batch inversion is "
+                            "producing garbage X coordinates. Round %d.\n", r);
+                        return 1;
+                    }
+                    ++dp_oncurve_checks;
+                }
             }
         }
 
@@ -185,9 +268,11 @@ int main() {
             static_cast<uint64_t>(cfg.num_kangaroos) * cfg.steps_per_round * 8u;
         const double ops_per_sec = wall_secs > 0.0
             ? static_cast<double>(total_ops) / wall_secs : 0.0;
-        std::printf("MetalKangarooSmoke: %llu DPs across 8 rounds, "
+        std::printf("MetalKangarooSmoke: %llu DPs across 8 rounds "
+                    "(%llu Jacobian-path verified on-curve), "
                     "%llu total ops in %.3fs, %.2f Mops/s, OK\n",
                     (unsigned long long)total_dp,
+                    (unsigned long long)dp_oncurve_checks,
                     (unsigned long long)total_ops,
                     wall_secs,
                     ops_per_sec / 1e6);

@@ -9,6 +9,7 @@
 
 #include "rckangaroo_wrapper.hpp"
 #include "../core/byte_codec.hpp"
+#include "hash_rounds.cuh"
 
 #include <iostream>
 #include <fstream>
@@ -54,7 +55,13 @@ static const uint32_t SHA256_K[64] = {
     0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
 };
 
-inline uint32_t rotr32(uint32_t x, int n) { return (x >> n) | (x << (32 - n)); }
+// v1.4.1 D.2: rotr now lives in hash_rounds.cuh (host+device).
+// rotl32 stays local because it's only used by the inline RIPEMD-160
+// implementation below; RIPEMD's left-rotate is unified in
+// ripemd160_device.cuh in a follow-up task.
+inline uint32_t rotr32(uint32_t x, int n) {
+    return collider::gpu::sha256::rotr(x, n);
+}
 inline uint32_t rotl32(uint32_t x, int n) { return (x << n) | (x >> (32 - n)); }
 
 static void cpu_sha256(const uint8_t* data, size_t len, uint8_t* hash) {

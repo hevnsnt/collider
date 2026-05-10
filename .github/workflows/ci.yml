@@ -126,14 +126,7 @@ jobs:
       # miss in fed3c05 would only surface when an operator tried to
       # build Pro on Mac. Separate build dir so the FREE configure/build
       # cache stays clean.
-      #
-      # The hashFiles() gate means these steps run only when the Pro
-      # generator headers are present in the checkout. On the public
-      # `collider` repo, sync-to-free.sh strips src/generators/, so the
-      # gate evaluates to '' and the Pro steps skip cleanly instead of
-      # turning the FREE-repo CI red on a missing-include.
       - name: Configure (PRO build, COLLIDER_PRO=ON, Metal backend)
-        if: hashFiles('src/generators/pcfg.hpp') != ''
         run: |
           cmake -B build_pro -G Ninja \
             -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
@@ -144,5 +137,4 @@ jobs:
             -DCOLLIDER_BUILD_BENCHMARKS=OFF
 
       - name: Build (PRO)
-        if: hashFiles('src/generators/pcfg.hpp') != ''
         run: cmake --build build_pro --config ${{ env.BUILD_TYPE }} -j4

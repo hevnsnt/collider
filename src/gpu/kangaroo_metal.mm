@@ -15,6 +15,7 @@
 
 #include <chrono>
 #include <cstring>
+#include <sstream>
 
 namespace collider {
 namespace gpu {
@@ -37,8 +38,9 @@ struct KangarooMetalSolver::Impl {
     uint64_t work_id_current = 0;
 
     // Persistent device buffers.
-    id<MTLBuffer> b_x        = nil;   // num_kangaroos * 4 ulong
-    id<MTLBuffer> b_y        = nil;
+    id<MTLBuffer> b_x        = nil;   // num_kangaroos * 4 ulong (Jacobian X)
+    id<MTLBuffer> b_y        = nil;   // num_kangaroos * 4 ulong (Jacobian Y)
+    id<MTLBuffer> b_z        = nil;   // num_kangaroos * 4 ulong (Jacobian Z; v1.4.1)
     id<MTLBuffer> b_d        = nil;
     id<MTLBuffer> b_type     = nil;   // num_kangaroos uchar
     id<MTLBuffer> b_jump_x   = nil;   // 32 * 4 ulong
@@ -77,23 +79,35 @@ struct KangarooMetalSolver::Impl {
         id<MTLCommandBuffer> cmd = [queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
         [enc setComputePipelineState:pipe_step];
+        // Buffer indices match the kangaroo_step kernel signature in
+        // kangaroo.metal. The v1.4.1 Jacobian rewrite added a Z buffer
+        // at index 2; downstream indices shift by +1.
         [enc setBuffer:b_x       offset:0 atIndex:0];
         [enc setBuffer:b_y       offset:0 atIndex:1];
-        [enc setBuffer:b_d       offset:0 atIndex:2];
-        [enc setBuffer:b_type    offset:0 atIndex:3];
-        [enc setBuffer:b_jump_x  offset:0 atIndex:4];
-        [enc setBuffer:b_jump_y  offset:0 atIndex:5];
-        [enc setBuffer:b_jump_d  offset:0 atIndex:6];
-        [enc setBytes:&cnt   length:sizeof(cnt)   atIndex:7];
-        [enc setBytes:&steps length:sizeof(steps) atIndex:8];
-        [enc setBytes:&dp    length:sizeof(dp)    atIndex:9];
-        [enc setBytes:&wid   length:sizeof(wid)   atIndex:10];
-        [enc setBuffer:b_dp_recs[slot]  offset:0 atIndex:11];
-        [enc setBuffer:b_dp_count[slot] offset:0 atIndex:12];
-        [enc setBytes:&dpmax length:sizeof(dpmax) atIndex:13];
+        [enc setBuffer:b_z       offset:0 atIndex:2];
+        [enc setBuffer:b_d       offset:0 atIndex:3];
+        [enc setBuffer:b_type    offset:0 atIndex:4];
+        [enc setBuffer:b_jump_x  offset:0 atIndex:5];
+        [enc setBuffer:b_jump_y  offset:0 atIndex:6];
+        [enc setBuffer:b_jump_d  offset:0 atIndex:7];
+        [enc setBytes:&cnt   length:sizeof(cnt)   atIndex:8];
+        [enc setBytes:&steps length:sizeof(steps) atIndex:9];
+        [enc setBytes:&dp    length:sizeof(dp)    atIndex:10];
+        [enc setBytes:&wid   length:sizeof(wid)   atIndex:11];
+        [enc setBuffer:b_dp_recs[slot]  offset:0 atIndex:12];
+        [enc setBuffer:b_dp_count[slot] offset:0 atIndex:13];
+        [enc setBytes:&dpmax length:sizeof(dpmax) atIndex:14];
 
-        const NSUInteger tg = MIN((NSUInteger)32,
-                                  [pipe_step maxTotalThreadsPerThreadgroup]);
+        // v1.4.1 Jacobian rewrite REQUIRES threadsPerThreadgroup == 32:
+        // the Montgomery batch inversion is a threadgroup-cooperative
+        // operation with KANGAROO_BATCH_SIZE = 32 baked into the kernel
+        // (threadgroup memory arrays are sized at compile time). The
+        // device's maxTotalThreadsPerThreadgroup is always >= 1024 on
+        // Apple silicon so 32 is always achievable; we assert here as
+        // documentation rather than expecting the MIN to clip.
+        const NSUInteger kBatchSize = 32;
+        const NSUInteger maxTPT = [pipe_step maxTotalThreadsPerThreadgroup];
+        const NSUInteger tg = (kBatchSize <= maxTPT) ? kBatchSize : maxTPT;
         [enc dispatchThreads:MTLSizeMake(cnt, 1, 1)
               threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
         [enc endEncoding];
@@ -127,6 +141,23 @@ bool KangarooMetalSolver::init(const KangarooMetalConfig& cfg) {
     @autoreleasepool {
         impl_->cfg = cfg;
         impl_->work_id_current = cfg.work_id;
+
+        // v1.4.1 Jacobian rewrite contract: num_kangaroos must be a
+        // multiple of the threadgroup batch size (32). The kernel uses
+        // a threadgroup-cooperative Montgomery batch inversion that
+        // requires every thread in the threadgroup to participate in
+        // the threadgroup_barrier; a partial trailing threadgroup with
+        // gid >= count would either deadlock or run with sentinel
+        // state. Reject the bad config up front so the failure mode is
+        // a clear init error rather than a hung kernel.
+        if (cfg.num_kangaroos == 0 || (cfg.num_kangaroos % 32u) != 0) {
+            std::ostringstream oss;
+            oss << "num_kangaroos must be a positive multiple of 32 "
+                   "(got " << cfg.num_kangaroos << "); the Metal kernel "
+                   "uses 32-thread threadgroups for batch inversion.";
+            error_ = oss.str();
+            return false;
+        }
 
         // Auto-size dp_max_per_round if the caller left it at 0. A round
         // produces (num_kangaroos * steps_per_round) walk ops; the
@@ -213,6 +244,11 @@ bool KangarooMetalSolver::init(const KangarooMetalConfig& cfg) {
                                                         options:MTLResourceStorageModeShared];
         impl_->b_y        = [impl_->device newBufferWithLength:N * kLimbBytes
                                                         options:MTLResourceStorageModeShared];
+        // v1.4.1: Jacobian Z coordinate buffer. Initialized below in
+        // seed_kangaroos / replace_seed (Z = 1 = affine seed); the kernel
+        // updates it across rounds.
+        impl_->b_z        = [impl_->device newBufferWithLength:N * kLimbBytes
+                                                        options:MTLResourceStorageModeShared];
         impl_->b_d        = [impl_->device newBufferWithLength:N * kLimbBytes
                                                         options:MTLResourceStorageModeShared];
         impl_->b_type     = [impl_->device newBufferWithLength:N
@@ -257,12 +293,19 @@ bool KangarooMetalSolver::seed_kangaroos(const std::vector<KangarooSeed>& seeds)
     }
     uint64_t* x = (uint64_t*)[impl_->b_x contents];
     uint64_t* y = (uint64_t*)[impl_->b_y contents];
+    uint64_t* z = (uint64_t*)[impl_->b_z contents];
     uint64_t* d = (uint64_t*)[impl_->b_d contents];
     uint8_t*  t = (uint8_t*) [impl_->b_type contents];
     for (size_t i = 0; i < seeds.size(); ++i) {
         ::collider::be32_to_limbs_le(seeds[i].x.data(), x + i * 4);
         ::collider::be32_to_limbs_le(seeds[i].y.data(), y + i * 4);
         ::collider::be32_to_limbs_le(seeds[i].d.data(), d + i * 4);
+        // Seeds are AFFINE points: Jacobian Z = 1 (1 in LE-by-limb is
+        // (1, 0, 0, 0)). The kernel updates Z as the walk progresses.
+        z[i * 4 + 0] = 1;
+        z[i * 4 + 1] = 0;
+        z[i * 4 + 2] = 0;
+        z[i * 4 + 3] = 0;
         t[i] = seeds[i].type;
     }
     return true;
@@ -276,11 +319,19 @@ bool KangarooMetalSolver::replace_seed(uint32_t index, const KangarooSeed& seed)
     }
     uint64_t* x = (uint64_t*)[impl_->b_x contents];
     uint64_t* y = (uint64_t*)[impl_->b_y contents];
+    uint64_t* z = (uint64_t*)[impl_->b_z contents];
     uint64_t* d = (uint64_t*)[impl_->b_d contents];
     uint8_t*  t = (uint8_t*) [impl_->b_type contents];
     ::collider::be32_to_limbs_le(seed.x.data(), x + index * 4);
     ::collider::be32_to_limbs_le(seed.y.data(), y + index * 4);
     ::collider::be32_to_limbs_le(seed.d.data(), d + index * 4);
+    // Reset Z = 1 so the freshly-reseeded kangaroo enters the kernel
+    // in affine form. Without this, a previously-walked kangaroo's
+    // stale non-1 Z would corrupt the (X, Y) interpretation.
+    z[index * 4 + 0] = 1;
+    z[index * 4 + 1] = 0;
+    z[index * 4 + 2] = 0;
+    z[index * 4 + 3] = 0;
     t[index] = seed.type;
     return true;
 }
@@ -290,17 +341,23 @@ bool KangarooMetalSolver::find_dead_kangaroos(std::vector<uint32_t>& out_dead) {
     out_dead.clear();
     const uint64_t* x = (const uint64_t*)[impl_->b_x contents];
     const uint64_t* y = (const uint64_t*)[impl_->b_y contents];
+    const uint64_t* z = (const uint64_t*)[impl_->b_z contents];
     const uint32_t n = impl_->cfg.num_kangaroos;
-    // A kangaroo is "dead" only when both (x, y) are entirely zero --
-    // matches the identity arm of point_op() in kangaroo.metal:375.
-    // (0, 0) is not on the curve so it's safe to use as a sentinel; a
-    // legitimate walk will never visit it.
+    // v1.4.1 Jacobian rewrite: a kangaroo is "dead" if its Jacobian Z
+    // is entirely zero (the canonical encoding of the point at
+    // infinity), OR if its (X, Y) are both zero (legacy sentinel that
+    // shouldn't fire under the new kernel since the in-kernel infinity
+    // recovery sets Z = 1 and replays jump 0 -- but we keep the legacy
+    // check too for safety, since it catches state that somehow ended
+    // up as the off-curve (0, 0) which a legitimate walk never produces).
     for (uint32_t i = 0; i < n; ++i) {
+        const bool z_zero = (z[i*4+0] == 0) && (z[i*4+1] == 0)
+                         && (z[i*4+2] == 0) && (z[i*4+3] == 0);
         const bool x_zero = (x[i*4+0] == 0) && (x[i*4+1] == 0)
                          && (x[i*4+2] == 0) && (x[i*4+3] == 0);
         const bool y_zero = (y[i*4+0] == 0) && (y[i*4+1] == 0)
                          && (y[i*4+2] == 0) && (y[i*4+3] == 0);
-        if (x_zero && y_zero) out_dead.push_back(i);
+        if (z_zero || (x_zero && y_zero)) out_dead.push_back(i);
     }
     return true;
 }

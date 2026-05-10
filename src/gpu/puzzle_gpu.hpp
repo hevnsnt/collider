@@ -2,7 +2,18 @@
  * GPU Puzzle Solver Interface
  *
  * Header for GPU-accelerated Bitcoin puzzle key search.
- * Supports multi-GPU with optimized kernels.
+ * Supports multi-GPU on CUDA and the unified GPU on Apple Silicon (Metal).
+ *
+ * Backend split:
+ *   - COLLIDER_USE_CUDA: full multi-GPU path. Implementation in puzzle_gpu.cu
+ *     and puzzle_optimized.cu.
+ *   - COLLIDER_USE_METAL: single-GPU path on Apple silicon. Implementation
+ *     in metal_multi_gpu_puzzle.mm and puzzle_metal.{hpp,mm}. The
+ *     GPUPuzzleSolver class is intentionally still a stub here -- the
+ *     CUDA single-GPU class was a v1.0-era convenience that the multi-GPU
+ *     class supersedes; the Mac path only implements the multi-GPU surface
+ *     that puzzle_solver.cpp actually calls.
+ *   - else: CPU-only stubs that always return false from init().
  */
 
 #pragma once
@@ -167,6 +178,90 @@ private:
     std::atomic<int> found_gpu_id_{-1};
 };
 
+#elif defined(COLLIDER_USE_METAL)
+
+// =============================================================================
+// MULTI-GPU PUZZLE SOLVER (Metal, macOS)
+//
+// Pre-1.4.1 the Mac standalone puzzle path hit the no-CUDA stub below and
+// silently fell back to the CPU reference at ~30 KKeys/s. This branch
+// implements the full surface on top of PuzzleMetalSolver. Apple silicon
+// has one unified GPU per device, so num_gpus() always reports 1; gpu_ids
+// in Config is honored for API parity but the solver only ever uses [0].
+//
+// GPUPuzzleSolver is intentionally a stub on Metal -- the CUDA single-GPU
+// class is a v1.0-era convenience that the multi-GPU class supersedes;
+// puzzle_solver.cpp uses MultiGPUPuzzleSolver exclusively. Implementation
+// of MultiGPUPuzzleSolver is in src/gpu/metal_multi_gpu_puzzle.mm and is
+// built when APPLE && COLLIDER_USE_METAL.
+// =============================================================================
+class GPUPuzzleSolver {
+public:
+    GPUPuzzleSolver() = default;
+    ~GPUPuzzleSolver() = default;
+    bool init(int /*device_id*/ = 0) { return false; }
+    bool set_target(const std::array<uint8_t, 20>& /*hash160*/) { return false; }
+    bool search_batch(uint64_t, uint64_t, uint64_t, uint64_t&, uint64_t&) { return false; }
+    bool is_initialized() const { return false; }
+    int device_id() const { return 0; }
+};
+
+class MultiGPUPuzzleSolver {
+public:
+    struct Config {
+        std::vector<int> gpu_ids = {0};
+        uint64_t batch_size_per_gpu = 4'000'000;  // 4M keys per GPU per batch
+    };
+    struct Result {
+        bool found = false;
+        uint64_t key_lo = 0;
+        uint64_t key_hi = 0;
+        uint64_t total_checked = 0;
+        int gpu_id = -1;
+    };
+    using ProgressCallback = std::function<bool(uint64_t total_checked, double rate)>;
+
+    MultiGPUPuzzleSolver();
+    ~MultiGPUPuzzleSolver();
+
+    MultiGPUPuzzleSolver(const MultiGPUPuzzleSolver&) = delete;
+    MultiGPUPuzzleSolver& operator=(const MultiGPUPuzzleSolver&) = delete;
+
+    bool init(const Config& config);
+    bool init(const std::vector<int>& gpu_ids);
+    bool set_target(const std::array<uint8_t, 20>& hash160);
+    Result search_range(
+        uint64_t start_lo, uint64_t start_hi,
+        uint64_t end_lo, uint64_t end_hi
+    );
+    bool search_batch(
+        uint64_t start_lo, uint64_t start_hi,
+        uint64_t batch_size,
+        uint64_t& found_lo, uint64_t& found_hi
+    );
+
+    int num_gpus() const;
+    std::map<int, uint64_t> calibrate_all(int iterations_per_test = 5);
+    void set_batch_size(uint64_t batch_size);
+    uint64_t get_batch_size() const;
+
+    ProgressCallback progress_callback;
+
+private:
+    struct Impl;
+    Impl* impl_ = nullptr;
+
+    // Search-loop state shared with progress callbacks. Atomic so a
+    // future multi-threaded variant (e.g., dispatching while a callback
+    // runs on a host thread) can write without races. The Metal path
+    // is single-threaded today; the atomics are cheap and the contract
+    // is the safe one to ship.
+    std::atomic<bool> found_{false};
+    std::atomic<uint64_t> found_key_lo_{0};
+    std::atomic<uint64_t> found_key_hi_{0};
+    std::atomic<int> found_gpu_id_{-1};
+};
+
 #else
 
 // =============================================================================
@@ -205,10 +300,13 @@ public:
     Result search_range(uint64_t, uint64_t, uint64_t, uint64_t) { return {}; }
     bool search_batch(uint64_t, uint64_t, uint64_t, uint64_t&, uint64_t&) { return false; }
     int num_gpus() const { return 0; }
+    std::map<int, uint64_t> calibrate_all(int /*iters*/ = 5) { return {}; }
+    void set_batch_size(uint64_t) {}
+    uint64_t get_batch_size() const { return 0; }
     ProgressCallback progress_callback;
 };
 
-#endif  // COLLIDER_USE_CUDA
+#endif  // COLLIDER_USE_CUDA / COLLIDER_USE_METAL / stub
 
 }  // namespace gpu
 }  // namespace collider

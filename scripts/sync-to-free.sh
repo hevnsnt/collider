@@ -55,6 +55,8 @@ PRO_PATHS=(
     "src/license/"
     "src/rules/"            # gpu_rules.hpp lives here in our tree
     "src/scrapers/"         # lyrics/quotes scrapers for brain wallet
+    "src/runtime/brain_wallet_runner.hpp"   # v1.4.1 A.3: PRO-only TU
+    "src/runtime/brain_wallet_runner.cpp"   # v1.4.1 A.3: PRO-only TU
     "src/gpu/mega_fused_kernel.cu"
     "src/gpu/mega_fused_kernel.hpp"
     "src/gpu/brain_wallet_gpu.cpp"
@@ -103,14 +105,6 @@ PRO_PATHS=(
     "*_hits.txt"
     "utxodump.csv"
     "funded_addresses.blf"
-
-    # Pro-side CI plumbing: these workflows orchestrate the pro->free
-    # sync itself and the JLP protocol push to collision-protocol.
-    # They have no place in the free repo (no source repo to pull from,
-    # no SYNC_DEPLOY_KEY secret), and leaving them on the free side
-    # would also re-trigger sync-free.yml on every tag pushed to free.
-    ".github/workflows/sync-free.yml"
-    ".github/workflows/sync-protocol.yml"
 )
 
 # -----------------------------------------------------------------------------
@@ -119,17 +113,21 @@ PRO_PATHS=(
 PRESERVE_PATHS=(
     "LICENSE"
     "build_macos.sh"
-    "example-config.yml"
     "docs/BUILD-LINUX.md"
     "docs/BUILD-MACOS.md"
     "docs/BUILD-WINDOWS.md"
     "src/core/edition.hpp"
     ".github/workflows/build-release.yml"
-    # README.md is public-only: the public Free repo's landing page is
-    # written for the Free audience and does not advertise Pro features.
-    # The private repo's README pitches the full Pro/Free product, so
-    # blindly overwriting public's would re-introduce false claims.
-    "README.md"
+
+    # v1.4.1: README.md is now sync'd from this repo. Pre-1.4.1 it was
+    # in PRESERVE_PATHS because the private README pitched Pro features
+    # the free landing page should not advertise. The v1.4.1 README is
+    # written as a unified document covering both editions with Pro
+    # features clearly tagged "Pro-only", so blindly overwriting the
+    # public's copy is correct now.
+    #
+    # example-config.yml is also synced (was preserved before but now
+    # ships from this repo as the canonical schema reference).
 )
 
 # -----------------------------------------------------------------------------

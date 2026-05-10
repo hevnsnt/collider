@@ -10,7 +10,8 @@
 // What this file covers (Priority 1 in the test plan):
 //
 //    1.  AUTH wire format: header magic, type, payload size, plus the
-//        76-byte JLPClientHello (worker_name fixed-width, gpu_count, speed).
+//        120-byte JLPClientHelloV2 (worker_name + password +
+//        timestamp_ms + nonce; v1.4.1 B.2 wire format).
 //    2.  authenticate() returns true when AUTH_OK arrives within timeout.
 //    3.  authenticate() returns false on AUTH_FAIL.
 //    4.  authenticate() returns false when MSG_ERROR arrives during AUTH_SENT.
@@ -473,8 +474,9 @@ template <class Server>
 bool drive_auth_ok(Server& server, JLPPoolClient& client, const char* tname) {
     std::atomic<bool> ok{false};
     std::thread t([&] { ok = client.authenticate("worker", ""); });
-    auto auth = server.wait_recv_pop(84, 5000ms);
-    if (auth.size() != 84) {
+    // v1.4.1 B.2: AUTH frame is 8-byte header + 120-byte v2 hello.
+    auto auth = server.wait_recv_pop(128, 5000ms);
+    if (auth.size() != 128) {
         // Force authenticate() to unblock so we can join cleanly.
         server.close_client();
         if (t.joinable()) t.join();
@@ -531,18 +533,21 @@ bool test_auth_wire_format() {
     auto client = make_connected(server.port());
     if (!client) return fail("auth_wire_format", "client connect failed");
 
-    // Run authenticate on a background thread because it blocks on AUTH_OK.
     std::thread t([&] {
-        client->authenticate("worker_test_name", "");
+        client->authenticate("worker_test_name", "hunter2");
     });
 
-    // We expect 8-byte header + 76-byte hello = 84 bytes.
-    auto bytes = server.wait_recv(84);
-    if (bytes.size() != 84) {
-        // Reply so background authenticate() returns and we can join.
+    // v1.4.1 B.2: AUTH wire payload is 120 bytes
+    // (worker_name 64 + password 32 + timestamp_ms 8 + nonce 16);
+    // total frame is 8-byte header + 120 = 128 bytes.
+    constexpr size_t kFrameSize   = 8 + 120;
+    constexpr uint16_t kPayloadSize = 120;
+    auto bytes = server.wait_recv(kFrameSize);
+    if (bytes.size() != kFrameSize) {
         server.send_frame(TYPE_AUTH_FAIL, nullptr, 0);
         t.join();
-        return fail("auth_wire_format", "did not receive 84 bytes within timeout");
+        return fail("auth_wire_format",
+                    "did not receive 128 AUTH bytes within timeout");
     }
 
     // Header inspection.
@@ -562,17 +567,15 @@ bool test_auth_wire_format() {
         return fail("auth_wire_format", "header flags != 0");
     }
     uint16_t plen = static_cast<uint16_t>(bytes[6] | (bytes[7] << 8));
-    if (plen != 76) {
+    if (plen != kPayloadSize) {
         server.send_frame(TYPE_AUTH_FAIL, nullptr, 0);
         t.join();
-        return fail("auth_wire_format", "header payload_size != 76");
+        return fail("auth_wire_format",
+                    "header payload_size != 120 (v1.4.1 B.2 wire fmt)");
     }
 
-    // ClientHello payload starts at offset 8: 64 bytes worker_name (NUL-padded),
-    // then 4 bytes gpu_count LE, then 8 bytes speed LE.
+    // Payload layout: name[64] password[32] timestamp_ms(LE u64, 8) nonce[16].
     const uint8_t* hello = bytes.data() + 8;
-
-    // Worker name should match what we passed, with the rest NUL.
     const char* expected = "worker_test_name";
     size_t elen = std::strlen(expected);
     if (std::memcmp(hello, expected, elen) != 0) {
@@ -588,23 +591,36 @@ bool test_auth_wire_format() {
         }
     }
 
-    // gpu_count default is 1 (constructor sets it). speed default is 0.
-    uint32_t gpu_count = 0;
-    std::memcpy(&gpu_count, hello + 64, 4);
-    if (gpu_count != 1) {
+    if (std::memcmp(hello + 64, "hunter2", 7) != 0) {
         server.send_frame(TYPE_AUTH_FAIL, nullptr, 0);
         t.join();
-        return fail("auth_wire_format", "gpu_count != 1 (default)");
-    }
-    uint64_t speed = 0;
-    std::memcpy(&speed, hello + 68, 8);
-    if (speed != 0) {
-        server.send_frame(TYPE_AUTH_FAIL, nullptr, 0);
-        t.join();
-        return fail("auth_wire_format", "speed != 0 (default)");
+        return fail("auth_wire_format", "password leading bytes wrong");
     }
 
-    // Reply AUTH_FAIL (any reply unblocks authenticate).
+    uint64_t ts_ms = 0;
+    std::memcpy(&ts_ms, hello + 96, 8);
+    // Sanity bound: timestamp must be sometime after Jan 2024 (in ms)
+    // and before year 9999.
+    if (ts_ms < 1704067200000ULL || ts_ms > 253402300799000ULL) {
+        server.send_frame(TYPE_AUTH_FAIL, nullptr, 0);
+        t.join();
+        return fail("auth_wire_format",
+                    "timestamp_ms out of plausible range");
+    }
+
+    // Nonce: at least one byte must be nonzero. With 16 bytes from
+    // std::random_device, the probability of all zero is ~2^-128 -- so
+    // this fires only on a busted RNG.
+    bool any_nonzero = false;
+    for (size_t i = 0; i < 16; ++i) {
+        if (hello[104 + i] != 0) { any_nonzero = true; break; }
+    }
+    if (!any_nonzero) {
+        server.send_frame(TYPE_AUTH_FAIL, nullptr, 0);
+        t.join();
+        return fail("auth_wire_format", "nonce was all-zero");
+    }
+
     server.send_frame(TYPE_AUTH_FAIL, nullptr, 0);
     t.join();
     return true;
@@ -626,8 +642,8 @@ bool test_authenticate_ok() {
     // during recv() and the sender has to win that mutex to actually send;
     // with our 100 ms recv timeout that race resolves quickly, but on a
     // loaded CI box it can still take a beat.
-    auto auth = server.wait_recv(84, 5000ms);
-    if (auth.size() != 84) {
+    auto auth = server.wait_recv(128, 5000ms);
+    if (auth.size() != 128) {
         std::fprintf(stderr,
             "[debug] authenticate_ok: wait_recv got %zu bytes\n", auth.size());
         server.close_client();
@@ -654,7 +670,7 @@ bool test_authenticate_fail() {
     bool result = true;
     std::thread t([&] { result = client->authenticate("worker", ""); });
 
-    server.wait_recv(84);
+    server.wait_recv(128);
     server.send_frame(TYPE_AUTH_FAIL, nullptr, 0);
 
     t.join();
@@ -673,7 +689,7 @@ bool test_authenticate_msg_error() {
     bool result = true;
     std::thread t([&] { result = client->authenticate("worker", ""); });
 
-    server.wait_recv(84);
+    server.wait_recv(128);
     const char* msg = "bad worker name";
     server.send_frame(TYPE_MSG_ERROR, msg, static_cast<uint16_t>(std::strlen(msg)));
 
@@ -711,7 +727,7 @@ bool test_authenticate_silent_server() {
     std::thread t([&] { result = client->authenticate("worker", ""); });
 
     // Wait for AUTH bytes so we know authenticate() is past send_hello().
-    server.wait_recv(84);
+    server.wait_recv(128);
     // Now hang up. authenticate() should return false within a few seconds.
     server.close_client();
 
@@ -813,7 +829,7 @@ bool test_pre_auth_work_gated() {
     // Start authenticate so the receiver thread is dispatching messages.
     bool auth_result = false;
     std::thread auth_t([&] { auth_result = client->authenticate("worker", ""); });
-    if (server.wait_recv_pop(84, 5000ms).size() != 84) {
+    if (server.wait_recv_pop(128, 5000ms).size() != 128) {
         server.close_client();
         auth_t.join();
         return fail("pre_auth_work_gated", "AUTH bytes never arrived");
@@ -1119,6 +1135,84 @@ bool test_report_solution() {
 }
 
 // ---------------------------------------------------------------------------
+// 16. v1.4.1 C.3: SOLUTION callback dedup. Sending the same SOLUTION
+//     payload twice fires the user's callback exactly once.
+// ---------------------------------------------------------------------------
+bool test_solution_callback_dedup() {
+    MockJlpServer server;
+    auto client = make_connected(server.port());
+    if (!client) return fail("solution_callback_dedup", "connect failed");
+
+    std::atomic<int> fire_count{0};
+    client->set_solution_callback([&](const uint8_t*) { fire_count++; });
+
+    if (!drive_auth_ok(server, *client, "solution_callback_dedup")) return false;
+
+    uint8_t key[32];
+    for (int i = 0; i < 32; ++i) key[i] = static_cast<uint8_t>(0xA5 ^ i);
+
+    server.send_frame(TYPE_SOLUTION, key, sizeof(key));
+    if (!wait_for([&] { return fire_count.load() >= 1; }, 2000ms)) {
+        return fail("solution_callback_dedup",
+                    "first SOLUTION did not fire callback");
+    }
+    // Second identical SOLUTION must be suppressed by fire_solution_callback.
+    server.send_frame(TYPE_SOLUTION, key, sizeof(key));
+    std::this_thread::sleep_for(200ms);
+
+    if (fire_count.load() != 1) {
+        return fail("solution_callback_dedup",
+                    "callback fired more than once for duplicate SOLUTION");
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// 17. v1.4.1 C.3: WORK_ASN callback dedup. Sending two WORK_ASN frames
+//     with the same work_id fires the work callback only once.
+// ---------------------------------------------------------------------------
+bool test_work_callback_dedup() {
+    MockJlpServer server;
+    auto client = make_connected(server.port());
+    if (!client) return fail("work_callback_dedup", "connect failed");
+
+    std::atomic<int> fire_count{0};
+    client->set_work_callback([&](const WorkAssignment&) { fire_count++; });
+
+    if (!drive_auth_ok(server, *client, "work_callback_dedup")) return false;
+
+    JLPServerConfig cfg{};
+    for (int i = 0; i < 33; ++i) cfg.public_key[i]  = 0x70 + i;
+    for (int i = 0; i < 32; ++i) cfg.range_start[i] = 0x80 + i;
+    for (int i = 0; i < 32; ++i) cfg.range_end[i]   = 0x90 + i;
+    cfg.dp_bits = 24;
+    cfg.work_id = 0xDEADBEEF'CAFE0001ULL;
+
+    server.send_frame(TYPE_WORK_ASN, &cfg, sizeof(cfg));
+    if (!wait_for([&] { return fire_count.load() >= 1; }, 2000ms)) {
+        return fail("work_callback_dedup",
+                    "first WORK_ASN did not fire callback");
+    }
+    // Same work_id arriving again -- treat as a network-layer duplicate.
+    server.send_frame(TYPE_WORK_ASN, &cfg, sizeof(cfg));
+    std::this_thread::sleep_for(200ms);
+
+    if (fire_count.load() != 1) {
+        return fail("work_callback_dedup",
+                    "callback fired again for duplicate work_id");
+    }
+
+    // Sanity: a different work_id MUST fire the callback again.
+    cfg.work_id = 0xDEADBEEF'CAFE0002ULL;
+    server.send_frame(TYPE_WORK_ASN, &cfg, sizeof(cfg));
+    if (!wait_for([&] { return fire_count.load() >= 2; }, 2000ms)) {
+        return fail("work_callback_dedup",
+                    "fresh work_id failed to fire callback");
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // Driver
 // ---------------------------------------------------------------------------
 
@@ -1143,6 +1237,8 @@ const TestCase TESTS[] = {
     {"dp_wire_format",            test_dp_submission_wire_format},
     {"dp_backpressure",           test_dp_backpressure},
     {"report_solution",           test_report_solution},
+    {"solution_callback_dedup",   test_solution_callback_dedup},
+    {"work_callback_dedup",       test_work_callback_dedup},
 };
 
 }  // namespace

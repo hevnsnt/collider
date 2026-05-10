@@ -17,6 +17,8 @@
 #include <cstdint>
 #include <cstdio>
 
+#include "hash_rounds.cuh"
+
 namespace collider {
 namespace gpu {
 namespace optimized {
@@ -45,33 +47,19 @@ static __constant__ uint32_t SHA256_K[64] = {
     0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
 };
 
-__device__ __forceinline__ uint32_t sha_rotr(uint32_t x, uint32_t n) {
-    return (x >> n) | (x << (32 - n));
-}
-
+// Round primitives now come from hash_rounds.cuh. The historical sha_*
+// names are kept as TU-local aliases so the compression loops below stay
+// verbatim.
 __device__ __forceinline__ uint32_t sha_ch(uint32_t x, uint32_t y, uint32_t z) {
-    return (x & y) ^ (~x & z);
+    return ::collider::gpu::sha256::ch(x, y, z);
 }
-
 __device__ __forceinline__ uint32_t sha_maj(uint32_t x, uint32_t y, uint32_t z) {
-    return (x & y) ^ (x & z) ^ (y & z);
+    return ::collider::gpu::sha256::maj(x, y, z);
 }
-
-__device__ __forceinline__ uint32_t sha_sigma0(uint32_t x) {
-    return sha_rotr(x, 2) ^ sha_rotr(x, 13) ^ sha_rotr(x, 22);
-}
-
-__device__ __forceinline__ uint32_t sha_sigma1(uint32_t x) {
-    return sha_rotr(x, 6) ^ sha_rotr(x, 11) ^ sha_rotr(x, 25);
-}
-
-__device__ __forceinline__ uint32_t sha_gamma0(uint32_t x) {
-    return sha_rotr(x, 7) ^ sha_rotr(x, 18) ^ (x >> 3);
-}
-
-__device__ __forceinline__ uint32_t sha_gamma1(uint32_t x) {
-    return sha_rotr(x, 17) ^ sha_rotr(x, 19) ^ (x >> 10);
-}
+__device__ __forceinline__ uint32_t sha_sigma0(uint32_t x) { return ::collider::gpu::sha256::sigma0(x); }
+__device__ __forceinline__ uint32_t sha_sigma1(uint32_t x) { return ::collider::gpu::sha256::sigma1(x); }
+__device__ __forceinline__ uint32_t sha_gamma0(uint32_t x) { return ::collider::gpu::sha256::gamma0(x); }
+__device__ __forceinline__ uint32_t sha_gamma1(uint32_t x) { return ::collider::gpu::sha256::gamma1(x); }
 
 /**
  * Inline SHA256 for exactly 33 bytes (compressed public key).

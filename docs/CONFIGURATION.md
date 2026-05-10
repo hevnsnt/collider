@@ -1,413 +1,216 @@
 # Configuration Guide
 
-> Complete reference for theCollider's configuration options.
+Complete reference for theCollider's `config.yml` and the precedence rules between CLI flags, config-file values, and built-in defaults.
+
+The schema source of truth is [`src/core/yaml_config.hpp`](../src/core/yaml_config.hpp) (the `AppConfig` struct). A documented example with every section is at [`example-config.yml`](../example-config.yml) at the repo root.
 
 ---
 
-## Configuration Methods
+## Precedence
 
-theCollider supports three configuration methods (in order of precedence):
-
-```mermaid
-flowchart LR
-    CLI[Command Line Args] --> |Highest Priority| FINAL[Final Config]
-    YML[config.yml] --> FINAL
-    DEF[Defaults] --> |Lowest Priority| FINAL
+```
+CLI flags  >  config.yml  >  built-in defaults
 ```
 
-1. **Command-line arguments** — Override everything
-2. **config.yml file** — Persistent settings
-3. **Built-in defaults** — Fallback values
+Concretely (Wave 5 refactor, v1.4.0):
+
+1. CLI flags explicitly supplied on `argv` are tracked via `CLIFlags::*_set` bits inside the parser, set the moment the flag is consumed (not inferred post-parse from the resulting value).
+2. Config-file values overlay onto `Arguments` only when the matching `*_set` bit is unset.
+3. Anything still unset falls through to the `Arguments` and `AppConfig` defaults.
+
+This eliminates the "value silently overridden" bug class where CLI values that happened to equal the parser's sentinel default (`--batch-size 4000000`, `--puzzle 0`) were treated as unset and clobbered by config.
 
 ---
 
-## config.yml Reference
-
-### File Location
+## File location
 
 theCollider searches for `config.yml` in this order:
 
-1. `./config.yml` — Current working directory
-2. `~/.collider/config.yml` — Home directory (Linux/macOS)
-3. `%USERPROFILE%\.collider\config.yml` — Home directory (Windows)
+1. `./config.yml`
+2. `./config.yaml`
+3. `~/.collider/config.yml` (Linux / macOS)
+4. `~/.collider/config.yaml`
+5. `%USERPROFILE%\.collider\config.yml` (Windows)
+6. `%USERPROFILE%\.collider\config.yaml`
 
-### Complete Example
-
-```yaml
-# ============================================================================
-# theCollider Configuration File
-# ============================================================================
-
-# ----------------------------------------------------------------------------
-# Pool Mining Configuration
-# ----------------------------------------------------------------------------
-pool:
-  # Pool server URL (jlp://host:port or http://host:port)
-  url: "jlp://pool.collisionprotocol.com:17403"
-  
-  # Your Bitcoin address for reward distribution (REQUIRED for pool mode)
-  worker: "bc1qYourBitcoinAddress"
-  
-  # Pool password (optional, most pools don't require this)
-  password: ""
-  
-  # API key for HTTP-based pools (optional)
-  api_key: ""
-
-# ----------------------------------------------------------------------------
-# Puzzle Solving Configuration
-# ----------------------------------------------------------------------------
-puzzle:
-  # Target puzzle number (66-160). Set to 0 for auto-selection.
-  number: 0
-  
-  # Use smart selection to pick best puzzle by ROI (true/false)
-  smart_select: true
-  
-  # Minimum puzzle bit size to consider (0 = no minimum)
-  min_bits: 0
-  
-  # Maximum puzzle bit size to consider
-  max_bits: 160
-  
-  # Use Pollard's Kangaroo algorithm (faster for large puzzles)
-  kangaroo: true
-  
-  # Distinguished point bits (-1 = auto-calculate optimal)
-  dp_bits: -1
-  
-  # Use random starting positions (true) or sequential search (false)
-  random_search: true
-  
-  # Auto-progress to next puzzle after solving
-  auto_next: false
-  
-  # Checkpoint file for saving/resuming progress
-  checkpoint: ""
-
-# ----------------------------------------------------------------------------
-# Brainwallet Scanning Configuration
-# ----------------------------------------------------------------------------
-brainwallet:
-  # Enable brainwallet scanning mode
-  enabled: false
-  
-  # Path to processed wordlist file
-  wordlist: ""
-  
-  # Save progress interval (every N passphrases)
-  save_interval: 1000000
-  
-  # Resume from previous saved state
-  resume: false
-
-# ----------------------------------------------------------------------------
-# Bloom Filter Configuration
-# ----------------------------------------------------------------------------
-bloom:
-  # Path to bloom filter file for address checking
-  # Supports: UTXO bloom, address bloom, or H160 bloom
-  file: ""
-
-# ----------------------------------------------------------------------------
-# GPU Configuration
-# ----------------------------------------------------------------------------
-gpu:
-  # GPU device IDs to use (empty = auto-detect all available)
-  # Example: [0, 1] for first two GPUs
-  devices: []
-  
-  # Batch size for GPU operations (0 = auto-calibrated)
-  batch_size: 0
-  
-  # Force GPU calibration on startup
-  force_calibrate: false
-
-# ----------------------------------------------------------------------------
-# Performance & Debug Settings
-# ----------------------------------------------------------------------------
-settings:
-  # Enable verbose output
-  verbose: false
-  
-  # Enable debug output (shows internal state)
-  debug: false
-  
-  # Benchmark duration in seconds
-  benchmark_seconds: 30
-
-# ----------------------------------------------------------------------------
-# Paths Configuration
-# ----------------------------------------------------------------------------
-paths:
-  # Directory for processed data (wordlists, bloom filters)
-  data_dir: "./processed"
-  
-  # Directory for checkpoints and save states
-  checkpoint_dir: "./checkpoints"
-  
-  # Directory for output logs
-  log_dir: "./logs"
-```
+Override with `--config <path>` (also `-c`).
 
 ---
 
-## Section Reference
+## Schema
 
-### Pool Configuration
+### `pool` section
 
-```yaml
-pool:
-  url: "jlp://pool.collisionprotocol.com:17403"
-  worker: "bc1qYourBitcoinAddress"
-```
+Pool-mining (distributed solving) settings.
 
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `url` | string | `""` | Pool server URL. Protocols: `jlp://`, `http://` |
-| `worker` | string | `""` | Your Bitcoin address for payouts |
-| `password` | string | `""` | Pool password (rarely needed) |
-| `api_key` | string | `""` | API key for HTTP pools |
+| Key        | Type   | Default | CLI override      | Description                                                                         |
+| ---------- | ------ | ------- | ----------------- | ----------------------------------------------------------------------------------- |
+| `url`      | string | `""`    | `--pool` / `-p`   | Pool URL. Schemes: `jlps://` (TLS), `jlp://` (plaintext), `http://` (HTTP variant). |
+| `worker`   | string | `""`    | `--worker` / `-w` | Bitcoin address to credit pool rewards to.                                          |
+| `password` | string | `""`    | `--pool-password` | Optional pool password. Collision Protocol's public pool ignores this.              |
+| `api_key`  | string | `""`    | `--pool-api-key`  | Optional API key for HTTP-only pools.                                               |
 
-### Puzzle Configuration
+Setting `pool.url` in the config (without a `--brainwallet` CLI flag) auto-enables pool mode.
+
+### `puzzle` section
+
+Standalone puzzle-solving settings (Bitcoin Puzzle Challenge).
+
+| Key             | Type   | Default | CLI override                      | Description                                                                                   |
+| --------------- | ------ | ------- | --------------------------------- | --------------------------------------------------------------------------------------------- |
+| `number`        | int    | `0`     | `--puzzle N` / `-P N`             | Specific puzzle number. `0` selects automatically (ROI-ranked).                               |
+| `smart_select`  | bool   | `true`  | `--no-smart`                      | ROI-rank when picking among unsolved puzzles. `--no-smart` picks the lowest-numbered instead. |
+| `min_bits`      | int    | `0`     | `--puzzle-min-bits N`             | Lower bound for `--all-unsolved` iteration.                                                   |
+| `max_bits`      | int    | `160`   | `--puzzle-max-bits N`             | Upper bound for `--all-unsolved` iteration.                                                   |
+| `kangaroo`      | bool   | `true`  | `--kangaroo`                      | Use Pollard's Kangaroo when a pubkey is available. v1.4.1 demotes to brute force if not.      |
+| `dp_bits`       | int    | `-1`    | `--dp-bits N`                     | Distinguished-point bits for kangaroo. `-1` auto-calculates. Manual range: 16 to 28.          |
+| `random_search` | bool   | `true`  | `--random` / `--sequential`       | Random walk vs. sequential within the search range.                                           |
+| `auto_next`     | bool   | `false` | `--auto-next`                     | Advance to the next unsolved puzzle after solving the current one.                            |
+| `checkpoint`    | string | `""`    | `--puzzle-checkpoint <file>`      | Checkpoint file for save/resume across runs.                                                  |
+| `target`        | string | `""`    | `--puzzle-target <addr>` (v1.4.1) | Override the target Bitcoin address. Independent of `number`.                                 |
+| `start`         | string | `""`    | `--puzzle-start <hex>` (v1.4.1)   | Override the range start (hex, with `0x` prefix).                                             |
+| `end`           | string | `""`    | `--puzzle-end <hex>` (v1.4.1)     | Override the range end.                                                                       |
+| `pubkey`        | string | `""`    | `--pubkey <hex>` (v1.4.1)         | 33-byte compressed pubkey (`02...`/`03...`). Only needed for non-bundled targets.             |
+
+**Kangaroo + pubkey rules.** The bundled `data/puzzle_history.json` ships every revealed pubkey for the canonical Bitcoin Puzzle Challenge (multiples of 5 in 71-160, plus all 82 confirmed-solved puzzles). For a target outside that set, supply `pubkey:` here. See README, "Which puzzles are kangaroo-able".
+
+### `brainwallet` section **(PRO VERSION ONLY)**
+
+Brain-wallet scanning. The free build silently ignores this section and prints a one-time hint if it sees `bloom.file`.
+
+| Key             | Type   | Default   | CLI override        | Description                                             |
+| --------------- | ------ | --------- | ------------------- | ------------------------------------------------------- |
+| `enabled`       | bool   | `false`   | `--brainwallet`     | Enable brain-wallet mode. Mutually exclusive with pool. |
+| `wordlist`      | string | `""`      | (none)              | Path to a wordlist file consumed by the generators.     |
+| `save_interval` | uint64 | `1000000` | `--save-interval N` | Save state every N candidates.                          |
+| `resume`        | bool   | `false`   | `--resume`          | Resume from the last checkpoint.                        |
+
+### `bloom` section **(PRO VERSION ONLY)**
+
+| Key    | Type   | Default | CLI override     | Description                                                           |
+| ------ | ------ | ------- | ---------------- | --------------------------------------------------------------------- |
+| `file` | string | `""`    | `--bloom <file>` | Bloom filter of funded addresses (built with the `build_bloom` tool). |
+
+### `gpu` section
+
+| Key               | Type   | Default | CLI override        | Description                                                     |
+| ----------------- | ------ | ------- | ------------------- | --------------------------------------------------------------- |
+| `devices`         | int[]  | `[]`    | `--gpus 0,1` / `-g` | Specific GPU IDs. Empty = auto-detect every visible device.     |
+| `batch_size`      | uint64 | `0`     | `--batch-size N`    | Keys per batch. `0` = use the calibrated value (or 4M default). |
+| `force_calibrate` | bool   | `false` | `--force-calibrate` | Re-run batch-size calibration even if a saved value exists.     |
+
+### `settings` section
+
+| Key                 | Type | Default | CLI override             | Description                       |
+| ------------------- | ---- | ------- | ------------------------ | --------------------------------- |
+| `verbose`           | bool | `false` | `--verbose` / `-v`       | Verbose output.                   |
+| `debug`             | bool | `false` | `--debug`                | Debug output for troubleshooting. |
+| `benchmark_seconds` | int  | `30`    | `--benchmark-time <sec>` | Benchmark duration.               |
+
+### `paths` section
+
+| Key              | Type   | Default         | Description                                 |
+| ---------------- | ------ | --------------- | ------------------------------------------- |
+| `data_dir`       | string | `./processed`   | Directory for processed data and wordlists. |
+| `checkpoint_dir` | string | `./checkpoints` | Directory for save-state files.             |
+| `log_dir`        | string | `./logs`        | Directory for output logs.                  |
+
+These keys are parsed but not yet consumed by every subsystem (see `track-e` finding 7 in the codebase). They are documented as a known gap rather than dropped, so existing configs keep loading.
+
+---
+
+## Common configurations
+
+### Solo puzzle solving with kangaroo
 
 ```yaml
 puzzle:
-  number: 135
+  number: 75
   kangaroo: true
   dp_bits: -1
+  random_search: true
+
+gpu:
+  devices: []
 ```
 
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `number` | int | `0` | Target puzzle (0 = auto-select) |
-| `smart_select` | bool | `true` | Auto-select best ROI puzzle |
-| `kangaroo` | bool | `true` | Use Kangaroo algorithm when possible |
-| `dp_bits` | int | `-1` | Distinguished point bits (-1 = auto) |
-| `random_search` | bool | `true` | Random vs sequential starting positions |
-| `min_bits` | int | `0` | Minimum puzzle bit size |
-| `max_bits` | int | `160` | Maximum puzzle bit size |
+### Pool mining (Collision Protocol)
 
-### Brainwallet Configuration
+```yaml
+pool:
+  url: "jlps://collisionprotocol.com:17403"
+  worker: "1YourBitcoinAddressForRewards"
+```
+
+### Custom range, brute force
+
+```yaml
+puzzle:
+  number: 71 # Used for record-keeping; range below overrides.
+  kangaroo: false # No pubkey for arbitrary addresses, brute force only.
+  target: "13zb1hQbWVsc2S7ZTZnP2G4undNNpdh5so"
+  start: "0x40000000000000000"
+  end: "0x7ffffffffffffffff"
+```
+
+### Multi-GPU with explicit selection
+
+```yaml
+gpu:
+  devices: [0, 2] # Skip GPU 1.
+  batch_size: 0 # Auto-calibrate.
+```
+
+### Brain wallet **(PRO VERSION ONLY)**
 
 ```yaml
 brainwallet:
   enabled: true
   wordlist: "./processed/combined.txt"
   save_interval: 1000000
-```
-
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `enabled` | bool | `false` | Enable brainwallet mode |
-| `wordlist` | string | `""` | Path to wordlist file |
-| `save_interval` | int | `1000000` | Checkpoint interval (passphrases) |
-| `resume` | bool | `false` | Resume from checkpoint |
-
-### GPU Configuration
-
-```yaml
-gpu:
-  devices: [0, 1]
-  batch_size: 0
-```
-
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `devices` | int[] | `[]` | GPU IDs to use (empty = all) |
-| `batch_size` | int | `0` | Batch size (0 = auto) |
-| `force_calibrate` | bool | `false` | Force GPU calibration |
-
----
-
-## Command-Line Arguments
-
-Command-line arguments override config.yml settings.
-
-### Pool Mode
-
-```bash
-./collider --pool <url> --worker <btc_address> [--password <pwd>]
-```
-
-| Argument | Short | Description |
-|----------|-------|-------------|
-| `--pool` | `-p` | Pool URL |
-| `--worker` | `-w` | Worker name (your BTC address) |
-| `--password` | | Pool password |
-
-### Puzzle Mode
-
-```bash
-./collider --puzzle <num> [--kangaroo] [--dp-bits <n>]
-```
-
-| Argument | Short | Description |
-|----------|-------|-------------|
-| `--puzzle` | | Puzzle number (66-160) |
-| `--kangaroo` | `-k` | Use Kangaroo algorithm |
-| `--dp-bits` | | Distinguished point bits |
-| `--smart-select` | | Auto-select best puzzle |
-| `--no-smart` | | Disable smart selection |
-| `--random` | | Random starting positions |
-| `--sequential` | | Sequential starting positions |
-
-### Brainwallet Mode
-
-```bash
-./collider --brainwallet --bloom <file> --wordlist <file>
-```
-
-| Argument | Short | Description |
-|----------|-------|-------------|
-| `--brainwallet` | `-b` | Enable brainwallet mode |
-| `--bloom` | | Bloom filter file |
-| `--wordlist` | | Wordlist file |
-| `--warpwallet` | | Enable WarpWallet mode |
-| `--salt` | | WarpWallet salt (email) |
-| `--resume` | | Resume from checkpoint |
-
-### General Options
-
-```bash
-./collider --gpu 0,1 --verbose --debug
-```
-
-| Argument | Short | Description |
-|----------|-------|-------------|
-| `--gpu` | `-g` | GPU device IDs (comma-separated) |
-| `--benchmark` | | Run benchmark |
-| `--verbose` | `-v` | Verbose output |
-| `--debug` | `-d` | Debug output |
-| `--help` | `-h` | Show help |
-| `--config` | `-c` | Config file path |
-
----
-
-## Common Configurations
-
-### Solo Puzzle Solving
-
-```yaml
-puzzle:
-  number: 135
-  kangaroo: true
-  dp_bits: -1  # Auto-calculate
-  random_search: true
-
-gpu:
-  devices: []  # Use all GPUs
-```
-
-### Pool Mining
-
-```yaml
-pool:
-  url: "jlp://pool.collisionprotocol.com:17403"
-  worker: "bc1qYourBitcoinAddress"
-
-puzzle:
-  kangaroo: true
-
-settings:
-  verbose: false
-```
-
-### Brainwallet Scanning
-
-```yaml
-brainwallet:
-  enabled: true
-  wordlist: "./processed/combined_wordlist.txt"
-  save_interval: 1000000
   resume: false
 
 bloom:
   file: "./funded_addresses.blf"
-
-gpu:
-  devices: []
-  batch_size: 0  # Auto-calibrate
-```
-
-### Multi-GPU Setup
-
-```yaml
-gpu:
-  # Only use GPUs 0 and 2 (skip GPU 1)
-  devices: [0, 2]
-  
-  # Or use all available GPUs
-  # devices: []
-```
-
-### Development/Debug
-
-```yaml
-settings:
-  verbose: true
-  debug: true
-
-gpu:
-  devices: [0]  # Single GPU for testing
-  force_calibrate: true
 ```
 
 ---
 
-## Environment Variables
+## Advanced research flags **(PRO VERSION ONLY)**
 
-Some settings can be overridden via environment variables:
+The following flags are accepted by the parser but not listed in `--help`. They drive the v2 puzzle-mode brain-wallet kernel and are intended for research, not production scanning.
 
-| Variable | Description |
-|----------|-------------|
-| `COLLIDER_CONFIG` | Path to config file |
-| `COLLIDER_DEBUG` | Enable debug mode (`1` or `0`) |
-| `COLLIDER_GPU_DEVICES` | GPU IDs (comma-separated) |
+| Flag                   | Description                                                          |
+| ---------------------- | -------------------------------------------------------------------- |
+| `--puzzle-only-v2`     | Enable the v2 puzzle-mode kernel plus multi-scheme dispatch.         |
+| `--puzzle-keys <file>` | Path to the puzzle keys file (typically `data/puzzle_history.json`). |
+| `--schemes <csv>`      | Comma-separated scheme list (e.g. `all`, or specific names).         |
+| `--addr-types <csv>`   | Comma-separated address types (e.g. `puzzle_only`).                  |
 
-```bash
-# Example
-COLLIDER_DEBUG=1 COLLIDER_GPU_DEVICES=0,1 ./collider --brainwallet
-```
+These flags imply `--brainwallet` (they go through the brain-wallet pipeline). Free builds reject them at the CLI with a Pro-feature message.
 
 ---
 
 ## Validation
 
-theCollider validates configuration on startup:
+theCollider validates configuration on startup. Common errors:
 
-```mermaid
-flowchart TD
-    START[Load Config] --> VALIDATE{Validate}
-    
-    VALIDATE --> |Missing Required| ERR1[Error: Missing pool worker]
-    VALIDATE --> |Invalid Value| ERR2[Error: Invalid puzzle number]
-    VALIDATE --> |File Not Found| ERR3[Error: Wordlist not found]
-    VALIDATE --> |Valid| OK[Start Execution]
-    
-    ERR1 --> HELP[Show Help]
-    ERR2 --> HELP
-    ERR3 --> HELP
-```
-
-### Common Validation Errors
-
-| Error | Cause | Solution |
-|-------|-------|----------|
-| `Pool URL required` | Missing `pool.url` | Add pool URL or use interactive mode |
-| `Worker name required` | Missing `pool.worker` | Add your BTC address |
-| `Bloom filter not found` | Invalid `bloom.file` path | Check file path |
-| `Invalid puzzle number` | `puzzle.number` out of range | Use 66-160 or 0 for auto |
+| Error                                 | Cause                             | Fix                                                                                   |
+| ------------------------------------- | --------------------------------- | ------------------------------------------------------------------------------------- |
+| Conflicting search modes              | Multiple top-level modes selected | Pick one of `--brainwallet`, `--pool`, `--puzzle [N] [--kangaroo]`.                   |
+| `[Pro] --bloom ... ignored`           | Free build, `bloom.file` set      | Brain wallet is **(PRO VERSION ONLY)**.                                               |
+| `[!] Failed to decompress public key` | Malformed `pubkey:` value         | Provide 66 hex chars, leading byte `02`/`03` (or 130 hex with `04` for uncompressed). |
+| `--pubkey accepts 33B compressed`     | Wrong-length pubkey               | Use the 33-byte compressed form.                                                      |
 
 ---
 
 ## Tips
 
-1. **Start with interactive mode** to generate a working config
-2. **Use `--debug`** to see exactly what configuration is being used
-3. **Keep secrets out of config.yml** — Use `--password` on command line instead
-4. **Auto-calibration is usually best** — Only override `batch_size` if you know what you're doing
+- Keep secrets out of `config.yml`. Use the matching CLI flag instead.
+- Use `--debug` to print the resolved configuration after merging CLI plus config.
+- Auto-calibration is usually the right default. Only override `batch_size` when you have measured something.
+- CLI flags always win. If a config value is being ignored, look for a matching CLI flag in the launch command (or a stray environment-set wrapper).
 
 ---
 
-*Need help? Run `./collider --help` or see [USAGE.md](USAGE.md)*
+For runtime usage examples and the full CLI surface, see the [README](../README.md). For the JLP wire format used in pool mode, see [JLP-PROTOCOL.md](JLP-PROTOCOL.md).

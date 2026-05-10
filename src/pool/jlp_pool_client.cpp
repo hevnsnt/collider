@@ -99,6 +99,16 @@ bool JLPPoolClient::init_tls() {
     // the OS "ROOT" cert store into OpenSSL's X509_STORE via wincrypt. This
     // is the same bridge used by tests/test_jlp_pool_handshake.cpp.
     if (verify_cert_) {
+        // v1.4.1 P-T1: track whether ANY trust anchor mechanism
+        // succeeded. If verify_cert is on but no trust store could be
+        // loaded, init_tls must FAIL HARD so operators see a clean
+        // startup diagnostic. Pre-1.4.1 we logged a warning and
+        // continued -- subsequent cert verification would then fail
+        // with a cryptic OpenSSL error during the first connection
+        // attempt, which made the actual root cause (no CA bundle
+        // available on this host) needlessly hard to diagnose.
+        bool trust_loaded = false;
+
 #ifdef _WIN32
         {
             HCERTSTORE hStore = CertOpenSystemStoreA(0, "ROOT");
@@ -124,28 +134,35 @@ bool JLPPoolClient::init_tls() {
                 CertCloseStore(hStore, 0);
                 if (added == 0) {
                     std::cerr << "[Pool] Warning: Windows ROOT store enumerated "
-                                 "0 certs; TLS verification will fail." << std::endl;
+                                 "0 certs; falling back to OpenSSL default verify paths."
+                              << std::endl;
+                    trust_loaded = (SSL_CTX_set_default_verify_paths(ssl_ctx_) == 1);
+                } else {
+                    trust_loaded = true;
                 }
             } else {
                 std::cerr << "[Pool] Warning: CertOpenSystemStoreA(ROOT) failed (err="
                           << (unsigned long)GetLastError()
                           << "); falling back to OpenSSL default verify paths "
                              "(likely empty on Windows)." << std::endl;
-                if (SSL_CTX_set_default_verify_paths(ssl_ctx_) != 1) {
-                    std::cerr << "[Pool] Warning: SSL_CTX_set_default_verify_paths "
-                                 "also failed; TLS verification will fail." << std::endl;
-                }
+                trust_loaded = (SSL_CTX_set_default_verify_paths(ssl_ctx_) == 1);
             }
         }
 #else
-        if (SSL_CTX_set_default_verify_paths(ssl_ctx_) != 1) {
-            // Non-fatal but worth surfacing - hostname verification will
-            // probably fail without trust anchors loaded.
-            std::cerr << "[Pool] Warning: SSL_CTX_set_default_verify_paths "
-                         "failed (system trust store unavailable). TLS "
-                         "verification will likely fail." << std::endl;
-        }
+        trust_loaded = (SSL_CTX_set_default_verify_paths(ssl_ctx_) == 1);
 #endif
+
+        if (!trust_loaded) {
+            std::cerr << "[Pool] FATAL: TLS verification enabled but no trust "
+                         "anchors could be loaded. Install a CA bundle (set "
+                         "SSL_CERT_FILE / SSL_CERT_DIR, or install ca-certificates "
+                         "on Linux), or pass verify_cert=false to skip "
+                         "verification (NOT recommended for production)."
+                      << std::endl;
+            SSL_CTX_free(ssl_ctx_);
+            ssl_ctx_ = nullptr;
+            return false;
+        }
         SSL_CTX_set_verify(ssl_ctx_, SSL_VERIFY_PEER, nullptr);
     } else {
         // Explicit opt-out (e.g., self-signed test cert). Loud warning.
@@ -303,16 +320,34 @@ void JLPPoolClient::cleanup_sockets() {
 // would self-join and deadlock. The receiver path that calls this for
 // receiver_thread_ must therefore happen from a different thread. Currently
 // only disconnect() (caller thread) re-creates these objects.
-void JLPPoolClient::replace_thread(std::thread& t, std::thread new_thread) {
+void JLPPoolClient::replace_thread(std::thread& t, std::thread new_thread) noexcept {
+    // v1.4.1 P-T2: noexcept. The body catches every potential throw
+    // (std::system_error from join/detach, anything from std::cerr)
+    // and std::thread::operator= is itself noexcept per the standard.
+    // Static-asserted below for future-proofing.
+    static_assert(
+        std::is_nothrow_move_assignable<std::thread>::value,
+        "std::thread::operator=(std::thread&&) must be noexcept for "
+        "replace_thread to honor its noexcept declaration");
     if (t.joinable()) {
         // Last-ditch safety. In well-formed code the caller has already signaled
         // running_=false and the old thread has exited, so this is fast.
         try {
             t.join();
         } catch (const std::system_error& e) {
-            std::cerr << "[Pool] thread join failed in replace_thread: "
-                      << e.what() << std::endl;
-            // Detach so destructor doesn't terminate.
+            // We can't `throw`, can't `terminate` quietly. Best
+            // effort: log and detach so the destructor of the
+            // outgoing thread object doesn't terminate.
+            try {
+                std::cerr << "[Pool] thread join failed in replace_thread: "
+                          << e.what() << std::endl;
+            } catch (...) {
+                // std::cerr can technically throw if exceptions are
+                // enabled on it; swallow to honor noexcept.
+            }
+            try { t.detach(); } catch (...) {}
+        } catch (...) {
+            // Any other exception: detach to avoid terminate.
             try { t.detach(); } catch (...) {}
         }
     }
@@ -497,21 +532,10 @@ bool JLPPoolClient::is_connected() const {
 bool JLPPoolClient::authenticate(const std::string& worker_name,
                                  const std::string& password) {
     worker_name_ = worker_name;
-
-    // Wave 4 D-M5 / I: the JLP wire ClientHello has no password field. Warn
-    // loudly if the operator passed one so they don't believe they are
-    // authenticated by password when in fact only their worker name is sent.
-    if (!password.empty()) {
-        static std::once_flag pw_warn_once;
-        std::call_once(pw_warn_once, []() {
-            std::cerr << "[Pool] WARNING: --pool-password was set but JLP "
-                         "protocol authenticates by worker name only. The "
-                         "password is being IGNORED. Remove it to silence this "
-                         "warning, or use a JLP server that supports the AUTH "
-                         "flags reserved for future credential payloads."
-                      << std::endl;
-        });
-    }
+    // v1.4.1 B.2: AUTH wire format (JLPClientHelloV2) carries a real
+    // password slot. Pre-1.4.1 we logged a warning that --pool-password
+    // was being silently ignored; that warning is now obsolete.
+    password_ = password;
 
     // Move to AUTH_SENT before transmitting so the receiver can correctly
     // accept AUTH_OK / AUTH_FAIL when they arrive.
@@ -558,22 +582,51 @@ bool JLPPoolClient::authenticate(const std::string& worker_name,
 }
 
 bool JLPPoolClient::send_hello() {
-    JLPClientHello hello;
-    memset(&hello, 0, sizeof(hello));
-    // Wave 4 D-M6: validate worker_name length to avoid silent truncation.
-    // Bitcoin Bech32m addresses can run up to ~90 chars; if the user passed a
-    // longer one, refuse rather than silently mangle it (rewards go nowhere).
+    // v1.4.1 B.2: send the v2 AUTH wire format. Pre-1.4.1 we sent
+    // JLPClientHello (76 bytes) but the Python server has always
+    // decoded 96 bytes (name + password); gpu_count/speed silently
+    // landed on the password slot. The v2 layout adds a real password
+    // field plus a timestamp_ms and 16-byte nonce so the server can
+    // refuse replays of captured AUTH packets and bound client clock
+    // drift. The pre-existing gpu_count_/speed_ telemetry is dropped
+    // from AUTH because it isn't read on the server side and never was.
+    JLPClientHelloV2 hello;
+    std::memset(&hello, 0, sizeof(hello));
     if (worker_name_.size() >= sizeof(hello.worker_name)) {
         std::cerr << "[Pool] Worker name too long: " << worker_name_.size()
                   << " bytes (max " << (sizeof(hello.worker_name) - 1)
                   << "). Refusing to send truncated identity." << std::endl;
         return false;
     }
-    // memset above zero-fills, so the trailing NUL is guaranteed even though
-    // strncpy wouldn't write it for max-length input.
+    if (password_.size() >= sizeof(hello.password)) {
+        std::cerr << "[Pool] Pool password too long: " << password_.size()
+                  << " bytes (max " << (sizeof(hello.password) - 1)
+                  << "). Refusing to send truncated credentials." << std::endl;
+        return false;
+    }
     std::memcpy(hello.worker_name, worker_name_.data(), worker_name_.size());
-    hello.gpu_count = gpu_count_;
-    hello.speed = speed_;
+    if (!password_.empty()) {
+        std::memcpy(hello.password, password_.data(), password_.size());
+    }
+
+    // Stamp wall-clock time in ms LE. The server tolerates +/- 30s of
+    // skew; clients with a clock more than that off should be fixed.
+    using namespace std::chrono;
+    const auto now_ms = duration_cast<milliseconds>(
+        system_clock::now().time_since_epoch()
+    ).count();
+    hello.timestamp_ms = static_cast<uint64_t>(now_ms);
+
+    // 16-byte CSPRNG nonce. Use std::random_device for entropy; we
+    // call it once per AUTH so the cost is negligible. A weak nonce
+    // (e.g., monotonic counter) would let an attacker predict and
+    // replay before our dedup table sees it.
+    std::random_device rd;
+    for (size_t i = 0; i < sizeof(hello.nonce); i += sizeof(unsigned)) {
+        const unsigned r = rd();
+        const size_t copy = std::min(sizeof(unsigned), sizeof(hello.nonce) - i);
+        std::memcpy(hello.nonce + i, &r, copy);
+    }
 
     return send_message(JLPMessageType::AUTH, &hello, sizeof(hello));
 }
@@ -645,11 +698,63 @@ bool JLPPoolClient::report_solution(const uint8_t* private_key) {
 }
 
 void JLPPoolClient::set_solution_callback(SolutionCallback cb) {
+    std::lock_guard<std::mutex> lock(callbacks_mutex_);
     solution_callback_ = cb;
 }
 
 void JLPPoolClient::set_work_callback(WorkCallback cb) {
+    std::lock_guard<std::mutex> lock(callbacks_mutex_);
     work_callback_ = cb;
+}
+
+// v1.4.1 C.3: dedup + safe-fire helpers.
+//
+// Both helpers consolidate the copy-callback-under-lock-then-call-
+// outside pattern that pre-1.4.1 was hand-coded only at the
+// WORK_ASN site (and skipped entirely at the SOLUTION site). The
+// dedup keys:
+//
+//   * fire_solution_callback: 32-byte recovered pubkey (the SOLUTION
+//     payload). A retransmitted solution from the server has the
+//     same bytes; duplicates would otherwise let the caller leak
+//     the recovered key twice (logs, filesystem, network).
+//   * fire_work_callback: WorkAssignment.work_id. The server should
+//     not re-issue an identical work_id, but it's cheap defense and
+//     prevents duplicate kangaroo-restarts on a flaky link.
+//
+// Both lock on the same mutex as set_*_callback so the function
+// pointer can never tear and the dedup state stays consistent.
+void JLPPoolClient::fire_solution_callback(const uint8_t* pubkey_bytes) {
+    SolutionCallback cb;
+    {
+        std::lock_guard<std::mutex> lock(callbacks_mutex_);
+        if (solution_fired_
+            && std::memcmp(last_solution_pubkey_.data(), pubkey_bytes, 32) == 0) {
+            // Same pubkey already delivered; suppress.
+            return;
+        }
+        std::memcpy(last_solution_pubkey_.data(), pubkey_bytes, 32);
+        solution_fired_ = true;
+        cb = solution_callback_;
+    }
+    if (cb) {
+        cb(pubkey_bytes);
+    }
+}
+
+void JLPPoolClient::fire_work_callback(const WorkAssignment& work) {
+    WorkCallback cb;
+    {
+        std::lock_guard<std::mutex> lock(callbacks_mutex_);
+        if (last_work_id_fired_ == work.work_id) {
+            return;
+        }
+        last_work_id_fired_ = work.work_id;
+        cb = work_callback_;
+    }
+    if (cb) {
+        cb(work);
+    }
 }
 
 bool JLPPoolClient::send_message(JLPMessageType type, const void* data, size_t size) {
@@ -950,9 +1055,17 @@ void JLPPoolClient::sender_loop() {
         //    (work_mutex_ then dp_mutex_); we mirror that order here to
         //    avoid a deadlock cycle.
         uint64_t current_work_id = 0;
+        // v1.4.1 B.1: snapshot the sequence counter under work_mutex_,
+        // assign sequences to each DP in the drained batch, then write
+        // the bumped counter back. Doing the bump under work_mutex_ (not
+        // dp_mutex_) keeps the counter aligned with current_work_id;
+        // when WORK_ASN resets dp_sequence_next_=0 the sender sees the
+        // reset on its next snapshot.
+        uint32_t seq_start = 0;
         {
             std::lock_guard<std::mutex> wlock(work_mutex_);
             current_work_id = current_work_.work_id;
+            seq_start = dp_sequence_next_;
         }
 
         // 3. Drain the queue under dp_mutex_ alone.
@@ -971,6 +1084,14 @@ void JLPPoolClient::sender_loop() {
                         p[i] = static_cast<uint8_t>((current_work_id >> (8 * i)) & 0xFFu);
                     }
                 }
+                {
+                    // v1.4.1 B.1: per-(worker, work_id) sequence (LE).
+                    uint32_t seq = seq_start + static_cast<uint32_t>(batch.size());
+                    uint8_t* p = reinterpret_cast<uint8_t*>(&jlp_dp.sequence);
+                    for (int i = 0; i < 4; ++i) {
+                        p[i] = static_cast<uint8_t>((seq >> (8 * i)) & 0xFFu);
+                    }
+                }
                 memcpy(jlp_dp.x, dp.x, 32);
                 memcpy(jlp_dp.d, dp.d, 32);
                 jlp_dp.type = dp.type;
@@ -980,12 +1101,30 @@ void JLPPoolClient::sender_loop() {
             }
         }
 
+        // 4. Advance the sequence counter ONLY IF the current work_id
+        // is still the one we drafted this batch under. If WORK_ASN
+        // raced our drain (work_id changed mid-flight), don't overwrite
+        // the new chunk's reset counter -- compare-and-set semantics
+        // under the lock. Done OUTSIDE dp_mutex_ to keep the lock order
+        // (work_mutex_ then dp_mutex_).
+        if (!batch.empty()) {
+            std::lock_guard<std::mutex> wlock(work_mutex_);
+            if (current_work_.work_id == current_work_id) {
+                dp_sequence_next_ = seq_start + static_cast<uint32_t>(batch.size());
+            }
+            // else: WORK_ASN swapped chunks while we were draining;
+            // the DPs in the batch are tagged with the OLD work_id and
+            // will be rejected by the server's work_id check anyway.
+            // Leave the new chunk's counter at whatever WORK_ASN reset
+            // it to (typically 0).
+        }
+
         // Send batch (only after AUTH_OK; before then the server will reject
         // these and we'd be sending plaintext DPs to an unauthenticated channel).
         if (!batch.empty() && connected_
             && auth_state_.load() == AuthState::AUTH_OK) {
-            // Wire format expected by the pool: [count:u32 LE][dp1:74][dp2:74]...
-            // (DP_BATCH_V2 uses 74-byte v2 entries; the leading u32 count is
+            // Wire format expected by the pool: [count:u32 LE][dp1:78][dp2:78]...
+            // (DP_BATCH_V2 uses 78-byte v2 entries post-1.4.1 B.1; the leading u32 count is
             // capped at 10000 server-side, so without it the first 4 bytes of
             // the first DP get interpreted as the count and the server tears
             // down the connection with "Batch count N exceeds max 10000".)
@@ -1092,10 +1231,14 @@ void JLPPoolClient::handle_server_message(const JLPHeader& header,
                     std::cerr << "[DEBUG] Parsed pubkey: " << pk_hex << std::endl;
                 }
 
-                // Copy work data and callback pointer INSIDE lock, then call OUTSIDE
-                // This prevents deadlock if callback tries to acquire any lock
+                // v1.4.1 C.3: snapshot the work assignment under
+                // work_mutex_, then delegate to fire_work_callback,
+                // which dedups by work_id and copies the callback
+                // pointer under callbacks_mutex_ before calling
+                // outside any lock. Pre-1.4.1 this was inlined here
+                // and only protected by work_mutex_; a concurrent
+                // set_work_callback could race with the read.
                 WorkAssignment work_copy;
-                WorkCallback cb_copy;
                 {
                     std::lock_guard<std::mutex> lock(work_mutex_);
                     memcpy(current_work_.public_key, config->public_key, 33);
@@ -1104,17 +1247,18 @@ void JLPPoolClient::handle_server_message(const JLPHeader& header,
                     current_work_.dp_bits = config->dp_bits;
                     current_work_.work_id = config->work_id;
                     work_received_ = true;  // chunk ID 0 is valid; don't use work_id as sentinel
+                    // v1.4.1 B.1: per-chunk DP sequence resets at the
+                    // start of every assignment. The server expects
+                    // sequences to start at 0 and grow monotonically
+                    // for each (worker, work_id) pair.
+                    dp_sequence_next_ = 0;
                     work_copy = current_work_;
-                    cb_copy = work_callback_;
                 }
 
                 std::cout << "[Pool] Received work assignment (ID: " << config->work_id
                           << ", DP bits: " << config->dp_bits << ")" << std::endl;
 
-                // Call callback OUTSIDE the lock to prevent deadlock
-                if (cb_copy) {
-                    cb_copy(work_copy);
-                }
+                fire_work_callback(work_copy);
             }
             break;
         }
@@ -1176,8 +1320,12 @@ void JLPPoolClient::handle_server_message(const JLPHeader& header,
 
         case JLPMessageType::SOLUTION: {  // Solution found (bidirectional)
             std::cout << "[Pool] SOLUTION FOUND!" << std::endl;
-            if (solution_callback_ && payload.size() >= 32) {
-                solution_callback_(payload.data());
+            // v1.4.1 C.3: route through dedup helper so a server-side
+            // retransmit (or any duplicate SOLUTION delivery) does not
+            // fire the user's solution callback twice. Pre-1.4.1 the
+            // raw callback was read and called without a lock.
+            if (payload.size() >= 32) {
+                fire_solution_callback(payload.data());
             }
             break;
         }

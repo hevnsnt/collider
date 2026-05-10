@@ -8,8 +8,18 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 
+#include "hash_rounds.cuh"
+
 namespace collider {
 namespace gpu {
+
+using ::collider::gpu::sha256::rotr;
+using ::collider::gpu::sha256::ch;
+using ::collider::gpu::sha256::maj;
+using ::collider::gpu::sha256::sigma0;
+using ::collider::gpu::sha256::sigma1;
+using ::collider::gpu::sha256::gamma0;
+using ::collider::gpu::sha256::gamma1;
 
 // SHA256 constants
 static __constant__ uint32_t K[64] = {
@@ -37,34 +47,7 @@ static __constant__ uint32_t SHA256_H0[8] = {
     0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
 };
 
-// Bitwise operations
-__device__ __forceinline__ uint32_t rotr(uint32_t x, uint32_t n) {
-    return (x >> n) | (x << (32 - n));
-}
-
-__device__ __forceinline__ uint32_t ch(uint32_t x, uint32_t y, uint32_t z) {
-    return (x & y) ^ (~x & z);
-}
-
-__device__ __forceinline__ uint32_t maj(uint32_t x, uint32_t y, uint32_t z) {
-    return (x & y) ^ (x & z) ^ (y & z);
-}
-
-__device__ __forceinline__ uint32_t sigma0(uint32_t x) {
-    return rotr(x, 2) ^ rotr(x, 13) ^ rotr(x, 22);
-}
-
-__device__ __forceinline__ uint32_t sigma1(uint32_t x) {
-    return rotr(x, 6) ^ rotr(x, 11) ^ rotr(x, 25);
-}
-
-__device__ __forceinline__ uint32_t gamma0(uint32_t x) {
-    return rotr(x, 7) ^ rotr(x, 18) ^ (x >> 3);
-}
-
-__device__ __forceinline__ uint32_t gamma1(uint32_t x) {
-    return rotr(x, 17) ^ rotr(x, 19) ^ (x >> 10);
-}
+// Bitwise operations now come from hash_rounds.cuh via the using-decls above.
 
 /**
  * SHA256 hash of a single message.

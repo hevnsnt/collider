@@ -1,187 +1,90 @@
-# =============================================================================
-# collider configuration file
-# =============================================================================
-# Copy this file to config.yml and customize for your setup.
-# Command-line arguments override these settings.
+# theCollider v1.4.1 -- example config.yml
 #
-# Config file search order:
-#   1. ./config.yml (current directory)
-#   2. ~/.collider/config.yml (home directory)
-# =============================================================================
+# Copy this file to ./config.yml (or ~/.collider/config.yml) and edit
+# in place. Anything unset falls back to the built-in default. CLI
+# flags ALWAYS win over config.yml values when both are supplied.
+#
+# Schema reference: src/core/yaml_config.hpp::AppConfig.
 
-# -----------------------------------------------------------------------------
-# Pool Mining Configuration
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Pool mode (distributed solving via the JLP protocol).
+# ---------------------------------------------------------------------------
+# Most users only need `worker` (Bitcoin address) and `url`. password +
+# api_key are present for compatibility with non-default pools that
+# require them; Collision Protocol's public pool does not.
 pool:
-  # Your Bitcoin address for receiving rewards
-  # This is your identity in the pool - use a valid BTC address you control
-  worker: "bc1qYourBitcoinAddressHere"
-  
-  # Pool server URL (default: collisionprotocol.com:17403)
-  # Note: Free edition always uses the default pool
-  url: "collisionprotocol.com:17403"
-  
-  # Optional: Pool password (if required by pool)
-  # password: ""
-  
-  # Optional: API key for authenticated pools
-  # api_key: ""
+  worker: "1YourBitcoinAddressForRewards"
+  url: "jlps://collisionprotocol.com:17403" # jlps:// = TLS (recommended)
+  # password: "..."
+  # api_key: "..."
 
-# -----------------------------------------------------------------------------
-# Puzzle Configuration (Solo Mode)
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Standalone puzzle mode (no pool, this machine solves directly).
+# ---------------------------------------------------------------------------
 puzzle:
-  # Target puzzle number (0 = use pool's current puzzle)
-  # Puzzle #135 is the current active puzzle with 13.5 BTC
-  number: 0
-  
-  # Auto-select optimal puzzle based on progress
-  smart_select: true
-  
-  # Puzzle bit range limits
-  min_bits: 0
-  max_bits: 160
-  
-  # Use Kangaroo algorithm (required for puzzles with known public keys)
-  kangaroo: true
-  
-  # Distinguished point bits (-1 = auto-calculate optimal value)
-  # Higher = fewer DPs stored, lower = more DPs but faster collision detection
-  dp_bits: -1
-  
-  # Randomize search starting points
-  random_search: true
-  
-  # Automatically move to next puzzle when solved
-  auto_next: false
-  
-  # Checkpoint file for resuming interrupted searches
-  # checkpoint: "./checkpoints/puzzle135.ckpt"
+  # number: 71            # Specific puzzle by number (otherwise smart-select)
+  # smart_select: true    # ROI-rank when picking among unsolved puzzles
+  # min_bits: 71          # Lower bound for --all-unsolved iteration
+  # max_bits: 160         # Upper bound for --all-unsolved iteration
+  # kangaroo: true        # Force kangaroo (only works on revealed-pubkey puzzles)
+  # dp_bits: 25           # Distinguished-point bits, 16-28 (default: auto)
+  # random_search: true   # Random walk within range (default true)
+  # auto_next: false      # Advance to next puzzle after solving
+  # checkpoint: "./puzzle.ckpt"
 
-# -----------------------------------------------------------------------------
-# GPU Configuration
-# -----------------------------------------------------------------------------
-gpu:
-  # GPU device IDs to use (empty = use all available GPUs)
-  # Example: [0] for first GPU only, [0, 1] for first two GPUs
-  devices: []
-  
-  # Batch size for GPU operations (0 = auto-tune)
-  # Larger values use more VRAM but may improve throughput
-  batch_size: 0
-  
-  # Force GPU calibration on startup
-  force_calibrate: false
+  # ------------------------------------------------------------
+  # v1.4.1: per-run target / range / pubkey override.
+  #
+  # Use these to scan a custom address + range without modifying the
+  # bundled puzzle data. Most users won't need them; they're for
+  # research targets, newly-revealed pubkeys, or testing.
+  #
+  # Kangaroo requires the public key. The bundled puzzle_history.json
+  # already has every revealed pubkey for the canonical Bitcoin Puzzle
+  # Challenge (multiples of 5 in 71-160 plus all solved puzzles below
+  # 71). For a target outside that set, supply `pubkey:` here too.
+  # ------------------------------------------------------------
+  # target:  "13zb1hQbWVsc2S7ZTZnP2G4undNNpdh5so"  # Bitcoin address
+  # start:   "0x40000000000000000"                  # Range start (hex)
+  # end:     "0x7ffffffffffffffff"                  # Range end (hex)
+  # pubkey:  "02..."                                # 33-byte compressed pubkey
 
-# -----------------------------------------------------------------------------
-# General Settings
-# -----------------------------------------------------------------------------
-settings:
-  # Enable verbose output
-  verbose: false
-  
-  # Enable debug output (very noisy)
-  debug: false
-  
-  # Benchmark duration in seconds
-  benchmark_seconds: 30
-
-# -----------------------------------------------------------------------------
-# Directory Paths
-# -----------------------------------------------------------------------------
-paths:
-  # Directory for processed wordlists and data files
-  data_dir: "./processed"
-  
-  # Directory for checkpoint files
-  checkpoint_dir: "./checkpoints"
-  
-  # Directory for log files
-  log_dir: "./logs"
-
-# =============================================================================
-# PRO-ONLY FEATURES
-# The following sections require collider pro: collisionprotocol.com/pro
-# Uncomment and configure after purchasing.
-# =============================================================================
-
-# -----------------------------------------------------------------------------
-# Brain Wallet Scanner (Pro)
-# Scan passphrases against funded Bitcoin addresses
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Brain wallet mode (Pro feature). FREE builds silently ignore this section.
+# ---------------------------------------------------------------------------
 # brainwallet:
-#   # Enable dedicated brainwallet cracking mode
 #   enabled: false
-#   
-#   # Primary wordlist file (rockyou.txt, passwords.txt, etc.)
 #   wordlist: "./wordlists/rockyou.txt"
-#   
-#   # Save progress every N candidates (for resume capability)
 #   save_interval: 1000000
-#   
-#   # Resume from last checkpoint
 #   resume: false
 
-# -----------------------------------------------------------------------------
-# Bloom Filter (Pro)
-# 50M+ funded Bitcoin addresses for opportunistic scanning
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Bloom filter (Pro feature; .blf file with funded addresses).
+# ---------------------------------------------------------------------------
 # bloom:
-#   # Path to bloom filter file (.blf format)
-#   # Pre-built filter included with Pro, or build your own from UTXO dump
 #   file: "./funded_addresses.blf"
 
-# -----------------------------------------------------------------------------
-# Passphrase Generation (Pro)
-# Advanced candidate generation for brainwallet cracking
-# -----------------------------------------------------------------------------
-# generator:
-#   # Directory containing hashcat-compatible rule files
-#   # Included: best64.rule, rockyou-30000.rule, d3ad0ne.rule, etc.
-#   rules_dir: "./rules"
-#   
-#   # PCFG (Probabilistic Context-Free Grammar) model
-#   # Learns password patterns from training data
-#   pcfg_model: "./models/rockyou.pcfg"
-#   
-#   # Markov chain order (2-4, higher = more accurate but slower)
-#   markov_order: 3
-#   
-#   # Markov chain model file
-#   markov_model: "./models/rockyou.markov"
-#   
-#   # Enable pattern learning from discoveries
-#   enable_feedback: true
-#   
-#   # Candidates per GPU batch (1M default for optimal throughput)
-#   batch_size: 1000000
+# ---------------------------------------------------------------------------
+# GPU configuration.
+# ---------------------------------------------------------------------------
+gpu:
+  # devices: [0, 1]      # Specific GPU IDs (default: auto-detect all)
+  # batch_size: 4000000  # Keys per batch
+  # force_calibrate: false
 
-# -----------------------------------------------------------------------------
-# WarpWallet / Scrypt (Pro)
-# Crack WarpWallet-style brain wallets with email salt
-# -----------------------------------------------------------------------------
-# warpwallet:
-#   # Enable WarpWallet mode (uses scrypt, much slower than SHA256)
-#   enabled: false
-#   
-#   # Email addresses to use as salt (one per line)
-#   emails_file: "./emails.txt"
-#   
-#   # Or specify a single email
-#   email: "user@example.com"
+# ---------------------------------------------------------------------------
+# General settings.
+# ---------------------------------------------------------------------------
+settings:
+  # verbose: false
+  # debug: false
+  # benchmark_seconds: 30
 
-# -----------------------------------------------------------------------------
-# Rule Engine (Pro)
-# Hashcat-compatible password transformation rules
-# -----------------------------------------------------------------------------
-# rules:
-#   # Rule files to load (in order of priority)
-#   files:
-#     - "./rules/best64.rule"
-#     - "./rules/rockyou-30000.rule"
-#   
-#   # Enable GPU-accelerated rule application
-#   gpu_rules: true
-#   
-#   # Maximum rules to apply per base word
-#   max_rules_per_word: 1000
+# ---------------------------------------------------------------------------
+# Working directories. (Currently parsed but not yet consumed by every
+# subsystem; see track-e finding 7 in the codebase.)
+# ---------------------------------------------------------------------------
+# paths:
+#   data_dir: "./processed"
+#   checkpoint_dir: "./checkpoints"
+#   log_dir: "./logs"

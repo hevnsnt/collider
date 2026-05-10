@@ -302,9 +302,9 @@ void PoolManager::stop_supervisor() {
 
 void PoolManager::supervisor_loop() {
     // Backoff state. Reset to kInitialBackoffMs on every successful
-    // reconnect; doubles up to kMaxBackoffMs on each consecutive
-    // failure. Jitter avoids thundering-herd against the pool when
-    // a fleet of workers reconnects together.
+    // reconnect; doubles up to MAX_RECONNECT_BACKOFF_MS on each
+    // consecutive failure. Jitter avoids thundering-herd against the
+    // pool when a fleet of workers reconnects together.
     uint32_t backoff_ms = kInitialBackoffMs;
     uint32_t consecutive_failures = 0;
     std::random_device rd;
@@ -399,13 +399,13 @@ void PoolManager::supervisor_loop() {
 
         if (!client_->connect(config_.host, config_.port)) {
             ++consecutive_failures;
-            backoff_ms = std::min(kMaxBackoffMs, backoff_ms * 2);
+            backoff_ms = std::min(MAX_RECONNECT_BACKOFF_MS, backoff_ms * 2);
             continue;
         }
         if (!client_->authenticate(config_.worker_name, config_.password)) {
             client_->disconnect();
             ++consecutive_failures;
-            backoff_ms = std::min(kMaxBackoffMs, backoff_ms * 2);
+            backoff_ms = std::min(MAX_RECONNECT_BACKOFF_MS, backoff_ms * 2);
             continue;
         }
 

@@ -49,6 +49,24 @@ struct AppConfig {
     bool auto_next = false;
     std::string checkpoint;
 
+    // v1.4.1: per-run target / range / pubkey override. Each field is
+    // empty by default; non-empty values overlay onto Arguments only
+    // when the matching CLIFlags bit is unset (CLI flags win).
+    //
+    //   target   - Bitcoin address to scan against (overrides the
+    //              puzzle's bundled address from puzzle_history.json)
+    //   start    - Range start in hex (with 0x prefix)
+    //   end      - Range end in hex (with 0x prefix)
+    //   pubkey   - 33-byte compressed public key in hex (02/03 + 32B).
+    //              Required for kangaroo when scanning a target whose
+    //              pubkey isn't already in puzzle_history.json (rare;
+    //              only useful for newly-revealed pubkeys or research
+    //              targets outside the canonical Bitcoin Puzzle set).
+    std::string puzzle_target;
+    std::string puzzle_start;
+    std::string puzzle_end;
+    std::string puzzle_pubkey;
+
     // Brainwallet configuration
     bool brainwallet_enabled = false;
     std::string wordlist;
@@ -225,6 +243,11 @@ private:
             else if (key == "random_search") random_search = parse_bool(value);
             else if (key == "auto_next") auto_next = parse_bool(value);
             else if (key == "checkpoint") checkpoint = value;
+            // v1.4.1: target / range / pubkey overrides
+            else if (key == "target") puzzle_target = value;
+            else if (key == "start") puzzle_start = value;
+            else if (key == "end") puzzle_end = value;
+            else if (key == "pubkey") puzzle_pubkey = value;
         }
         else if (section == "brainwallet") {
             if (key == "enabled") brainwallet_enabled = parse_bool(value);
@@ -283,6 +306,84 @@ private:
         }
         return result;
     }
+
+public:
+    // -----------------------------------------------------------------------
+    // Pool worker (BTC payout address) persistence.
+    //
+    // Guided mode in interactive_ui calls save_pool_worker() after the user
+    // enters their BTC address so the next launch defaults to it. We touch
+    // ONLY ~/.collider/config.yml (or %USERPROFILE%/.collider/config.yml on
+    // Windows) -- never the user's working-directory ./config.yml, which is
+    // the operator-managed file. A power user with their own config remains
+    // in control; the home-directory file is purely the "remember my BTC
+    // address from guided mode" store.
+    //
+    // Returns the path written, or empty string on any failure (callers
+    // emit a hint, never abort).
+    // -----------------------------------------------------------------------
+    static std::string save_pool_worker(const std::string& worker_addr,
+                                         const std::string& pool_url = "") {
+        if (worker_addr.empty()) return {};
+
+        std::string home;
+#ifdef _WIN32
+        const char* userprofile = std::getenv("USERPROFILE");
+        home = userprofile ? userprofile : "";
+#else
+        const char* home_env = std::getenv("HOME");
+        home = home_env ? home_env : "";
+#endif
+        if (home.empty()) return {};
+
+        std::filesystem::path dir = std::filesystem::path(home) / ".collider";
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        // Even if create_directories fails (e.g. read-only home), keep
+        // going -- the open-for-write below will be the authoritative
+        // failure point.
+
+        const std::filesystem::path file_path = dir / "config.yml";
+
+        // If the file already exists and has a pool.worker line, do
+        // nothing. Operator preference wins; never silently overwrite.
+        if (std::filesystem::exists(file_path)) {
+            std::ifstream existing(file_path);
+            std::string line;
+            bool in_pool = false;
+            while (std::getline(existing, line)) {
+                std::string trim = line;
+                size_t indent = 0;
+                while (indent < trim.size() && (trim[indent] == ' ' || trim[indent] == '\t')) ++indent;
+                std::string key = trim.substr(indent);
+                if (indent == 0 && key.rfind("pool:", 0) == 0) {
+                    in_pool = true;
+                } else if (indent == 0 && !key.empty() && key[0] != '#') {
+                    in_pool = false;
+                }
+                if (in_pool && key.rfind("worker:", 0) == 0) {
+                    return file_path.string();  // Already configured.
+                }
+            }
+            // Existing file but no pool.worker -- don't risk corrupting
+            // it with a hand-rolled YAML edit. Hint and return.
+            return {};
+        }
+
+        // File does not exist -- write a minimal new one.
+        std::ofstream out(file_path);
+        if (!out) return {};
+        out << "# theCollider config (auto-created from guided mode).\n";
+        out << "# Edit freely -- the format is documented in example-config.yml.\n";
+        out << "\n";
+        out << "pool:\n";
+        out << "  worker: \"" << worker_addr << "\"\n";
+        if (!pool_url.empty()) {
+            out << "  url: \"" << pool_url << "\"\n";
+        }
+        out << "\n";
+        return file_path.string();
+    }
 };
 
 /**
@@ -315,6 +416,11 @@ struct CLIFlags {
     bool puzzle_auto_next_set = false;  // --auto-next
     bool puzzle_kangaroo_set = false;   // --kangaroo
     bool smart_select_set = false;      // --no-smart
+    // v1.4.1: per-run override flags
+    bool puzzle_target_set = false;     // --puzzle-target
+    bool puzzle_start_set = false;      // --puzzle-start
+    bool puzzle_end_set = false;        // --puzzle-end
+    bool puzzle_pubkey_set = false;     // --pubkey
 
     // Brainwallet / search
     bool resume_set = false;            // --resume
@@ -379,6 +485,20 @@ void apply_config_to_args(Arguments& args, const AppConfig& config, const CLIFla
     }
     if (!cli.puzzle_checkpoint_set && !config.checkpoint.empty()) {
         args.puzzle_checkpoint = config.checkpoint;
+    }
+
+    // v1.4.1: target / range / pubkey overlay. CLI wins when set.
+    if (!cli.puzzle_target_set && !config.puzzle_target.empty()) {
+        args.puzzle_target = config.puzzle_target;
+    }
+    if (!cli.puzzle_start_set && !config.puzzle_start.empty()) {
+        args.puzzle_range_start = config.puzzle_start;
+    }
+    if (!cli.puzzle_end_set && !config.puzzle_end.empty()) {
+        args.puzzle_range_end = config.puzzle_end;
+    }
+    if (!cli.puzzle_pubkey_set && !config.puzzle_pubkey.empty()) {
+        args.puzzle_pubkey = config.puzzle_pubkey;
     }
 
     // Boolean settings: config wins only if CLI did not set a *_set bit.

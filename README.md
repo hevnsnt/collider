@@ -1,241 +1,259 @@
-<p align="center">
-  <img src="docs/assets/logo.png" alt="theCollider Logo" width="200" />
-</p>
+# theCollider
 
-<h1 align="center">theCollider</h1>
+GPU-accelerated solver for the [Bitcoin Puzzle Challenge](https://privatekeys.pw/puzzles/bitcoin-puzzle-tx) (1000 BTC distributed across 160 secp256k1 ranges of progressively larger size, designed by the Bitcoin author to be solvable only at scale).
 
-<p align="center">
-  <strong>GPU-accelerated Bitcoin Puzzle solver with built-in pool client</strong>
-</p>
+**theCollider** is two products with a shared core:
 
-<p align="center">
-  <a href="#what-it-does">What it does</a> •
-  <a href="#quick-start">Quick start</a> •
-  <a href="#performance">Performance</a> •
-  <a href="#pool-mining">Pool</a> •
-  <a href="#documentation">Docs</a> •
-  <a href="#pro-edition">Pro</a>
-</p>
+- **theCollider** (free, MIT). Pollard's Kangaroo and brute-force scanners for the Bitcoin Puzzle Challenge, plus a JLP pool client for distributed solving.
+- **theCollider Pro**. Adds the brain-wallet pipeline (passphrase generation plus bloom-filter lookup against funded address sets), license-gated. See [collisionprotocol.com/pro](https://collisionprotocol.com/pro).
 
-<p align="center">
-  <img src="https://img.shields.io/badge/version-1.2.1-blue.svg" alt="Version 1.2.1" />
-  <img src="https://img.shields.io/badge/CUDA-12.x-76B900.svg?logo=nvidia" alt="CUDA 12.x" />
-  <img src="https://img.shields.io/badge/Windows-0078D6?logo=windows" alt="Windows" />
-  <img src="https://img.shields.io/badge/macOS-000000?logo=apple" alt="macOS" />
-  <img src="https://img.shields.io/badge/Linux-FCC624?logo=linux&logoColor=black" alt="Linux" />
-  <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT License" />
-</p>
+This README covers both. Pro-only features are tagged **(PRO VERSION ONLY)**.
 
 ---
 
-## What it does
+## Background you actually need
 
-The **Bitcoin Puzzle Challenge** locks ~1000 BTC behind 256 progressively harder private-key ranges. Cracking the high-bit puzzles individually is computationally infeasible; the realistic path is collaborative computation across many GPUs.
+### Which puzzles are kangaroo-able
 
-**theCollider Free** is the puzzle-solving piece of that path:
+Pollard's Kangaroo recovers a private key from a **public key plus range** in roughly the square root of n group operations. It cannot run on an address alone. Addresses are SHA-256+RIPEMD-160 of the pubkey, and that hash is one-way.
 
-- **Pollard's Kangaroo** with the K=1.15 symmetry exploit (RCKangaroo), runs on every NVIDIA GPU back to compute capability 7.5 (RTX 20-series and newer). 8 GKeys/s on a single RTX 4090.
-- **JLP pool client** that talks to [collisionprotocol.com](https://collisionprotocol.com) (or any compatible JLP server) over TLS 1.3 with hostname verification. Connect a worker, get assigned a chunk, stream distinguished points, watch your share grow.
-- **Cross-machine session share**: workers on multiple boxes that use the same Bitcoin payout address aggregate server-side -- your dashboard shows your real contribution percentage across every machine, not per-box subtotals.
-- **Multi-platform**: Linux x64 (CUDA), Windows x64 (CUDA), macOS arm64 (Metal/CPU fallback for pool mode).
+A pubkey is only knowable for an address that has had a _spending_ transaction (the input script reveals it). For the Bitcoin Puzzle Challenge:
 
-```mermaid
-graph LR
-    subgraph "theCollider Free"
-        A[Puzzle Solver<br/>Kangaroo K=1.15] --> D[Multi-GPU Engine]
-        C[Pool Client<br/>JLP + TLS 1.3] --> D
-    end
-    D --> E[Solutions]
+- **Solved puzzles** (1 to 70 plus every multiple of 5 up to 130, 82 in total). Pubkey known by definition (someone spent them). Bundled in `data/puzzle_history.json`.
+- **Multiples of 5 in 71 to 160** (75, 80, 85, ..., 160). Partial-solved and spent at some point. Pubkey revealed. Bundled.
+- **Non-multiples of 5 above 71** (71, 72, 73, 74, 76, 77, ...). Pure addresses, never spent. **The pubkey is mathematically unknown to anyone, anywhere**, until someone partial-solves and broadcasts a spending transaction. Until then: brute force is the only option.
 
-    style A fill:#4a9eff,color:#fff
-    style C fill:#8b5cf6,color:#fff
-    style E fill:#f59e0b,color:#fff
+`./collider --puzzle N --kangaroo` does the right thing in v1.4.1 when puzzle N has no bundled pubkey:
+
+- In `--all-unsolved` or `--auto-next` worklist mode: silently demote that puzzle to brute force and continue.
+- In single-puzzle interactive mode (TTY): prompt for a pubkey, with ENTER falling back to brute force.
+- In single-puzzle non-interactive mode (piped / CI): silently demote and log it.
+
+`--kangaroo` on a known-pubkey puzzle works on Windows and Linux (CUDA backend) and on macOS (Metal backend, with the Jacobian rewrite shipped in v1.4.1).
+
+### Brute force vs. Kangaroo, in one paragraph
+
+Kangaroo runs in roughly the square root of n group operations. Brute force runs in n. For a 71-bit puzzle, that is the difference between roughly 2^35 and 2^71 operations. If a puzzle's pubkey is known, kangaroo is the only sane choice. If it is not, brute force is the only choice. On consumer hardware, anything above roughly 64 bits is multi-decade brute-force territory, so attention concentrates on the kangaroo-able multiples of 5.
+
+---
+
+## Quick Start
+
+### Get a binary
+
+[GitHub releases](https://github.com/hevnsnt/collider/releases) (free edition). Linux x64 plus CUDA, Windows x64 plus CUDA, macOS arm64 plus Metal. **(PRO VERSION ONLY)** builds are issued per-license to paying customers via the dashboard.
+
+### Run the easiest unsolved puzzle
+
 ```
+./collider
+```
+
+Default behavior: ROI-rank all puzzles by reward divided by expected ops, pick the best, fire kangaroo if the pubkey is bundled, fall back to brute force otherwise.
+
+### Run a specific puzzle with kangaroo
+
+```
+./collider --puzzle 75 --kangaroo
+```
+
+(Puzzle 75 has a revealed pubkey; bundled. Kangaroo on the 75-bit range targets roughly 2^37 steps.)
+
+### Pool mode (distributed)
+
+```
+./collider --pool jlps://collisionprotocol.com:17403 --worker 1YourBitcoinAddress
+```
+
+You receive work assignments (chunk plus work_id), submit distinguished points, and earn shares. The pool's anti-cheat verifier (math plus work_id attestation plus AUTH replay protection plus per-DP sequence nonce in v1.4.1) is documented at [collisionprotocol.com](https://collisionprotocol.com) and in [docs/JLP-PROTOCOL.md](docs/JLP-PROTOCOL.md).
+
+---
+
+## CLI reference
+
+Full list: `./collider --help`. The most useful flags:
+
+| Flag                                          | Effect                                                                                                             |
+| --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `--puzzle N`, `-P`                            | Target puzzle N. Default: ROI-pick the best unsolved puzzle.                                                       |
+| `--kangaroo`                                  | Force kangaroo. Requires a known pubkey for the target. Demotes to brute force if no pubkey is available (v1.4.1). |
+| `--puzzle-target <addr>`                      | Override target Bitcoin address (independent of `--puzzle N`).                                                     |
+| `--puzzle-start <hex>`                        | Override range start. Format: `0x...`.                                                                             |
+| `--puzzle-end <hex>`                          | Override range end.                                                                                                |
+| `--pubkey <hex>`                              | 33-byte compressed pubkey (02.../03...). Only needed when scanning a target whose pubkey isn't bundled (rare).     |
+| `--all-unsolved`                              | Auto-progress through unsolved puzzles in turn.                                                                    |
+| `--puzzle-min-bits N` / `--puzzle-max-bits N` | Bound `--all-unsolved` to a bit-range.                                                                             |
+| `--auto-next`                                 | After solving, advance to the next puzzle automatically.                                                           |
+| `--puzzle-checkpoint <file>`                  | Save / resume search state.                                                                                        |
+| `--dp-bits N`                                 | Distinguished-point bits for kangaroo. Default: auto. Manual override: 16 to 28.                                   |
+| `--random` / `--sequential`                   | Search direction within the range. Default: random.                                                                |
+| `--analyze`                                   | Print the puzzle ROI ranking and exit. No search.                                                                  |
+| `--no-smart`                                  | Disable ROI-based puzzle auto-selection (when no `--puzzle N`). Picks the lowest-numbered unsolved puzzle first.   |
+| `--gpus 0,1,3`, `-g`                          | Specific GPU IDs. Default: all detected.                                                                           |
+| `--batch-size N`                              | Keys per batch. Default 4M. Tune with `--calibrate`.                                                               |
+| `--calibrate`                                 | Run the GPU batch-size calibration (also runs automatically on first launch).                                      |
+| `--force-calibrate`                           | Force re-calibration even if a saved value exists.                                                                 |
+| `--pool <url>`, `-p`                          | Pool mode. `jlps://` for TLS, `jlp://` for plaintext, `http://` for HTTP variant. `--worker <addr>` is required.   |
+| `--worker <addr>`, `-w`                       | Bitcoin address for pool rewards.                                                                                  |
+| `--pool-password <pass>`                      | Optional, for pools that require it (Collision Protocol does not).                                                 |
+| `--pool-api-key <key>`                        | Optional, for HTTP pools that require API-key auth.                                                                |
+| `--config <file>`, `-c`                       | Use a non-default config file. Default search: `./config.yml`, `./config.yaml`, `~/.collider/config.yml`.          |
+| `--benchmark`                                 | Run a synthetic GPU benchmark (default: 30s). Prints throughput.                                                   |
+| `--benchmark-time <sec>`                      | Override the benchmark duration.                                                                                   |
+| `--verbose`, `-v`                             | Verbose output.                                                                                                    |
+| `--debug`                                     | Debug output for troubleshooting.                                                                                  |
+| `--help`, `-h`                                | Show help.                                                                                                         |
+
+**(PRO VERSION ONLY)** flags (license-gated; ignored or hint-printed in the free build):
+
+| Flag                  | Effect                                                                           |
+| --------------------- | -------------------------------------------------------------------------------- |
+| `--brainwallet`       | Brain-wallet mode. Requires `--bloom`.                                           |
+| `--brainwallet-setup` | Interactive setup wizard for the brain-wallet pipeline.                          |
+| `--bloom <file.blf>`  | Bloom filter of funded addresses (built with the `build_bloom` tool).            |
+| `--resume`            | Resume the brain-wallet scan from the last checkpoint.                           |
+| `--save-interval N`   | Save state every N candidates.                                                   |
+| `--cpu-rules`         | Force CPU-side rule expansion (allows multi-GPU parallelism on certain targets). |
+| `--activate <KEY>`    | Activate the Pro license key (run once after purchase).                          |
+
+---
+
+## config.yml
+
+`config.yml` lives in the working directory or in `~/.collider/`. CLI flags always win over config values when both are set.
+
+A documented example ships at the repo root: [`example-config.yml`](example-config.yml). The full schema is in [`src/core/yaml_config.hpp`](src/core/yaml_config.hpp).
+
+Minimum useful pool config:
+
+```yaml
+pool:
+  worker: "1YourBitcoinAddressForRewards"
+  url: "jlps://collisionprotocol.com:17403"
+```
+
+Standalone with a custom range:
+
+```yaml
+puzzle:
+  number: 71 # Used for record-keeping; range below overrides.
+  kangaroo: false # Brute force (no pubkey for arbitrary addresses).
+  target: "13zb1hQbWVsc2S7ZTZnP2G4undNNpdh5so"
+  start: "0x40000000000000000"
+  end: "0x7ffffffffffffffff"
+```
+
+Standalone with a non-bundled but known pubkey (rare):
+
+```yaml
+puzzle:
+  number: 71
+  kangaroo: true
+  pubkey: "02ABCDEF...your 33-byte compressed pubkey hex..."
+  start: "0x40000000000000000"
+  end: "0x7ffffffffffffffff"
+```
+
+---
+
+## Pool mode usage
+
+The pool client speaks the JLP wire protocol over TCP (or TCP+TLS via `jlps://`). v1.4.1 wire properties:
+
+- **AUTH timing**. Worker must send AUTH within 30 seconds of TCP connect or the server drops.
+- **DP work_id attestation**. Every distinguished point you submit cryptographically attests which assigned chunk it came from. Server rejects mismatches.
+- **Per-DP sequence nonce** (v1.4.1 B.1). Monotonic counter per (worker, work_id) starting at 0. The server tracks an expected window and rejects out-of-window sequences (replays of captured DP_BATCHes).
+- **TLS**. When the URL is `jlps://`, certificates are validated against the system trust store. v1.4.1 fails hard at init if no trust anchors are loadable (was a silent fallback in v1.4.0).
+
+Optional pool authentication:
+
+- `--pool-password`. Passes a password in the AUTH frame's password slot. Collision Protocol's public pool ignores this. Pools that need it (private pools, throttled-tier pools) advertise it in their docs.
+- `--pool-api-key`. For HTTP-only pools that require a header-based API key. Not used over JLP. Kept for compatibility with non-JLP pool integrations.
+
+Most users on Collision Protocol only need `--pool jlps://collisionprotocol.com:17403 --worker <btc-addr>`.
+
+The full wire format is documented in [docs/JLP-PROTOCOL.md](docs/JLP-PROTOCOL.md). Third-party clients can implement against that document plus `protocol/jlp.yaml` (the IDL).
+
+---
+
+## Build from source
+
+### Prerequisites
+
+- CMake 3.20 or newer
+- A C++20 compiler (MSVC 2022, GCC 11 or newer, Apple Clang 14 or newer)
+- **CUDA backend** (Linux / Windows): CUDA Toolkit 12.x
+- **Metal backend** (macOS): Apple Silicon, Xcode Command Line Tools
+- OpenSSL (optional but recommended; enables TLS pool connections)
+- vcpkg (Windows; auto-bootstraps from the repo root)
+
+### Free build
+
+```
+git clone https://github.com/hevnsnt/collider.git
+cd collider
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target collider --parallel
+```
+
+Output: `build/collider` (or `build/collider.exe` on Windows).
+
+For macOS, the canonical entry point is `./build_macos.sh` (configures Metal, sets `OPENSSL_ROOT_DIR` from Homebrew, runs Ninja). See [docs/BUILD-MACOS.md](docs/BUILD-MACOS.md).
+
+CUDA architectures default to `86;89;100` (Ampere, Ada, Blackwell). To target a single architecture for faster builds, pass `-DCMAKE_CUDA_ARCHITECTURES="89"` (or whichever SM matches your card).
 
 ---
 
 ## Performance
 
-| Mode | Hardware | Throughput |
-|---|---|---|
-| Kangaroo (CUDA) | RTX 4090 | ~8 GKeys/s |
-| Kangaroo (CUDA) | RTX 3090 | ~4 GKeys/s |
-| Kangaroo (CUDA) | RTX 3060 + 2060 SUPER (combined) | ~2.7 GKeys/s |
-| Pool client (Metal/CPU) | Apple M-series | ~200 KKeys/s -- works, but pool worker payoff is dominated by GPU contributors |
+Benchmarked numbers per GPU live in the [GitHub release notes](https://github.com/hevnsnt/collider/releases) for each tagged version. Numbers depend strongly on driver version, batch size, and which kernel path is exercised. Anything quoted statically here would go stale within weeks of the next driver release.
 
-Pool mode on Apple Silicon connects, authenticates, and submits DPs reliably, but at dp_bits=35 the statistically expected time-to-first-DP on CPU alone is hours-to-days. **For meaningful pool earnings you want a CUDA GPU.**
+If you want a fresh number on your hardware:
+
+```
+./collider --benchmark
+```
+
+(30-second synthetic run by default; prints kangaroo step rate and EC-multiply throughput. Use `--benchmark-time <sec>` to change the duration.)
 
 ---
 
-## Quick start
+## Troubleshooting
 
-### Download
+### Kangaroo demoted to brute force
 
-Grab the latest binary for your platform from [Releases](https://github.com/hevnsnt/collider/releases/latest):
+The puzzle you targeted does not have its pubkey bundled. v1.4.1 handles this gracefully:
 
-| Platform | Asset |
-|---|---|
-| Linux x64 (CUDA) | `collider` |
-| Windows x64 (CUDA) | `collider.exe` |
-| macOS arm64 | `collider-macos-arm64` |
+- **Worklist mode** (`--all-unsolved` or `--auto-next`): the puzzle is silently downgraded to brute force and the run continues.
+- **Single-puzzle interactive**: you are prompted for a pubkey. Press ENTER to fall back to brute force, or paste a 33-byte compressed pubkey if you have one from an external source.
+- **Single-puzzle non-interactive** (piped, CI): silently demoted with a log line.
 
-Verify the download with the `SHA256SUMS.txt` published on the same release.
+See "Which puzzles are kangaroo-able" above for which puzzles have bundled pubkeys.
 
-### Run
+### Pool client cannot connect
 
-```bash
-# Solo: solve a specific puzzle locally
-./collider --puzzle 71 --kangaroo
+- Verify the URL. `jlps://` is TLS, `jlp://` is plaintext, `http://` is the HTTP-API variant.
+- Verify the worker address is a real Bitcoin address (the pool's reward-payment field).
+- Check the local time. The AUTH frame is timestamped on the server side; severe clock drift may produce auth failures.
+- If you see a TLS error referencing a missing trust anchor: install `ca-certificates` (Linux) or run from a shell that has `SSL_CERT_FILE` or `SSL_CERT_DIR` set.
 
-# Pool: contribute to the global puzzle 135 effort
-./collider --pool jlps://collisionprotocol.com:17403 --worker bc1qYourBtcAddress
+### "Brain wallet scanning is a Pro feature" in `--help`
 
-# Interactive menu (no args)
-./collider
-```
+Correct. That is the FREE build. Brain-wallet scanning is **(PRO VERSION ONLY)**, available at [collisionprotocol.com/pro](https://collisionprotocol.com/pro). The free edition handles the Bitcoin Puzzle Challenge (kangaroo plus brute force plus pool client).
 
-```
-+==============================================================+
-|                       theCollider v1.2.1                     |
-+==============================================================+
+### Reporting bugs
 
-What would you like to do?
+Issues at [github.com/hevnsnt/collider/issues](https://github.com/hevnsnt/collider/issues). Please include:
 
-  [1] Solve Bitcoin Puzzle Challenge
-  [2] Run Benchmark
-  [3] Show Help
-  [0] Exit
-```
-
-### Configure (optional)
-
-Drop a `config.yml` next to the binary for persistent settings -- pool URL, worker address, GPU selection. See [example-config.yml](example-config.yml) and the [Configuration guide](docs/CONFIGURATION.md).
-
-```yaml
-pool:
-  url: "jlps://collisionprotocol.com:17403"
-  worker: "bc1qYourBitcoinAddress"
-
-gpu:
-  devices: []   # empty = auto-detect all GPUs
-```
-
----
-
-## Pool mining
-
-Solo-solving Puzzle #135 with consumer hardware would take many human lifetimes. Pool mining splits the work across all connected GPUs and pays proportionally based on distinguished points contributed.
-
-```mermaid
-sequenceDiagram
-    participant W as Your GPU
-    participant P as Collision Protocol
-    participant R as Reward
-
-    W->>P: Connect over TLS 1.3<br/>Authenticate with BTC address
-    P->>W: Assign chunk + dp_bits
-    loop Continuous
-        W->>P: Submit DP_BATCH
-        P->>P: Cross-check tame/wild collisions
-    end
-    P->>R: Solution found
-    R->>W: Proportional payout
-```
-
-| Component | Details |
-|---|---|
-| Fee | 5% (infrastructure, development) |
-| Payout | Proportional to your distinguished points |
-| Verification | 72-hour period, then payout within 7 days |
-| Transport | JLP protocol over TLS 1.3 with hostname verification |
-
-The on-screen progress display refreshes every 10 seconds via a `STATS_REQ` to the pool server:
-
-```
-Speed: 2.70 GKeys/s | Local DPs: 47 | Sent: 47 | Your total: 1.2K | Pool total: 4.6K | Session share: 26.1%
-```
-
-`Your total` aggregates server-side across every machine using the same BTC payout address -- run on a Mac and a Windows box at once and you'll see one combined number, not two.
-
-[Pool economics ->](docs/POOL-ECONOMICS.md)
-
----
-
-## Documentation
-
-| Document | Description |
-|---|---|
-| [Install](docs/INSTALL.md) | Build from source |
-| [Build (Linux)](docs/BUILD-LINUX.md) | Linux + CUDA |
-| [Build (Windows)](docs/BUILD-WINDOWS.md) | Windows + MSVC + vcpkg |
-| [Build (macOS)](docs/BUILD-MACOS.md) | macOS arm64 |
-| [Usage](docs/USAGE.md) | Command reference |
-| [Configuration](docs/CONFIGURATION.md) | `config.yml` reference |
-| [Architecture](docs/ARCHITECTURE.md) | How the GPU pipeline + pool client fit together |
-| [Bitcoin Puzzle strategy](docs/BITCOIN-PUZZLE-STRATEGY.md) | Why pool mining wins on the high-bit puzzles |
-| [Pool economics](docs/POOL-ECONOMICS.md) | Fee, payout calc, examples |
-| [Changelog](docs/CHANGELOG.md) | Version history |
-
----
-
-## System requirements
-
-### Minimum (puzzle solver, CUDA path)
-- NVIDIA GPU, compute capability 7.5+ (RTX 20-series or newer)
-- 8 GB GPU VRAM
-- 16 GB system RAM
-- CUDA 12.x runtime
-
-### Recommended
-- RTX 3090 / 4090 / 5090, or multiple GPUs
-- 24+ GB GPU VRAM
-- 64 GB system RAM
-
-### macOS
-- Apple Silicon (M1 or newer), macOS 12+
-- Connects to the pool and runs a CPU-side kangaroo. Compute throughput is well below CUDA hardware; pool earnings will reflect that.
-
----
-
-## Pro edition
-
-theCollider Pro adds the brain-wallet pipeline: GPU-accelerated SHA-256 -> secp256k1 -> RIPEMD-160 with hashcat-compatible rule engine, PCFG-trained passphrase generation, Markov-chain candidate streaming, WarpWallet/scrypt support, and bloom-filter opportunistic address scanning against ~36 M known funded BTC addresses.
-
-If your interest is the puzzle challenge, the Free build is the whole solution. If you also want to research brain wallets, see [collisionprotocol.com/pro](https://collisionprotocol.com/pro).
-
----
-
-## Legal & ethics
-
-theCollider is built for:
-- Security research and education
-- Authorized penetration testing
-- Recovering wallets you own
-- Academic cryptography research
-
-Do not use it to access wallets you do not own.
-
----
-
-## Acknowledgments
-
-- [RetiredCoder](https://github.com/RetiredCoder) -- RCKangaroo
-- [JeanLucPons](https://github.com/JeanLucPons) -- original GPU Kangaroo work
-- [bitcoin-core/secp256k1](https://github.com/bitcoin-core/secp256k1) -- reference EC implementation
+- Output of `./collider --help` (the build identifies its edition there).
+- GPU model plus driver version (`nvidia-smi` on Linux/Windows, `system_profiler SPDisplaysDataType` on macOS).
+- The exact command line you ran.
+- A copy-paste of the output (not a screenshot when possible).
 
 ---
 
 ## License
 
-MIT -- see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
 
-Third-party components: RCKangaroo (GPLv3, RetiredCoder); secp256k1 primitives (MIT, bitcoin-core).
-
----
-
-<p align="center">
-  <a href="https://collisionprotocol.com">collisionprotocol.com</a> •
-  <a href="docs/INSTALL.md">Install</a> •
-  <a href="docs/USAGE.md">Documentation</a> •
-  <a href="https://github.com/hevnsnt/collider/issues">Issues</a>
-</p>
+The Pro edition is a separate, license-gated build of the same source tree (with `-DCOLLIDER_PRO=ON` plus the brain-wallet sources that aren't in the public repo). Pro source is **not** MIT and is delivered as binaries to paying customers only.
