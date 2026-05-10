@@ -60,7 +60,7 @@ It is the most expensive Bitcoin scratch-off in the world, and you were buying i
 
 ## Dedicated brain-wallet mode: your GPU is a key factory
 
-When you are not pool-mining puzzle 135 (overnight, between work assignments, when the pool is quiet), Pro flips to **dedicated brain-wallet mode**: a purpose-built pipeline that systematically scans human-chosen passphrases against the same 100M+ funded-address bloom.
+When you are not pool-mining puzzles, flips to **dedicated brain-wallet mode**: a purpose-built pipeline that systematically scans human-chosen passphrases against the same 100M+ funded-address bloom.
 
 Bitcoin's earliest users protected coins with a passphrase that hashes directly to a private key. `SHA256("correct horse battery staple")` is a private key. No wallet file. No mnemonic. Just words. **Tens of thousands of these wallets were created between 2011 and 2014, and many of them still hold real Bitcoin today.**
 
