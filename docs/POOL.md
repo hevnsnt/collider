@@ -44,7 +44,7 @@ That is the entire setup. The first time you connect successfully, guided mode p
 Required:
 
 - `--pool <url>` (or `pool.url:` in `config.yml`). Use `jlps://` for TLS (recommended for any pool you do not host yourself).
-- `--worker <addr>` (or `pool.worker:` in `config.yml`). A real Bitcoin address that you control. This is your payout key and your identity on the pool.
+- `--worker <addr>` (or `pool.worker:` in `config.yml`). A real Bitcoin address that you control. **When the pool solves a puzzle, your share of the reward is sent to exactly this address.** It is also your identity on the pool for share-of-pool accrual. See [Picking a good worker address](#picking-a-good-worker-address) below for how to validate you actually control it.
 
 Not required:
 
@@ -119,6 +119,8 @@ What the client does not guarantee:
 
 ## Picking a good worker address
 
+This is the single most important decision you will make as a pool operator. **The address you put in `--worker` is the address the pool will send your share of the reward to when a puzzle is solved.** If you pick an address whose private key you do not hold, your share is unrecoverable and there is nothing the pool operator can do about it. Get this right before you start submitting DPs.
+
 The `worker_name` field is 64 bytes on the wire, null-padded if shorter. Any valid Bitcoin address fits, including:
 
 - Legacy P2PKH (`1...`, ~34 chars).
@@ -126,13 +128,32 @@ The `worker_name` field is 64 bytes on the wire, null-padded if shorter. Any val
 - Native SegWit bech32 (`bc1q...`, ~42 chars).
 - Taproot bech32m (`bc1p...`, ~62 chars).
 
-All four work. The server does not validate the address format (so a typo will not bounce AUTH); it just uses the string as a key. **You are responsible for the address being one you control.** If you submit DPs under an address whose private key you do not have, the payout is unrecoverable.
+All four work on the wire. The server does not validate the address format (so a typo will not bounce AUTH); it just uses the string as a key.
 
-Practical advice:
+### Validating that you control the address
+
+Before you use an address as your worker, confirm you can spend from it. The pool cannot do this for you; the only thing it sees is a string.
+
+**Use an address from a wallet you own and run yourself.** Acceptable sources include:
+
+- Bitcoin Core (you control the wallet file plus passphrase).
+- A hardware wallet you physically possess (Ledger, Trezor, Coldcard, BitBox).
+- A self-custodied software wallet (Electrum, Sparrow, BlueWallet, Wasabi, Samourai) where you hold the seed phrase.
+
+**Do not use:**
+
+- A deposit address copied from an exchange (Coinbase, Binance, Kraken). Exchanges rotate deposit addresses, treat them as ephemeral routing hints, and may not credit a future payout to one. Some exchanges will refuse "unexpected" inbound transactions outright.
+- An address you do not have a wallet file or seed phrase for. "I generated it on a website once" is not control. "I have it on a piece of paper from years ago" is not control unless you have tested spending from it.
+- An address from a custodial brain-wallet service or vanity-address generator that retained the private key.
+
+**The definitive test:** send a tiny amount of BTC (a few thousand sats) to the address, then send it back out to a different address you control. If the outbound transaction confirms, you have proven you can sign for the address. If you cannot complete that round trip, do not use the address as your worker.
+
+Practical follow-ups:
 
 - Use a dedicated address that you do not share with hot wallets or exchanges. If the pool ever has to coordinate a payout, you do not want it landing in a custodial wallet that has rotated its deposit addresses.
-- Treat the BTC address as a worker identity, not a secret. It is sent in plaintext over TLS to the pool and shows up on the public stats dashboard (if the pool runs one).
+- Treat the BTC address as a worker identity, not a secret. It is sent in plaintext over TLS to the pool and shows up on the public stats dashboard (if the pool runs one). The address being public does not affect your ability to spend from it.
 - Once chosen, do not change it casually. Switching addresses mid-puzzle splits your accrual across two buckets, and the pool's payout policy is unlikely to merge them retroactively.
+- If you lose access to the wallet behind the address (drive failure, lost seed phrase), your accrued share becomes unrecoverable the same way a regular lost wallet is unrecoverable. Back up your seed phrase before you commit serious hash time.
 
 ---
 
