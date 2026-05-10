@@ -166,7 +166,7 @@ theCollider ships in two editions from one source tree.
 | v2 puzzle-mode multi-scheme kernel                   |            | Yes              |
 | License gating (Ed25519, offline-verifiable)         |            | Yes              |
 
-Pro licenses are available at [collisionprotocol.com/pro](https://collisionprotocol.com/pro). The Pro source tree is not public; the Free build is the same source minus the Pro modules, generated automatically by `scripts/sync-to-free.sh` and published at [github.com/hevnsnt/collider](https://github.com/hevnsnt/collider).
+Pro licenses are available at [collisionprotocol.com/pro](https://collisionprotocol.com/pro). The Pro source tree is not public; the Free build is the same source minus the Pro modules, generated automatically by Github and published at [github.com/hevnsnt/collider](https://github.com/hevnsnt/collider).
 
 ---
 
