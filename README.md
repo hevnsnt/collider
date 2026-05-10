@@ -2,7 +2,7 @@
 
 > A GPU-accelerated solver for the [Bitcoin Puzzle Challenge](https://privatekeys.pw/puzzles/bitcoin-puzzle-tx), built for the unsolved keys at the hard end of the curve.
 
-theCollider is the most complete open-source toolkit for the Bitcoin Puzzle Challenge today: solo Pollard's Kangaroo and brute-force search on CUDA (Windows, Linux) and Metal (macOS Apple Silicon), a pool client for distributed solving via the [Collision Protocol](https://collisionprotocol.com), and the canonical bundled record of every solved puzzle to date. A paid Pro edition adds a brain-wallet pipeline on top of the same core.
+theCollider is the most complete open-source toolkit for the Bitcoin Puzzle Challenge today: solo Pollard's Kangaroo and brute-force search on CUDA (Windows, Linux) and Metal (macOS Apple Silicon), a pool client for distributed solving via the [Collision Protocol](https://collisionprotocol.com) pool, and the canonical bundled record of every solved puzzle to date. A paid Pro edition adds a brain-wallet opportunistic pipeline and Brainwallet cracker on top of the same core.
 
 ```
 $ ./collider --puzzle 135 --kangaroo
