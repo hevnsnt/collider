@@ -21,10 +21,14 @@
  */
 
 // Prevent Windows min/max macros from breaking std::min/std::max
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 
 // Prevent Windows.h from including winsock.h (conflicts with winsock2.h)
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
 
 // Windows console ANSI support
 #ifdef _WIN32
@@ -48,11 +52,41 @@
 #include <cmath>
 #include <set>
 
+#ifdef COLLIDER_HAS_OPENSSL
+#include <openssl/sha.h>
+#endif
+
+#ifdef __APPLE__
+// CommonCrypto uses the ARMv8 SHA crypto extensions on Apple Silicon,
+// roughly 100-300x faster than OpenSSL's software fallback when OpenSSL
+// is built without crypto-extension support (Homebrew default).
+#include <CommonCrypto/CommonDigest.h>
+#endif
+
+#if defined(__APPLE__) && defined(COLLIDER_USE_METAL)
+#include "gpu/sha256_metal_bench.hpp"
+#include "gpu/kangaroo_metal.hpp"
+#endif
+
+#ifdef COLLIDER_USE_CUDA
+#include <cuda_runtime.h>
+// Forward decl from src/gpu/sha256.cu (no header for that one yet).
+extern "C" cudaError_t sha256_batch(
+    const uint8_t* d_passphrases,
+    const uint32_t* d_offsets,
+    const uint32_t* d_lengths,
+    uint8_t* d_hashes,
+    size_t count,
+    cudaStream_t stream);
+#endif
+
 #include "core/types.hpp"
 #include "core/rule_engine.hpp"
 #include "core/puzzle_config.hpp"
 #include "core/crypto_cpu.hpp"
 #include "core/kangaroo.hpp"
+#include "core/byte_codec.hpp"
+#include "core/kangaroo_backend.hpp"
 #include "core/config.hpp"
 #include "core/logger.hpp"
 #include "gpu/kangaroo_solver_gpu.hpp"
@@ -62,6 +96,7 @@
 #include "platform/platform.hpp"
 #include "core/search_state.hpp"
 #include "ui/banner.hpp"
+#include "ui/pool_progress.hpp"
 #include "ui/interactive.hpp"
 #include "gpu/puzzle_gpu.hpp"
 // ---- Pro-only includes ---------------------------------------------------
@@ -73,6 +108,7 @@
 #include "core/brainwallet_state.hpp"
 #include "ui/brainwallet_setup.hpp"
 #include "gpu/brain_wallet_gpu.hpp"
+#include "gpu/v2/v2_orchestrator.hpp"
 #include "gpu/gpu_rules.hpp"
 #include "generators/brain_wallet_engine.hpp"
 #include "generators/streaming_brain_wallet.hpp"
@@ -545,6 +581,15 @@ struct Arguments {
     size_t save_interval = 1000000;       // Save state every N passphrases checked
     bool cpu_rules = false;               // Force CPU rule processing (enables multi-GPU)
 
+    // Brain Wallet v2 (Phase 9, restructure plan v1.4.0).
+    // --puzzle-only-v2 enables the multi-scheme puzzle-mode bloom check that
+    // short-circuits before EC_MUL when no puzzle target hits. Requires
+    // COLLIDER_PRO=ON.
+    bool puzzle_only_v2 = false;
+    std::string puzzle_keys_file;         // Override path to puzzle_history.json
+    std::string schemes_csv;              // Phase 3: comma list of derivation schemes
+    std::string addr_types_csv;           // Phase 4: comma list of address types
+
     // Calibration mode
     bool calibrate = false;               // Run batch size calibration
     bool force_calibrate = false;         // Force re-calibration even if already done
@@ -710,6 +755,26 @@ inline int parse_args_core(int argc, char* argv[], Arguments& args,
             cli.brainwallet_set = true;
         } else if (arg == "--brainwallet-setup") {
             args.brainwallet_setup = true;
+        } else if (arg == "--puzzle-only-v2") {
+#ifdef COLLIDER_PRO
+            // Phase 9, v1.4.0: enable v2 puzzle-mode kernel + multi-scheme.
+            args.puzzle_only_v2 = true;
+            args.brainwallet_mode = true;   // Goes through the brainwallet pipeline
+            args.pool_mode = false;
+            args.pool_url.clear();
+#else
+            // Exact text per v1.4.0 spec; do NOT add URLs or extra trailing text.
+            std::cerr << "I'm sorry, but this is a pro function. If you'd like "
+                         "to try pro, go and visit the website to purchase and "
+                         "download." << std::endl;
+            return 2;
+#endif
+        } else if (arg == "--puzzle-keys" && i + 1 < argc) {
+            args.puzzle_keys_file = argv[++i];
+        } else if (arg == "--schemes" && i + 1 < argc) {
+            args.schemes_csv = argv[++i];
+        } else if (arg == "--addr-types" && i + 1 < argc) {
+            args.addr_types_csv = argv[++i];
         } else if (arg == "--resume") {
             args.resume = true;
             cli.resume_set = true;
@@ -859,8 +924,10 @@ Brainwallet Mode (PRO):
 #endif
     std::cout << R"(Pool Mode (Distributed Solving):
   --pool, -p <url>        Connect to pool for distributed Kangaroo solving
-                          URL format: jlp://host:port or http://host:port
-                          Example: jlp://pool.collisionprotocol.com:17403
+                          URL format: jlps://host:port (TLS, recommended)
+                                      jlp://host:port (plaintext)
+                                      http://host:port
+                          Example: jlps://collisionprotocol.com:17403
   --worker, -w <address>  Worker name (your Bitcoin address for rewards)
   --pool-password <pass>  Pool password (if required)
   --pool-api-key <key>    API key for HTTP pools (if required)
@@ -911,7 +978,7 @@ Examples:
            --puzzle-target 13zb1hQbWVsc2S7ZTZnP2G4undNNpdh5so
 
   # Join Collision Protocol for distributed solving
-  collider --pool jlp://pool.collisionprotocol.com:17403 --worker 1YourBitcoinAddress...
+  collider --pool jlps://collisionprotocol.com:17403 --worker 1YourBitcoinAddress...
 
   # Pool mode with HTTP API
   collider --pool http://api.collisionprotocol.com --worker 1YourBitcoinAddress...
@@ -1218,19 +1285,11 @@ std::string format_number_human(uint64_t n) {
     return oss.str();
 }
 
-/**
- * Format rate as human-readable string.
- */
-std::string format_rate(double rate) {
-    if (rate >= 1e9) {
-        return std::to_string(rate / 1e9).substr(0, 5) + "B/s";
-    } else if (rate >= 1e6) {
-        return std::to_string(rate / 1e6).substr(0, 5) + "M/s";
-    } else if (rate >= 1e3) {
-        return std::to_string(rate / 1e3).substr(0, 5) + "K/s";
-    }
-    return std::to_string(static_cast<int>(rate)) + "/s";
-}
+// Rate formatting now lives in src/ui/banner.hpp as
+// `collider::ui::format_rate(double, std::string_view = "Keys/s")`.
+// Use a `using` alias here so the bare `format_rate(rate)` calls below
+// (kangaroo / brain-wallet status lines) keep their original spelling.
+using collider::ui::format_rate;
 
 /**
  * Normalize path separators for display (consistent slashes per platform).
@@ -1824,7 +1883,7 @@ Arguments run_interactive_mode(Arguments base_args, double gpu_speed_mkeys) {
         args.go_back = false;
 
         // Display main menu
-        MainMenuChoice choice = Interactive::display_main_menu("1.2.1");
+        MainMenuChoice choice = Interactive::display_main_menu("1.4.0");
 
         switch (choice) {
             case MainMenuChoice::PUZZLE_MODE: {
@@ -1902,6 +1961,11 @@ void enable_windows_ansi() {
 /**
  * Run pool mode - connect to a Kangaroo pool for distributed solving.
  */
+// Pool-mining entry point. The local PoolManager's destructor disconnects
+// the TLS/TCP session automatically, so error paths can `return 1;`
+// without manual cleanup; the explicit disconnect at end-of-flow exists
+// only so the final "Disconnected from pool" message lands deterministically
+// before the session summary.
 int run_pool_mode(const Arguments& args, const GPUDetectionResult& gpu_info) {
     using namespace collider::pool;
 
@@ -1958,8 +2022,7 @@ int run_pool_mode(const Arguments& args, const GPUDetectionResult& gpu_info) {
     WorkAssignment work;
     if (!pool_manager.get_work(work)) {
         std::cerr << "[!] Failed to get work assignment from pool\n";
-        pool_manager.disconnect();
-        return 1;
+        return 1;  // PoolManager dtor disconnects automatically.
     }
 
     std::cout << "[+] Work assigned: " << work.puzzle_name << "\n";
@@ -1981,277 +2044,82 @@ int run_pool_mode(const Arguments& args, const GPUDetectionResult& gpu_info) {
         std::cout << "=============================================================\n";
     });
 
-#ifdef COLLIDER_USE_RCKANGAROO
-    // Initialize RCKangaroo with pool integration
-    std::cout << "[*] Initializing RCKangaroo for pool solving...\n";
+    // ---- Backend dispatch ----------------------------------------------
+    // The three pool branches that used to live here (CUDA RCKangaroo /
+    // Apple Metal Kangaroo / CPU KangarooSolver) collapsed behind the
+    // IKangarooBackend interface. The factory picks the right one for
+    // this build configuration; everything past this point is
+    // backend-agnostic.
+    auto backend = collider::kangaroo::create_kangaroo_backend(args.gpu_ids);
 
-    gpu::RCKangarooManager rc_kangaroo;
-
-    // Set parameters from work assignment
-    rc_kangaroo.dp_bits = work.dp_bits;
-
-    // Calculate range bits from work assignment
-    // (simplified - in real implementation, parse from work.range_start/end)
-    rc_kangaroo.range_bits = 135;  // Default to puzzle 135
-
-    int num_gpus = rc_kangaroo.init(args.gpu_ids);
-    if (num_gpus == 0) {
-        std::cerr << "[!] No GPUs available for pool solving\n";
-        pool_manager.disconnect();
+    std::cout << "[*] Initializing " << backend->name() << " for pool solving...\n";
+    if (!backend->initialize(work)) {
+        std::cerr << "[!] " << backend->name()
+                  << " initialization failed: " << backend->error() << "\n";
         return 1;
     }
 
-    std::cout << "[+] RCKangaroo initialized with " << num_gpus << " GPU(s)\n";
-
-    // Load bloom filter if specified (same as standalone mode).
-    // Opportunistic address scanning is a Pro feature; the free build
-    // strips bloom_file at the config-merge gateway, so this block is a
-    // no-op there. Defense-in-depth: also #ifdef-guard the load itself.
 #ifdef COLLIDER_PRO
+    // Bloom filter loading is a Pro feature and is supported only by the
+    // CUDA backend today. Other backends silently return false from
+    // try_set_bloom_filter (interface default).
     if (!args.bloom_file.empty()) {
-        if (rc_kangaroo.load_bloom_filter(args.bloom_file)) {
+        if (backend->try_set_bloom_filter(args.bloom_file)) {
             std::cout << "[*] Bloom filter loaded - opportunistic address checking enabled\n";
-            rc_kangaroo.bloom_hit_callback = [](const gpu::BloomHit& hit) {
-                std::ofstream hitlog("bloom_hits.txt", std::ios::app);
-                if (hitlog) {
-                    char h160_hex[41];
-                    for (int i = 0; i < 20; i++) {
-                        snprintf(h160_hex + i*2, 3, "%02x", hit.hash160[i]);
-                    }
-                    hitlog << "H160: " << h160_hex << " at ops " << hit.ops_at_hit << "\n";
-                }
-            };
-        } else {
-            std::cerr << "[!] WARNING: Failed to load bloom filter: " << args.bloom_file << "\n";
+        } else if (!backend->error().empty()) {
+            std::cerr << "[!] WARNING: Failed to load bloom filter: "
+                      << args.bloom_file << " (" << backend->error() << ")\n";
         }
+        // Backends that simply don't support bloom filtering fall through
+        // silently -- not an error; the user opted in but the platform
+        // doesn't have the feature.
     }
 #endif
 
-    // Set target public key from work assignment
-    std::string pubkey_hex;
-    for (int i = 0; i < 33; i++) {
-        char buf[3];
-        snprintf(buf, 3, "%02x", work.public_key[i]);
-        pubkey_hex += buf;
-    }
+    // Pool Solving header. Backend supplies its own name + device summary.
+    std::cout << "\n";
+    ui::ProfessionalUI::render_section("Pool Solving - " + backend->name());
+    ui::ProfessionalUI::render_kv("Pool",
+        pool_config.host + ":" + std::to_string(pool_config.port));
+    ui::ProfessionalUI::render_kv("Worker", pool_config.worker_name);
+    ui::ProfessionalUI::render_kv("Device", backend->device_summary());
+    ui::ProfessionalUI::render_kv("DP Bits", std::to_string(work.dp_bits));
+    std::cout << "\n";
+    ui::ProfessionalUI::render_footer("Press Ctrl+C to stop");
 
-    if (!rc_kangaroo.set_target_pubkey(pubkey_hex)) {
-        std::cerr << "[!] Failed to set target public key\n";
-        pool_manager.disconnect();
-        return 1;
-    }
-
-    // DP callback - submit each distinguished point to the pool
-    rc_kangaroo.dp_callback = [&](const uint8_t* x, const uint8_t* d, uint8_t type) {
-        pool_manager.submit_dp(x, d, type, work.dp_bits);
+    // Wire the backend callbacks. Pool-side baseline capture for the
+    // session-share % is owned by PoolProgressDisplay; the lambdas here
+    // are pure adapters between IKangarooBackend's surface and the pool
+    // client / progress widget.
+    ui::PoolProgressDisplay progress;
+    collider::kangaroo::BackendCallbacks cb;
+    cb.on_dp = [&pool_manager](const uint8_t* x_be, const uint8_t* d_be,
+                                uint8_t type, uint32_t dp_bits) {
+        pool_manager.submit_dp(x_be, d_be, type, dp_bits);
     };
-
-    // Progress callback. Pool mode shows the worker's contribution share
-    // since session start (server-aggregated across ALL machines using
-    // this worker name) rather than a single-worker-finish-the-puzzle
-    // ETA, which is meaningless in a pool context.
-    //
-    // Share is computed against deltas from a baseline captured on the
-    // first STATS_RSP, not all-time totals: the all-time pool count is
-    // dragged down by historical DPs (e.g., from earlier pre-protocol-fix
-    // testing) that distort the operator's true present-day contribution.
-    // A heavy local worker correctly reads as ~90% of *current* work even
-    // if the lifetime pool counter started in the thousands.
-    bool baseline_captured = false;
-    uint64_t baseline_pool_dps = 0;
-    uint64_t baseline_your_dps = 0;
-    rc_kangaroo.progress_callback = [&, baseline_captured,
-                                      baseline_pool_dps,
-                                      baseline_your_dps](
-            uint64_t /*ops*/, uint64_t dp_count, int speed) mutable -> bool {
+    cb.on_progress = [&progress, &pool_manager](double ops_per_sec,
+                                                 uint64_t local_dps) -> bool {
         if (g_shutdown.load()) return false;
-
-        collider::pool::PoolStats ps = pool_manager.get_stats();
-        if (!baseline_captured && ps.total_dps > 0) {
-            baseline_pool_dps = ps.total_dps;
-            baseline_your_dps = ps.your_dps;
-            baseline_captured = true;
-        }
-        uint64_t pool_delta = (ps.total_dps > baseline_pool_dps)
-            ? (ps.total_dps - baseline_pool_dps) : 0;
-        uint64_t your_delta = (ps.your_dps > baseline_your_dps)
-            ? (ps.your_dps - baseline_your_dps) : 0;
-        double share_pct = (pool_delta > 0)
-            ? (100.0 * static_cast<double>(your_delta)
-                      / static_cast<double>(pool_delta))
-            : 0.0;
-
-        std::cout << "\r\033[K";
-        std::cout << "\033[32mSpeed:\033[0m " << ui::ProfessionalUI::format_speed(speed) << " | "
-                  << "\033[35mLocal DPs:\033[0m " << ui::ProfessionalUI::format_number_short(dp_count) << " | "
-                  << "\033[33mSent:\033[0m " << ui::ProfessionalUI::format_number_short(pool_manager.get_submitted_count()) << " | "
-                  << "\033[36mYour total:\033[0m " << ui::ProfessionalUI::format_number_short(ps.your_dps) << " | "
-                  << "\033[34mPool total:\033[0m " << ui::ProfessionalUI::format_number_short(ps.total_dps) << " | "
-                  << "\033[35mSession share:\033[0m " << std::fixed << std::setprecision(1) << share_pct << "%"
-                  << "  " << std::flush;
-
-        return true;  // Continue
+        const collider::pool::PoolStats ps = pool_manager.get_stats();
+        progress.tick(ops_per_sec,
+                      local_dps,
+                      pool_manager.get_submitted_count(),
+                      ps.total_dps,
+                      ps.your_dps);
+        return true;
     };
-
-    // Display professional search header. The per-worker "Expected Ops"
-    // line was removed -- in pool mode the relevant total is the pool-wide
-    // 2^((range_bits-1)/2 + 1) figure, which the website dashboard already
-    // surfaces against the live aggregate pool speed.
-    std::cout << "\n";
-    ui::ProfessionalUI::render_section("Pool Solving - RCKangaroo");
-    ui::ProfessionalUI::render_kv("Pool", pool_config.host + ":" + std::to_string(pool_config.port));
-    ui::ProfessionalUI::render_kv("Worker", pool_config.worker_name);
-    ui::ProfessionalUI::render_kv("GPUs", std::to_string(num_gpus) + " detected");
-    ui::ProfessionalUI::render_kv("DP Bits", std::to_string(work.dp_bits));
-    std::cout << "\n";
-    ui::ProfessionalUI::render_footer("Press Ctrl+C to stop");
-
-    // Solve (this will run until solution found or stopped)
-    auto result = rc_kangaroo.solve();
-
-    std::cout << "\n";
-
-    if (result.found) {
-        std::cout << "[+] SOLUTION FOUND!\n";
-
-        // Convert private key array to hex string and bytes
-        std::stringstream ss;
-        uint8_t key[32];
-        for (int i = 3; i >= 0; i--) {
-            uint64_t val = result.private_key[i];
-            for (int j = 7; j >= 0; j--) {
-                key[(3 - i) * 8 + (7 - j)] = static_cast<uint8_t>((val >> (j * 8)) & 0xFF);
-            }
-            ss << std::hex << std::setfill('0') << std::setw(16) << val;
+    cb.on_solution = [&pool_manager](const uint8_t key[32]) {
+        std::cout << "\n[+] SOLUTION FOUND!\n    Private Key: ";
+        for (int i = 0; i < 32; ++i) {
+            std::printf("%02x", key[i]);
         }
-        std::string private_key_hex = ss.str();
-
-        std::cout << "    Private Key: " << private_key_hex << "\n";
-
-        // Report to pool
+        std::cout << "\n";
         pool_manager.report_solution(key);
-    } else {
-        std::cout << "[*] Solving stopped\n";
-    }
-
-#else
-    // CPU/Metal fallback: use KangarooSolver for pool mode.
-    // On macOS (Metal) and any non-CUDA build, we run the portable CPU kangaroo
-    // and wire its dp_callback to submit distinguished points to the pool.
-    std::cout << "[*] No CUDA available. Using CPU kangaroo for pool solving.\n";
-    std::cout << "    Performance will be lower than a CUDA GPU.\n\n";
-
-    // Convert work.range_start / work.range_end (big-endian uint8[32]) to UInt256
-    auto bytes_to_uint256 = [](const uint8_t* b) -> UInt256 {
-        UInt256 v;
-        for (int i = 0; i < 4; i++) {
-            uint64_t part = 0;
-            for (int j = 0; j < 8; j++) {
-                part = (part << 8) | b[i * 8 + j];
-            }
-            v.parts[3 - i] = part;  // big-endian bytes → little-endian UInt256 parts
-        }
-        return v;
     };
+    cb.should_continue = []() { return !g_shutdown.load(); };
 
-    KangarooSolver cpu_solver;
-    cpu_solver.set_range(bytes_to_uint256(work.range_start), bytes_to_uint256(work.range_end));
-    cpu_solver.dp_bits = static_cast<int>(work.dp_bits);
-    // Pool mode: the worker contributes to a *global* solve, not its own
-    // chunk-local discrete-log. set_range() defaults max_steps to
-    // expected_steps*4 (~16M for a 2^40 chunk), which trips after ~80s of CPU
-    // grinding -- before any DP is statistically likely at dp_bits=35. Run
-    // indefinitely instead; the receiver/server controls termination.
-    cpu_solver.max_steps = UINT64_MAX;
-
-    // Decompress the 33-byte pool pubkey (0x02/03 prefix + 32 X bytes) into
-    // the (X, Y) form the CPU kangaroo expects. Without this the solver
-    // searches for the discrete log of the all-zeros point, makes no
-    // progress, and exits immediately with 0 steps / 0 DPs.
-    {
-        std::string pubkey_hex;
-        pubkey_hex.reserve(66);
-        for (int i = 0; i < 33; ++i) {
-            char buf[3];
-            snprintf(buf, sizeof(buf), "%02x", work.public_key[i]);
-            pubkey_hex += buf;
-        }
-        cpu::uint256_t target_x, target_y;
-        if (!cpu::decompress_pubkey(target_x, target_y, pubkey_hex)) {
-            std::cerr << "[!] Failed to decompress pool target pubkey: "
-                      << pubkey_hex << "\n";
-            pool_manager.disconnect();
-            return 1;
-        }
-        cpu_solver.set_target_pubkey(target_x, target_y);
-    }
-
-    // Submit each DP to the pool as it is found
-    cpu_solver.dp_callback = [&](const cpu::uint256_t& x, const cpu::uint256_t& dist, bool is_tame) {
-        uint8_t x_bytes[32], d_bytes[32];
-        for (int i = 0; i < 4; i++) {
-            uint64_t xv = x.d[3 - i], dv = dist.d[3 - i];
-            for (int j = 0; j < 8; j++) {
-                x_bytes[i * 8 + j] = static_cast<uint8_t>((xv >> (56 - j * 8)) & 0xFF);
-                d_bytes[i * 8 + j] = static_cast<uint8_t>((dv >> (56 - j * 8)) & 0xFF);
-            }
-        }
-        pool_manager.submit_dp(x_bytes, d_bytes, is_tame ? 0 : 1, work.dp_bits);
-    };
-
-    cpu_solver.progress_callback = [&](uint64_t, uint64_t, uint64_t dp_count, double rate) -> bool {
-        if (!g_shutdown.load()) {
-            // CPU rates are typically <1 MKeys/s on Apple Silicon, so the
-            // standard format_speed (int MKeys/s) rounds them to "0". Display
-            // with two decimals or fall back to KKeys/s for sub-MKey/s rates.
-            std::ostringstream speed_str;
-            double mkeys = rate / 1e6;
-            if (mkeys >= 1.0) {
-                speed_str << std::fixed << std::setprecision(2) << mkeys << " MKeys/s";
-            } else {
-                speed_str << std::fixed << std::setprecision(1) << (rate / 1e3) << " KKeys/s";
-            }
-            std::cout << "\r\033[K"
-                      << "\033[36mPool:\033[0m CPU | "
-                      << "\033[32mSpeed:\033[0m " << speed_str.str() << " | "
-                      << "\033[35mDPs:\033[0m " << ui::ProfessionalUI::format_number_short(dp_count) << " | "
-                      << "\033[33mSent:\033[0m " << ui::ProfessionalUI::format_number_short(pool_manager.get_submitted_count())
-                      << "  " << std::flush;
-            return true;
-        }
-        return false;
-    };
-
-    std::cout << "\n";
-    ui::ProfessionalUI::render_section("Pool Solving - CPU Kangaroo");
-    ui::ProfessionalUI::render_kv("Pool", pool_config.host + ":" + std::to_string(pool_config.port));
-    ui::ProfessionalUI::render_kv("Worker", pool_config.worker_name);
-    ui::ProfessionalUI::render_kv("DP Bits", std::to_string(work.dp_bits));
-    std::cout << "\n";
-    ui::ProfessionalUI::render_footer("Press Ctrl+C to stop");
-
-    auto cpu_result = cpu_solver.solve();
-    std::cout << "\n";
-
-    if (cpu_result.found) {
-        std::cout << "[+] SOLUTION FOUND!\n";
-        uint8_t key[32] = {};
-        for (int i = 0; i < 4; i++) {
-            uint64_t v = cpu_result.private_key.d[3 - i];
-            for (int j = 0; j < 8; j++) {
-                key[i * 8 + j] = static_cast<uint8_t>((v >> (56 - j * 8)) & 0xFF);
-            }
-        }
-        std::stringstream ss;
-        for (int i = 0; i < 32; i++) {
-            ss << std::hex << std::setfill('0') << std::setw(2) << static_cast<int>(key[i]);
-        }
-        std::cout << "    Private Key: " << ss.str() << "\n";
-        pool_manager.report_solution(key);
-    } else {
-        std::cout << "[*] Solving stopped\n";
-    }
-#endif
+    backend->solve(cb);
+    std::cout << "\n[*] Solving stopped\n";
 
     // Disconnect from pool
     pool_manager.disconnect();
@@ -2384,7 +2252,7 @@ int main(int argc, char* argv[]) {
         if (args.debug) std::cout << "[DEBUG] Got logger instance, calling init()...\n" << std::flush;
         if (logger.init()) {
             if (args.debug) std::cout << "[DEBUG] Logger init succeeded\n" << std::flush;
-            LOG_INFO("Starting theCollider v1.2.1");
+            LOG_INFO("Starting theCollider v1.4.0");
         } else {
             if (args.debug) std::cout << "[DEBUG] Logger init returned false\n" << std::flush;
         }
@@ -2451,7 +2319,7 @@ int main(int argc, char* argv[]) {
     banner_stats.gpu_names = gpu_info.gpu_names;
     banner_stats.backend = gpu_info.backend;  // Actual backend: CUDA, Metal, or CPU
     banner_stats.estimated_speed = gpu_info.estimated_speed;
-    banner_stats.version = "1.2.1";
+    banner_stats.version = "1.4.0";
 
     // Add puzzle info if in puzzle mode
     if (args.puzzle_mode) {
@@ -2541,6 +2409,35 @@ int main(int argc, char* argv[]) {
     // and the early-rejection above ensures args.brainwallet_mode is false
     // before we ever get here.)
 #ifdef COLLIDER_PRO
+    // Phase 9, v1.4.0: --puzzle-only-v2 short-circuits the legacy bloom-only
+    // path and dispatches via the v2 orchestrator. The orchestrator validates
+    // puzzle_keys + scheme/addr masks; if the user did not request a bloom
+    // (addr_mask=0 puzzle-only short-circuit) we don't require --bloom.
+    if (args.puzzle_only_v2) {
+        collider::gpu::v2::OrchestratorOptions opts;
+        opts.puzzle_keys_path = args.puzzle_keys_file;  // empty -> default
+        opts.wordlist_path    = args.wordlist_file;
+        opts.bloom_path       = args.bloom_file;
+
+        std::string parse_err;
+        if (!collider::gpu::v2::parse_scheme_mask(
+                args.schemes_csv, opts.scheme_mask, parse_err)) {
+            std::cerr << "[v2] --schemes parse error: " << parse_err << "\n";
+            return 1;
+        }
+        if (!collider::gpu::v2::parse_addr_mask(
+                args.addr_types_csv, opts.addr_mask, parse_err)) {
+            std::cerr << "[v2] --addr-types parse error: " << parse_err << "\n";
+            return 1;
+        }
+        // Default: puzzle-only short-circuit when neither --bloom nor
+        // --addr-types was given. Caller can still override addr_mask via CLI.
+        if (args.bloom_file.empty() && args.addr_types_csv.empty()) {
+            opts.addr_mask = 0;
+        }
+        return collider::gpu::v2::run_v2_orchestrator(opts);
+    }
+
     if (args.brainwallet_mode) {
         if (args.bloom_file.empty()) {
             std::cerr << "[!] ERROR: Brainwallet mode requires --bloom <file.blf>\n";
@@ -3058,12 +2955,9 @@ int main(int argc, char* argv[]) {
                 public_key_compressed[32] = pub_x.d[0] & 0xff;
 
                 // Build address from Hash160
-                std::string hash160_hex;
-                for (int j = 0; j < 20; j++) {
-                    char hex[3];
-                    snprintf(hex, sizeof(hex), "%02x", hash160[j]);
-                    hash160_hex += hex;
-                }
+                char hash160_buf[41];
+                ::collider::hex_encode_lower(hash160.data(), 20, hash160_buf);
+                std::string hash160_hex(hash160_buf, 40);
 
                 // Convert Hash160 to Bitcoin address (Base58Check)
                 std::string btc_address = Base58::hash160_to_address(
@@ -3103,22 +2997,14 @@ int main(int argc, char* argv[]) {
                 // Log to detailed hits file
                 std::ofstream hitlog("brainwallet_hits.txt", std::ios::app);
                 if (hitlog) {
+                    char pk_hex[65];
+                    char pubc_hex[67];
+                    ::collider::hex_encode_lower(private_key.data(), 32, pk_hex);
+                    ::collider::hex_encode_lower(public_key_compressed.data(), 33, pubc_hex);
                     hitlog << "=== HIT FOUND ===\n";
                     hitlog << "Passphrase: " << hit_passphrase << "\n";
-                    hitlog << "Private Key: ";
-                    for (int j = 0; j < 32; j++) {
-                        char hex[3];
-                        snprintf(hex, sizeof(hex), "%02x", private_key[j]);
-                        hitlog << hex;
-                    }
-                    hitlog << "\n";
-                    hitlog << "Public Key: ";
-                    for (int j = 0; j < 33; j++) {
-                        char hex[3];
-                        snprintf(hex, sizeof(hex), "%02x", public_key_compressed[j]);
-                        hitlog << hex;
-                    }
-                    hitlog << "\n";
+                    hitlog << "Private Key: " << pk_hex << "\n";
+                    hitlog << "Public Key: " << pubc_hex << "\n";
                     hitlog << "Address: " << btc_address << "\n";
                     hitlog << "Hash160: " << hash160_hex << "\n";
                     hitlog << "Verify: https://mempool.space/address/" << btc_address << "\n";
@@ -3129,12 +3015,9 @@ int main(int argc, char* argv[]) {
                 // Also log to potfile format (hashcat-compatible)
                 std::ofstream potfile("brainwallet.pot", std::ios::app);
                 if (potfile) {
-                    for (int j = 0; j < 20; j++) {
-                        char hex[3];
-                        snprintf(hex, sizeof(hex), "%02x", hash160[j]);
-                        potfile << hex;
-                    }
-                    potfile << ":" << hit_passphrase << "\n";
+                    char h160_hex_pot[41];
+                    ::collider::hex_encode_lower(hash160.data(), 20, h160_hex_pot);
+                    potfile << h160_hex_pot << ":" << hit_passphrase << "\n";
                     potfile.close();
                 }
             }
@@ -3304,15 +3187,168 @@ int main(int argc, char* argv[]) {
     // The free build prints a notice and exits cleanly instead.
     if (args.benchmark) {
 #ifndef COLLIDER_PRO
+        // Free benchmark: SHA-256 throughput on CPU + GPU/backend info.
+        // Gives users a real number to validate their hardware without
+        // requiring the brain-wallet pipeline (Pro-only).
         std::cout << "\n";
         std::cout << "+================================================================+\n";
-        std::cout << "|               GPU PERFORMANCE BENCHMARK                        |\n";
+        std::cout << "|               COLLIDER FREE BENCHMARK                          |\n";
         std::cout << "+================================================================+\n";
-        std::cout << "[PRO] The full brain-wallet pipeline benchmark requires\n"
-                  << "      theCollider Pro. Free builds can still run the puzzle\n"
-                  << "      solver (--puzzle N [--kangaroo]) and the JLP pool client\n"
-                  << "      (--pool jlps://...).\n"
-                  << "      Purchase Pro at: https://collisionprotocol.com/pro\n";
+        std::cout << "|  Hardware: " << std::left << std::setw(52)
+                  << (gpu_info.gpu_names.empty()
+                      ? std::string("(no GPU detected)")
+                      : gpu_info.gpu_names)
+                  << "|\n";
+        std::cout << "|  Backend:  " << std::left << std::setw(52)
+                  << gpu_info.backend << "|\n";
+        std::cout << "+================================================================+\n";
+        std::cout << "  Measuring CPU SHA-256 throughput over "
+                  << args.benchmark_seconds << "s...\n\n";
+
+        // Streaming CPU SHA-256 over a 1 MB buffer. The 1 MB stream
+        // saturates the ARMv8 SHA crypto unit on Apple Silicon and the
+        // SHA-NI extension on modern Intel/AMD; the per-call init/final
+        // overhead vanishes against the per-block hash time, so the
+        // reported rate reflects actual hardware throughput.
+        constexpr size_t kBufSize = 1 << 20;   // 1 MiB
+        std::vector<uint8_t> buf(kBufSize);
+        for (size_t i = 0; i < buf.size(); ++i) buf[i] = (uint8_t)(i & 0xff);
+        uint8_t digest[32] = {0};
+        const auto bench_dur =
+            std::chrono::seconds(args.benchmark_seconds > 0
+                                 ? args.benchmark_seconds : 5);
+        const auto t0 = std::chrono::steady_clock::now();
+        uint64_t bytes_hashed = 0;
+        uint64_t streams_done = 0;
+        const char* sha_backend = nullptr;
+#if defined(__APPLE__)
+        sha_backend = "CommonCrypto (ARMv8 SHA crypto extensions)";
+        while (std::chrono::steady_clock::now() - t0 < bench_dur) {
+            CC_SHA256_CTX ctx;
+            CC_SHA256_Init(&ctx);
+            CC_SHA256_Update(&ctx, buf.data(), (CC_LONG)buf.size());
+            CC_SHA256_Final(digest, &ctx);
+            bytes_hashed += buf.size();
+            streams_done += 1;
+        }
+#elif defined(COLLIDER_HAS_OPENSSL)
+        sha_backend = "OpenSSL EVP";
+        while (std::chrono::steady_clock::now() - t0 < bench_dur) {
+            SHA256_CTX ctx;
+            SHA256_Init(&ctx);
+            SHA256_Update(&ctx, buf.data(), buf.size());
+            SHA256_Final(digest, &ctx);
+            bytes_hashed += buf.size();
+            streams_done += 1;
+        }
+#endif
+        std::cout << "[CPU]\n";
+        if (sha_backend != nullptr) {
+            const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+            const double sec = (double)elapsed_ms / 1000.0;
+            const double mbps = (double)bytes_hashed / (sec * 1024.0 * 1024.0);
+            // Report the equivalent rate of 64-byte SHA-256 blocks per second
+            // for direct comparison with the GPU number below.
+            const double blocks_per_sec = (double)bytes_hashed / 64.0 / sec;
+            std::cout << "  Backend:    " << sha_backend << "\n";
+            std::cout << "  Throughput: " << std::fixed << std::setprecision(1)
+                      << mbps << " MB/s   ("
+                      << format_number((uint64_t)blocks_per_sec)
+                      << " 64-byte blocks/s)\n";
+            std::cout << "  Method:     streaming SHA-256 over 1 MiB buffer, "
+                      << streams_done << " streams in " << std::fixed
+                      << std::setprecision(1) << sec << "s\n";
+        } else {
+            std::cout << "  SHA-256 unavailable (built without OpenSSL).\n";
+        }
+        (void)digest;
+
+        // -------------------------------------------------------------
+        // GPU SHA-256 benchmark
+        // -------------------------------------------------------------
+        std::cout << "\n[GPU]\n";
+#if defined(__APPLE__) && defined(COLLIDER_USE_METAL)
+        {
+            std::cout << "  Running Metal sha256_bench kernel ("
+                      << args.benchmark_seconds << "s)...\n";
+            auto gpu = collider::gpu::run_sha256_metal_benchmark(
+                args.benchmark_seconds);
+            if (gpu.ok) {
+                std::cout << "  Backend:    Metal (" << gpu.device_name << ")\n";
+                std::cout << "  SHA-256:    "
+                          << format_number((uint64_t)gpu.hashes_per_second)
+                          << " H/s (batched, 64-byte input)\n";
+            } else {
+                std::cout << "  Metal benchmark failed: " << gpu.error << "\n";
+            }
+        }
+#elif defined(COLLIDER_USE_CUDA)
+        {
+            // Allocate a 64-byte * batch input buffer and run sha256_batch
+            // for the configured number of seconds.
+            constexpr uint32_t kBatchSize = 1u << 18;   // 262144 inputs / dispatch
+            uint8_t* d_in = nullptr;
+            uint32_t* d_offsets = nullptr;
+            uint32_t* d_lengths = nullptr;
+            uint8_t* d_out = nullptr;
+            cudaError_t cerr = cudaMalloc(&d_in, kBatchSize * 64);
+            if (cerr == cudaSuccess) cerr = cudaMalloc(&d_offsets, kBatchSize * sizeof(uint32_t));
+            if (cerr == cudaSuccess) cerr = cudaMalloc(&d_lengths, kBatchSize * sizeof(uint32_t));
+            if (cerr == cudaSuccess) cerr = cudaMalloc(&d_out, kBatchSize * 32);
+            if (cerr == cudaSuccess) {
+                std::vector<uint32_t> h_offsets(kBatchSize), h_lengths(kBatchSize);
+                for (uint32_t i = 0; i < kBatchSize; ++i) {
+                    h_offsets[i] = i * 64;
+                    h_lengths[i] = 64;
+                }
+                cudaMemcpy(d_offsets, h_offsets.data(),
+                           kBatchSize * sizeof(uint32_t), cudaMemcpyHostToDevice);
+                cudaMemcpy(d_lengths, h_lengths.data(),
+                           kBatchSize * sizeof(uint32_t), cudaMemcpyHostToDevice);
+                cudaMemset(d_in, 0xAB, kBatchSize * 64);
+                // Warmup
+                sha256_batch(d_in, d_offsets, d_lengths, d_out, kBatchSize, 0);
+                cudaDeviceSynchronize();
+
+                std::cout << "  Running CUDA sha256_batch kernel ("
+                          << args.benchmark_seconds << "s)...\n";
+                const auto gt0 = std::chrono::steady_clock::now();
+                const auto gdur = std::chrono::seconds(
+                    args.benchmark_seconds > 0 ? args.benchmark_seconds : 5);
+                uint64_t ghashes = 0;
+                while (std::chrono::steady_clock::now() - gt0 < gdur) {
+                    sha256_batch(d_in, d_offsets, d_lengths, d_out, kBatchSize, 0);
+                    cudaDeviceSynchronize();
+                    ghashes += kBatchSize;
+                }
+                const auto gms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - gt0).count();
+                double grate = (double)ghashes * 1000.0 / (double)gms;
+                std::cout << "  Backend:    CUDA ("
+                          << (gpu_info.gpu_names.empty() ? std::string("GPU")
+                                                          : gpu_info.gpu_names) << ")\n";
+                std::cout << "  SHA-256:    " << format_number((uint64_t)grate)
+                          << " H/s (batched, 64-byte input)\n";
+            } else {
+                std::cout << "  GPU buffer alloc failed: "
+                          << cudaGetErrorString(cerr) << "\n";
+            }
+            if (d_in)      cudaFree(d_in);
+            if (d_offsets) cudaFree(d_offsets);
+            if (d_lengths) cudaFree(d_lengths);
+            if (d_out)     cudaFree(d_out);
+        }
+#else
+        std::cout << "  No GPU backend compiled in (CPU-only build).\n";
+#endif
+
+        std::cout << "\nFor sustained-rate Kangaroo throughput on this hardware,\n";
+        std::cout << "connect to the live pool:\n";
+        std::cout << "  ./collider --pool jlps://collisionprotocol.com:17403 --worker bc1q...\n";
+        std::cout << "\nFor the full brain-wallet pipeline benchmark, theCollider Pro\n";
+        std::cout << "exercises SHA256 -> EC -> hash160 -> bloom across all GPUs.\n";
+        std::cout << "https://collisionprotocol.com/pro\n";
         return 0;
 #else
         std::cout << "\n";
@@ -3738,14 +3774,30 @@ int main(int argc, char* argv[]) {
                 gpu::RCKangarooManager rc_kangaroo;
                 rc_kangaroo.range_bits = bits;
 
-                // Set DP bits
+                // Set DP bits. RCKangaroo's documented acceptance window
+                // is [kMinDpBits, kMaxDpBits] = [14, 60]. Reject explicitly
+                // out-of-range user values rather than silently clamping;
+                // a misconfigured CLI invocation should surface a clear
+                // error so the operator can correct intent.
+                using gpu::RCKangarooManager;
                 if (args.dp_bits > 0) {
-                    rc_kangaroo.dp_bits = std::max(14, std::min(60, args.dp_bits));
+                    if (args.dp_bits < RCKangarooManager::kMinDpBits ||
+                        args.dp_bits > RCKangarooManager::kMaxDpBits) {
+                        std::cerr << "[!] --dp-bits=" << args.dp_bits
+                                  << " is outside RCKangaroo's accepted range ["
+                                  << RCKangarooManager::kMinDpBits << ".."
+                                  << RCKangarooManager::kMaxDpBits << "]. Aborting.\n";
+                        return 64;  // EX_USAGE
+                    }
+                    rc_kangaroo.dp_bits = args.dp_bits;
                     std::cout << "\033[36m[*] DP Configuration\033[0m\n";
                     std::cout << "    dp_bits: " << rc_kangaroo.dp_bits << " (user override)\n";
                     std::cout << "    1 in " << format_number(1ULL << rc_kangaroo.dp_bits) << " points marked as DP\n";
                 } else {
-                    // RCKangaroo auto-calculates optimal dp_bits, but we can hint
+                    // Auto: clamp the bits/3 heuristic into [16, 28]. We
+                    // narrow the auto window further than the absolute
+                    // [14, 60] window because the heuristic shouldn't
+                    // ever pick wildly off values, only sane defaults.
                     rc_kangaroo.dp_bits = std::min(28, std::max(16, bits / 3));
                     std::cout << "\033[36m[*] DP Configuration (auto)\033[0m\n";
                     std::cout << "    dp_bits: " << rc_kangaroo.dp_bits << " (optimal for " << bits << "-bit puzzle)\n";
@@ -3820,7 +3872,7 @@ int main(int argc, char* argv[]) {
                         std::cout << "\033[36mProgress:\033[0m "
                                   << std::fixed << std::setprecision(4) << progress_pct << "% | "
                                   << "\033[33mOps:\033[0m " << ui::ProfessionalUI::format_number_short(ops) << " | "
-                                  << "\033[32mSpeed:\033[0m " << ui::ProfessionalUI::format_speed(speed) << " | "
+                                  << "\033[32mSpeed:\033[0m " << ui::format_rate(static_cast<double>(speed) * 1e6) << " | "
                                   << "\033[35mDPs:\033[0m " << ui::ProfessionalUI::format_number_short(dp_count) << " | "
                                   << "\033[34mETA:\033[0m " << eta_str
                                   << "  " << std::flush;
@@ -3901,16 +3953,26 @@ int main(int argc, char* argv[]) {
                 int total_kangaroos = gpu_kangaroo.num_kangaroos_per_gpu * num_gpus;
 
                 if (args.dp_bits > 0) {
-                    // User specified dp_bits manually
-                    dp_bits_to_use = std::max(16, std::min(28, args.dp_bits));
-                    std::cout << "\033[36m[*] DP Configuration\033[0m\n";
-                    std::cout << "    dp_bits: " << dp_bits_to_use;
-                    if (dp_bits_to_use != args.dp_bits) {
-                        std::cout << " (clamped from " << args.dp_bits << ")";
-                    } else {
-                        std::cout << " (user override)";
+                    // User specified dp_bits manually. The MultiGPU
+                    // backend's documented window is [kMinDpBits,
+                    // kMaxDpBits] = [16, 28]. Out-of-range values used
+                    // to be silently clamped, hiding configuration
+                    // mistakes. Reject explicitly so the operator sees
+                    // and corrects the intent.
+                    using gpu::MultiGPUKangarooManager;
+                    if (args.dp_bits < MultiGPUKangarooManager::kMinDpBits ||
+                        args.dp_bits > MultiGPUKangarooManager::kMaxDpBits) {
+                        std::cerr << "[!] --dp-bits=" << args.dp_bits
+                                  << " is outside MultiGPU Kangaroo's accepted range ["
+                                  << MultiGPUKangarooManager::kMinDpBits << ".."
+                                  << MultiGPUKangarooManager::kMaxDpBits
+                                  << "]. Use --use-rckangaroo for the wider "
+                                  << "[14, 60] range. Aborting.\n";
+                        return 64;  // EX_USAGE
                     }
-                    std::cout << "\n";
+                    dp_bits_to_use = args.dp_bits;
+                    std::cout << "\033[36m[*] DP Configuration\033[0m\n";
+                    std::cout << "    dp_bits: " << dp_bits_to_use << " (user override)\n";
                     std::cout << "    1 in " << format_number(1ULL << dp_bits_to_use) << " points marked as DP\n";
                 } else {
                     // Auto-calculate optimal dp_bits
@@ -4059,7 +4121,7 @@ int main(int argc, char* argv[]) {
                 solver.set_target_h160(target_hash160);
             }
 
-            solver.progress_callback = [&](uint64_t tame_steps, uint64_t wild_steps, uint64_t dp_count, double rate) -> bool {
+            solver.set_progress_callback([&](uint64_t tame_steps, uint64_t wild_steps, uint64_t dp_count, double rate) -> bool {
                 if (g_shutdown) return false;
 
                 uint64_t total = tame_steps + wild_steps;
@@ -4069,7 +4131,7 @@ int main(int argc, char* argv[]) {
                           << format_rate(rate) << "        " << std::flush;
 
                 return !g_shutdown;
-            };
+            });
 
             std::cout << "[*] Starting CPU kangaroo search...\n";
             std::cout << "    Press Ctrl+C to stop\n\n";

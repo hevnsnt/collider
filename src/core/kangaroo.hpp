@@ -30,6 +30,7 @@
 #include <mutex>
 #include <shared_mutex>
 #include <thread>
+#include <iostream>
 #include <fstream>
 #include <sstream>
 #include <iomanip>
@@ -211,7 +212,7 @@ struct KangarooWorkFile {
     std::string target_pubkey_hex;
     std::string range_start_hex;
     std::string range_end_hex;
-    int dp_bits;
+    uint32_t dp_bits;
     uint64_t total_steps;
     std::vector<DistinguishedPoint> dps;
     std::chrono::system_clock::time_point started_at;
@@ -254,7 +255,7 @@ struct KangarooWorkFile {
                 if (key == "target") target_pubkey_hex = val;
                 else if (key == "range_start") range_start_hex = val;
                 else if (key == "range_end") range_end_hex = val;
-                else if (key == "dp_bits") dp_bits = std::stoi(val);
+                else if (key == "dp_bits") dp_bits = static_cast<uint32_t>(std::stoul(val));
                 else if (key == "total_steps") total_steps = std::stoull(val);
                 else if (key == "elapsed_seconds") elapsed_seconds = std::stod(val);
                 else if (key == "dp_count") dp_count = std::stoull(val);
@@ -345,17 +346,33 @@ private:
 class KangarooSolver {
 public:
     // Configuration
-    int dp_bits = 20;  // Distinguished point: trailing zeros in X coordinate
+    uint32_t dp_bits = 20;  // Distinguished point: trailing zeros in X coordinate
     uint64_t max_steps = 0;  // 0 = no limit (use expected steps)
     std::atomic<bool> stop_flag{false};
 
     // Progress callback: (tame_steps, wild_steps, dp_count, keys_per_sec) -> continue?
-    std::function<bool(uint64_t, uint64_t, uint64_t, double)> progress_callback;
+    using ProgressCallback =
+        std::function<bool(uint64_t, uint64_t, uint64_t, double)>;
+    using DpCallback =
+        std::function<void(const cpu::uint256_t&, const cpu::uint256_t&, bool)>;
 
-    // DP callback: fired each time a distinguished point is found, before local collision check.
-    // Use this in pool mode to submit DPs to the server.
-    // Signature: (x_coord, distance, is_tame)
-    std::function<void(const cpu::uint256_t&, const cpu::uint256_t&, bool)> dp_callback;
+    // Set the progress callback. Stored under callback_mutex_; safe to
+    // change between solve() invocations. Setting during a live solve()
+    // is permitted (the worker threads atomically observe the latest
+    // callback at the start of each invocation point) but unusual.
+    void set_progress_callback(ProgressCallback cb) {
+        std::lock_guard<std::mutex> lk(callback_mutex_);
+        progress_callback_ = std::move(cb);
+    }
+
+    // Set the DP callback. Fired each time a distinguished point is
+    // found, before the local collision check. Use this in pool mode to
+    // submit DPs to the server. Signature: (x_coord, distance, is_tame).
+    // Same threading semantics as set_progress_callback.
+    void set_dp_callback(DpCallback cb) {
+        std::lock_guard<std::mutex> lk(callback_mutex_);
+        dp_callback_ = std::move(cb);
+    }
 
     /**
      * Set number of threads for parallel execution
@@ -402,7 +419,7 @@ public:
         // Set DP bits based on range size
         // DP bits ~ sqrt(range_bits) / 2 gives good memory/speed tradeoff
         int range_bits = rs.bit_length();
-        dp_bits = std::max(10, std::min(28, range_bits / 4));
+        dp_bits = static_cast<uint32_t>(std::max(10, std::min(28, range_bits / 4)));
 
         // Expected steps ~ 2 * sqrt(range)
         // For large puzzles (> ~120 bits), the expected steps overflow uint64_t
@@ -458,6 +475,56 @@ public:
         if (!work_file_path_.empty()) {
             KangarooWorkFile wf;
             if (wf.load(work_file_path_)) {
+                // Verify the checkpoint matches the current target. A
+                // mismatched checkpoint silently loaded into a different
+                // search would inject foreign DPs into dp_table_,
+                // generating false collisions and wasted compute on a
+                // search that can never solve. Reject hard so the
+                // operator either points at the correct file or starts
+                // a new run.
+                bool mismatch = false;
+                std::ostringstream why;
+                if (!target_pubkey_hex_.empty() &&
+                    !wf.target_pubkey_hex.empty() &&
+                    wf.target_pubkey_hex != target_pubkey_hex_)
+                {
+                    mismatch = true;
+                    why << "  target pubkey: file='" << wf.target_pubkey_hex
+                        << "' solver='" << target_pubkey_hex_ << "'\n";
+                }
+                if (!range_start_hex_.empty() &&
+                    !wf.range_start_hex.empty() &&
+                    wf.range_start_hex != range_start_hex_)
+                {
+                    mismatch = true;
+                    why << "  range_start: file='" << wf.range_start_hex
+                        << "' solver='" << range_start_hex_ << "'\n";
+                }
+                if (!range_end_hex_.empty() &&
+                    !wf.range_end_hex.empty() &&
+                    wf.range_end_hex != range_end_hex_)
+                {
+                    mismatch = true;
+                    why << "  range_end: file='" << wf.range_end_hex
+                        << "' solver='" << range_end_hex_ << "'\n";
+                }
+                if (wf.dp_bits != dp_bits) {
+                    mismatch = true;
+                    why << "  dp_bits: file=" << wf.dp_bits
+                        << " solver=" << dp_bits << "\n";
+                }
+
+                if (mismatch) {
+                    std::cerr << "[!] Work file '" << work_file_path_
+                              << "' does not match the current search:\n"
+                              << why.str()
+                              << "    Refusing to load mismatched checkpoint. "
+                              << "Move or rename the file, or correct the "
+                              << "target/range/dp-bits to match.\n";
+                    result.elapsed_seconds = 0;
+                    return result;  // not_found, no solution
+                }
+
                 dp_table_.load(wf.dps);
                 total_steps_.store(wf.total_steps);
                 elapsed_before_resume_ = wf.elapsed_seconds;
@@ -504,6 +571,31 @@ private:
 
     // Thread-safe DP table
     ThreadSafeDPTable dp_table_;
+
+    // Callbacks moved off the public surface in v1.4.0 phase 1.9. Mutex
+    // serializes set_*_callback against the worker-thread reads on hot
+    // paths; the readers take a brief shared snapshot under the same
+    // mutex so an in-flight callback isn't replaced mid-call. The
+    // mutex is mutable so the snapshot helpers can lock it from const
+    // context if needed.
+    mutable std::mutex callback_mutex_;
+    ProgressCallback   progress_callback_;
+    DpCallback         dp_callback_;
+
+    // Snapshot helpers used by the worker hot paths. Returning the
+    // function by value (cheap empty-or-target std::function) is fine
+    // because the worker calls it and then drops the snapshot; this
+    // keeps the lock window tiny and avoids holding it across the user
+    // callback (which could deadlock if the callback re-entered the
+    // solver).
+    ProgressCallback snapshot_progress_callback() const {
+        std::lock_guard<std::mutex> lk(callback_mutex_);
+        return progress_callback_;
+    }
+    DpCallback snapshot_dp_callback() const {
+        std::lock_guard<std::mutex> lk(callback_mutex_);
+        return dp_callback_;
+    }
 
     /**
      * Convert uint256 to hex string
@@ -569,9 +661,9 @@ private:
             double elapsed = std::chrono::duration<double>(now - start_time).count();
             uint64_t steps = total_steps_.load();
 
-            if (progress_callback) {
+            if (auto pcb = snapshot_progress_callback()) {
                 double rate = steps / std::max(0.001, elapsed);
-                if (!progress_callback(steps / 2, steps / 2, dp_table_.size(), rate)) {
+                if (!pcb(steps / 2, steps / 2, dp_table_.size(), rate)) {
                     stop_flag.store(true);
                     break;
                 }
@@ -624,6 +716,12 @@ private:
     void thread_worker_standard(int thread_id) {
         std::random_device rd;
         std::mt19937_64 rng(rd() + thread_id);
+
+        // Snapshot the DP callback once at thread start. The mutex
+        // protects against set_dp_callback() racing with reads, but we
+        // only want to take it once per thread, not per DP -- the hot
+        // path runs millions of iterations per second.
+        const DpCallback dp_cb = snapshot_dp_callback();
 
         // Initialize tame kangaroo at range midpoint + small offset for this thread
         Kangaroo tame;
@@ -684,7 +782,7 @@ private:
                 dp.distance = tame.distance;
                 dp.is_tame = true;
 
-                if (dp_callback) dp_callback(dp.x, dp.distance, true);
+                if (dp_cb) dp_cb(dp.x, dp.distance, true);
 
                 cpu::uint256_t result_key;
                 if (dp_table_.insert_and_check(dp, result_key)) {
@@ -709,7 +807,7 @@ private:
                 dp.distance = wild.distance;
                 dp.is_tame = false;
 
-                if (dp_callback) dp_callback(dp.x, dp.distance, false);
+                if (dp_cb) dp_cb(dp.x, dp.distance, false);
 
                 cpu::uint256_t result_key;
                 if (dp_table_.insert_and_check(dp, result_key)) {
@@ -747,9 +845,9 @@ private:
             double elapsed = std::chrono::duration<double>(now - start_time).count();
             uint64_t steps = total_steps_.load();
 
-            if (progress_callback) {
+            if (auto pcb = snapshot_progress_callback()) {
                 double rate = steps / std::max(0.001, elapsed);
-                if (!progress_callback(steps, 0, 0, rate)) {
+                if (!pcb(steps, 0, 0, rate)) {
                     stop_flag.store(true);
                     break;
                 }

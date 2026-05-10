@@ -115,5 +115,26 @@ jobs:
             -DCOLLIDER_BUILD_TESTS=OFF \
             -DCOLLIDER_BUILD_BENCHMARKS=OFF
 
-      - name: Build
+      - name: Build (FREE)
         run: cmake --build build --config ${{ env.BUILD_TYPE }} -j4
+
+      # v1.4.0: Pro build coverage on Mac. The free build above doesn't
+      # exercise brain_wallet_gpu.hpp (the Pro brain-wallet pipeline)
+      # or rckangaroo_wrapper.cu, both of which include cuda* type
+      # references that need correct stubs in the !COLLIDER_USE_CUDA
+      # path. Without this job, regressions like the cudaEvent_t stub
+      # miss in fed3c05 would only surface when an operator tried to
+      # build Pro on Mac. Separate build dir so the FREE configure/build
+      # cache stays clean.
+      - name: Configure (PRO build, COLLIDER_PRO=ON, Metal backend)
+        run: |
+          cmake -B build_pro -G Ninja \
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+            -DCOLLIDER_PRO=ON \
+            -DCOLLIDER_USE_CUDA=OFF \
+            -DCOLLIDER_USE_METAL=ON \
+            -DCOLLIDER_BUILD_TESTS=OFF \
+            -DCOLLIDER_BUILD_BENCHMARKS=OFF
+
+      - name: Build (PRO)
+        run: cmake --build build_pro --config ${{ env.BUILD_TYPE }} -j4

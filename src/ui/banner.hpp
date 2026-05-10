@@ -8,6 +8,7 @@
 
 #include <iostream>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <chrono>
 #include <thread>
@@ -99,6 +100,40 @@ namespace ansi {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Single source of truth for "X items per second" formatting.
+//
+// Auto-picks an SI prefix (K / M / G / T) based on magnitude and emits two
+// decimals of precision (one for sub-MKey/s, zero for sub-KKey/s) so output
+// width is bounded and predictable. Default unit is "Keys/s" since most
+// callers are measuring kangaroo / brute-force key throughput; the SHA
+// benchmark and brain-wallet check loops can override it.
+//
+// Replaces the three independent formatters that grew up alongside this
+// header (`Banner::format_speed(uint64_t)`,
+// `ProfessionalUI::format_speed(int mkeys_per_sec)`, and a substr-truncating
+// free function in main.cpp). Callers that had a value already in MKeys/s
+// should multiply by 1e6 before calling.
+// ---------------------------------------------------------------------------
+inline std::string format_rate(double rate, std::string_view unit = "Keys/s") {
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(2);
+    if (rate >= 1e12) {
+        oss << (rate / 1e12) << " T" << unit;
+    } else if (rate >= 1e9) {
+        oss << (rate / 1e9)  << " G" << unit;
+    } else if (rate >= 1e6) {
+        oss << (rate / 1e6)  << " M" << unit;
+    } else if (rate >= 1e3) {
+        oss.precision(1);
+        oss << (rate / 1e3)  << " K" << unit;
+    } else {
+        oss.precision(0);
+        oss << rate << " " << unit;
+    }
+    return oss.str();
+}
+
 /**
  * Clean banner with shine wipe effect.
  */
@@ -146,29 +181,48 @@ private:
     }
 
     /**
-     * Check if running on Windows (for ASCII fallback).
+     * Decide whether to use ASCII or Unicode block art for the logo.
+     *
+     * Honors explicit env-var overrides first:
+     *   COLLIDER_ASCII=1   -> force ASCII
+     *   COLLIDER_UNICODE=1 -> force Unicode (used for testing on Windows)
+     *
+     * Otherwise:
+     *   Windows: ASCII by default (cmd.exe + PowerShell default to legacy
+     *            code pages that can't render U+2588 block chars cleanly).
+     *   Linux/Mac: Unicode IF the active locale is UTF-8. Falls back to
+     *              ASCII when LANG / LC_ALL / LC_CTYPE is unset, "C", or
+     *              not a UTF-8 locale -- a Mac terminal launched without
+     *              an inherited locale (some shells, ssh sessions, GUI
+     *              app launches) won't render U+2588 and would show the
+     *              "���" replacement-char triple per glyph instead.
      */
     bool use_ascii_fallback() const {
+        if (std::getenv("COLLIDER_ASCII") != nullptr)   return true;
+        if (std::getenv("COLLIDER_UNICODE") != nullptr) return false;
 #ifdef _WIN32
-        // Windows console often has issues with Unicode block chars
-        // Use ASCII by default, can be overridden with env var
-        return std::getenv("COLLIDER_UNICODE") == nullptr;
+        // Windows console default code pages don't render U+2588 cleanly.
+        return true;
+#elif defined(__APPLE__)
+        // Even with LANG=en_US.UTF-8, many monospace fonts shipped with
+        // Mac terminals (Menlo, SF Mono in some weights, third-party
+        // fonts) lack U+2588 FULL BLOCK and render it as the
+        // replacement-glyph triple. ASCII is the safe default; users
+        // who want the block-letter version can opt in via
+        // COLLIDER_UNICODE=1.
+        return true;
 #else
-        return false;
+        // Linux: probe LC_ALL > LC_CTYPE > LANG.
+        const char* loc = std::getenv("LC_ALL");
+        if (!loc || !*loc) loc = std::getenv("LC_CTYPE");
+        if (!loc || !*loc) loc = std::getenv("LANG");
+        if (!loc || !*loc) return true;
+        std::string s(loc);
+        for (auto& c : s) c = (char)std::tolower((unsigned char)c);
+        if (s.find("utf-8") != std::string::npos) return false;
+        if (s.find("utf8")  != std::string::npos) return false;
+        return true;
 #endif
-    }
-
-    std::string format_speed(uint64_t speed) {
-        if (speed >= 1'000'000'000) {
-            return std::to_string(speed / 1'000'000'000) + "." +
-                   std::to_string((speed % 1'000'000'000) / 100'000'000) + "B/s";
-        } else if (speed >= 1'000'000) {
-            return std::to_string(speed / 1'000'000) + "." +
-                   std::to_string((speed % 1'000'000) / 100'000) + "M/s";
-        } else if (speed >= 1'000) {
-            return std::to_string(speed / 1'000) + "K/s";
-        }
-        return std::to_string(speed) + "/s";
     }
 
     /**
@@ -325,7 +379,8 @@ private:
             if (config_.enable_color) out << ansi::BRIGHT_YELLOW;
             out << "Speed";
             if (config_.enable_color) out << ansi::RESET << ansi::CYAN;
-            out << ":    " << std::left << std::setw(48) << format_speed(stats.estimated_speed) << "|\n";
+            out << ":    " << std::left << std::setw(48)
+                << format_rate(static_cast<double>(stats.estimated_speed)) << "|\n";
         }
 
         // Mode-specific info
@@ -538,25 +593,12 @@ public:
         return oss.str();
     }
 
-    /**
-     * Format speed in Keys/s with appropriate suffix.
-     * Input is in MKeys/s, output uses G/T when appropriate.
-     */
-    static std::string format_speed(int mkeys_per_sec) {
-        std::ostringstream oss;
-        oss << std::fixed << std::setprecision(2);
-        if (mkeys_per_sec >= 1000000) {
-            // TKeys/s range
-            oss << (static_cast<double>(mkeys_per_sec) / 1000000.0) << " TKeys/s";
-        } else if (mkeys_per_sec >= 1000) {
-            // GKeys/s range
-            oss << (static_cast<double>(mkeys_per_sec) / 1000.0) << " GKeys/s";
-        } else {
-            // MKeys/s range
-            oss << mkeys_per_sec << " MKeys/s";
-        }
-        return oss.str();
-    }
+    // Speed/rate formatting now lives at namespace scope as
+    // `collider::ui::format_rate(double, std::string_view)`. The previous
+    // `format_speed(int mkeys_per_sec)` version mis-scaled M into T and
+    // produced "1.21 TKeys/s" displays for ~1 MKey/s inputs; converting
+    // its callers to multiply their value by 1e6 first is more honest.
+
 
     /**
      * Format duration in human-readable form.
@@ -622,6 +664,11 @@ public:
 
 // Convenience alias
 using UI = ProfessionalUI;
+
+// PoolProgressDisplay was previously defined here; it now lives in
+// src/ui/pool_progress.hpp. Keeping the header focused on banner +
+// general UI utilities; pool-specific widgets live alongside the pool
+// client integration.
 
 } // namespace ui
 } // namespace collider

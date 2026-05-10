@@ -37,6 +37,18 @@
 #include <iostream>
 #include <memory>
 
+// Shared jump-table size (must come BEFORE namespace block: the
+// header opens its own collider::gpu, which would nest if pulled in
+// inside an already-open namespace).
+#include "kangaroo_jump_table_size.hpp"
+
+// File-scope MSL boundary check: the Metal kernel hard-codes 32 via
+// #define KANGAROO_JUMP_TABLE_SIZE; if the host-side constant is ever
+// retuned, the MSL kernel needs the same change in lockstep.
+static_assert(::collider::gpu::kKangarooJumpTableSize == 32u,
+              "kangaroo.metal hard-codes KANGAROO_JUMP_TABLE_SIZE 32; "
+              "update the .metal kernel together with this constant.");
+
 namespace collider {
 namespace gpu {
 
@@ -53,23 +65,18 @@ __device__ const uint64_t SECP256K1_P[4] = {
     0xFFFFFFFFFFFFFFFFULL
 };
 
-// secp256k1 order n and generator G - kept for reference, currently unused
-// __device__ const uint64_t SECP256K1_N[4] = {
-//     0xBFD25E8CD0364141ULL, 0xBAAEDCE6AF48A03BULL,
-//     0xFFFFFFFFFFFFFFFEULL, 0xFFFFFFFFFFFFFFFFULL
-// };
-// __device__ const uint64_t SECP256K1_GX[4] = {
-//     0x59F2815B16F81798ULL, 0x029BFCDB2DCE28D9ULL,
-//     0x55A06295CE870B07ULL, 0x79BE667EF9DCBBACULL
-// };
-// __device__ const uint64_t SECP256K1_GY[4] = {
-//     0x9C47D08FFB10D4B8ULL, 0xFD17B448A6855419ULL,
-//     0x5DA4FBFC0E1108A8ULL, 0x483ADA7726A3C465ULL
-// };
-
-// Number of jump table entries (must be power of 2)
-#define NUM_JUMPS 32
-#define JUMP_MASK (NUM_JUMPS - 1)
+// Number of jump table entries. Sourced from the shared header so the
+// CUDA host path agrees with the Metal host path (kangaroo_metal.hpp
+// pulls from the same kangaroo_jump_table_size.hpp). The include
+// happens above the `namespace collider { namespace gpu {` block at
+// the top of this file (an include here would nest collider::gpu
+// inside itself); see the static_assert at file scope below for the
+// MSL boundary check. Kept as a #define because the kernel uses it
+// in shared-memory array sizing and that requires a compile-time
+// integer constant expression visible without namespace qualification
+// at __device__ scope.
+#define NUM_JUMPS  ((int)::collider::gpu::kKangarooJumpTableSize)
+#define JUMP_MASK  (NUM_JUMPS - 1)
 
 // DP check interval: batch convert to affine every N steps for correct DP detection
 // Using warp size (32) for efficient warp-cooperative batch inversion
@@ -438,11 +445,18 @@ __device__ void mod_inv(uint64_t* r, const uint64_t* a) {
     for (int i = 1; i < 44; i++) mod_sqr(x220, x220);
     mod_mul(x220, x220, x44);
 
-    // x223 = a^(2^223 - 1)
+    // x223 = a^(2^223 - 1).
+    //
+    // 2026-05-09 fix: previous code multiplied by x2 (= a^3) here, which
+    // produces x223 = a^(2^223 - 5), not a^(2^223 - 1). The libsecp256k1
+    // canonical chain uses x3 (= a^7) at this position so that
+    //   (2^220 - 1)*2^3 + 7 = 2^223 - 8 + 7 = 2^223 - 1.
+    // Caught by tests/test_kangaroo_small_puzzle.cu reporting 7/8 vectors
+    // wrong. Fixed by changing x2 -> x3 below.
     mod_sqr(x223, x220);
     mod_sqr(x223, x223);
     mod_sqr(x223, x223);
-    mod_mul(x223, x223, x2);
+    mod_mul(x223, x223, x3);
 
     // Now compute a^(p-2) using x223 and additional operations
     // p - 2 = 2^256 - 2^32 - 979
@@ -960,7 +974,7 @@ struct KangarooState {
 
 __global__ void kangaroo_step_kernel_jlp(
     KangarooState state,
-    int dp_bits,
+    uint32_t dp_bits,
     int steps_per_kernel,
     size_t total_kangaroos,  // Total kangaroos (must be multiple of GPU_GRP_SIZE)
     const uint64_t* __restrict__ d_jump_x,  // Jump table X [NUM_JUMPS * 4]
@@ -1122,7 +1136,7 @@ __global__ void kangaroo_step_kernel_jlp(
 
 __global__ void kangaroo_step_kernel_sota(
     KangarooState state,
-    int dp_bits,
+    uint32_t dp_bits,
     int steps_per_kernel,
     size_t total_kangaroos,
     const uint64_t* __restrict__ d_jump_x,  // Jump table X [NUM_JUMPS * 4]
@@ -1314,7 +1328,7 @@ __global__ void kangaroo_step_kernel_sota(
  */
 __global__ void kangaroo_step_kernel(
     KangarooState state,
-    int dp_bits,
+    uint32_t dp_bits,
     int steps_per_kernel,
     size_t count,
     const uint64_t* __restrict__ d_jump_x,  // Jump table X [NUM_JUMPS * 4]
@@ -1670,7 +1684,7 @@ public:
         SOTA_3GROUP           // SOTA: 3-group with symmetry, K=1.15 (fastest, 45% fewer ops)
     };
 
-    void step(int dp_bits, int steps_per_kernel, KernelMode mode = KernelMode::SOTA_3GROUP) {
+    void step(uint32_t dp_bits, int steps_per_kernel, KernelMode mode = KernelMode::SOTA_3GROUP) {
         if (!allocated_) return;
 
         // Check that jump tables are uploaded
@@ -1725,12 +1739,12 @@ public:
     }
 
     // Convenience method for JLP kernel
-    void step_jlp(int dp_bits, int steps_per_kernel) {
+    void step_jlp(uint32_t dp_bits, int steps_per_kernel) {
         step(dp_bits, steps_per_kernel, KernelMode::JLP_AFFINE_BATCH);
     }
 
     // Convenience method for SOTA kernel (recommended - fastest)
-    void step_sota(int dp_bits, int steps_per_kernel) {
+    void step_sota(uint32_t dp_bits, int steps_per_kernel) {
         step(dp_bits, steps_per_kernel, KernelMode::SOTA_3GROUP);
     }
 
@@ -1833,97 +1847,6 @@ private:
 }  // namespace collider
 
 // ============================================================================
-// Kernel Launch Helpers (called from kangaroo_solver_gpu.cu)
-// Must be outside namespace for proper C linkage
-// ============================================================================
-
-// Device memory pointers for jump tables (extern C interface)
-// These are allocated by allocate_kangaroo_jump_tables() and freed by free_kangaroo_jump_tables()
-static uint64_t* g_d_jump_x = nullptr;
-static uint64_t* g_d_jump_y = nullptr;
-static uint64_t* g_d_jump_d = nullptr;
-
-/**
- * Allocate device memory for jump tables (call once before upload_kangaroo_jump_table)
- */
-extern "C" bool allocate_kangaroo_jump_tables() {
-    size_t jump_table_size = NUM_JUMPS * 4 * sizeof(uint64_t);
-    cudaError_t err;
-
-    if (!g_d_jump_x) {
-        err = cudaMalloc(&g_d_jump_x, jump_table_size);
-        if (err != cudaSuccess) return false;
-    }
-    if (!g_d_jump_y) {
-        err = cudaMalloc(&g_d_jump_y, jump_table_size);
-        if (err != cudaSuccess) return false;
-    }
-    if (!g_d_jump_d) {
-        err = cudaMalloc(&g_d_jump_d, jump_table_size);
-        if (err != cudaSuccess) return false;
-    }
-    return true;
-}
-
-/**
- * Free device memory for jump tables
- */
-extern "C" void free_kangaroo_jump_tables() {
-    if (g_d_jump_x) { cudaFree(g_d_jump_x); g_d_jump_x = nullptr; }
-    if (g_d_jump_y) { cudaFree(g_d_jump_y); g_d_jump_y = nullptr; }
-    if (g_d_jump_d) { cudaFree(g_d_jump_d); g_d_jump_d = nullptr; }
-}
-
-/**
- * Upload jump table to device memory (not constant memory - fixes RDC linking)
- * Note: Call allocate_kangaroo_jump_tables() first!
- */
-extern "C" void upload_kangaroo_jump_table(
-    const uint64_t jump_x[][4],
-    const uint64_t jump_y[][4],
-    const uint64_t jump_d[][4]
-) {
-    size_t jump_table_size = NUM_JUMPS * 4 * sizeof(uint64_t);
-
-    // Allocate if not already done
-    if (!g_d_jump_x || !g_d_jump_y || !g_d_jump_d) {
-        allocate_kangaroo_jump_tables();
-    }
-
-    // Copy to device memory
-    cudaMemcpy(g_d_jump_x, jump_x, jump_table_size, cudaMemcpyHostToDevice);
-    cudaMemcpy(g_d_jump_y, jump_y, jump_table_size, cudaMemcpyHostToDevice);
-    cudaMemcpy(g_d_jump_d, jump_d, jump_table_size, cudaMemcpyHostToDevice);
-}
-
-/**
- * Launch kangaroo stepping kernel
- * Note: Call upload_kangaroo_jump_table() first!
- */
-extern "C" void launch_kangaroo_kernel(
-    uint64_t* d_x, uint64_t* d_y, uint64_t* d_z,
-    uint64_t* d_dist, uint32_t* d_flags, uint32_t* d_types,
-    int dp_bits, int steps_per_round, int num_kangaroos
-) {
-    collider::gpu::KangarooState state;
-    state.x = d_x;
-    state.y = d_y;
-    state.z = d_z;
-    state.dist = d_dist;
-    state.flags = d_flags;
-    state.types = d_types;
-
-    int threads_per_block = 256;
-    int blocks = (num_kangaroos + threads_per_block - 1) / threads_per_block;
-
-    collider::gpu::kangaroo_step_kernel<<<blocks, threads_per_block>>>(
-        state, dp_bits, steps_per_round, num_kangaroos,
-        g_d_jump_x, g_d_jump_y, g_d_jump_d,  // Pass jump table pointers
-        0  // debug_mode
-    );
-}
-
-// ============================================================================
 // GPUKangarooManager Implementation (must be in same .cu file as kernels)
 // ============================================================================
 
@@ -1951,16 +1874,6 @@ inline int clz64_local(uint64_t x) {
 
 namespace collider {
 namespace gpu {
-
-// secp256k1 generator point for host-side computations - kept for reference
-// static const uint64_t HOST_GX[4] = {
-//     0x59F2815B16F81798ULL, 0x029BFCDB2DCE28D9ULL,
-//     0x55A06295CE870B07ULL, 0x79BE667EF9DCBBACULL
-// };
-// static const uint64_t HOST_GY[4] = {
-//     0x9C47D08FFB10D4B8ULL, 0xFD17B448A6855419ULL,
-//     0x5DA4FBFC0E1108A8ULL, 0x483ADA7726A3C465ULL
-// };
 
 /**
  * Implementation struct (pimpl)

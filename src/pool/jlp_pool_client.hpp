@@ -138,6 +138,11 @@ struct JLPDistinguishedPointV2 {
     uint8_t  x[32];          // 32 bytes - X coordinate
     uint8_t  d[32];          // 32 bytes - Distance
     uint8_t  type;           // 1 byte   - Tame (0) or Wild (1)
+    // Wire format pins this to 1 byte (struct.pack 'B' on the server side
+    // gives 74-byte total). The abstract DistinguishedPoint::dp_bits in
+    // pool_client.hpp is uint64_t for API ergonomics; the sender narrows
+    // to uint8_t here. Realistic values are 1..50, so truncation is safe.
+    // (Gemini PR review pointed out the type difference; deliberate.)
     uint8_t  dp_bits;        // 1 byte   - Number of leading-zero bits used
 };
 static_assert(sizeof(JLPDistinguishedPointV2) == 74,

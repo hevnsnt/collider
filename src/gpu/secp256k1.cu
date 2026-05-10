@@ -484,68 +484,104 @@ __device__ __forceinline__ void mod_sqr(uint256& result, const uint256& a) {
  * Based on the libsecp256k1 addition chain which is near-optimal.
  */
 __device__ void mod_inv(uint256& r, const uint256& a) {
-    // Wave 1 / C-CRIT-2 fix (2026-05-04 v3):
-    // Right-to-left binary exponentiation of a^(p-2) mod p using the literal
-    // p-2 constant in 8 x uint32 little-endian limbs. Algorithm matches the
-    // working puzzle_optimized.cu mod_inv (which uses 4 x uint64 limbs).
+    // v1.4.0 phase 4 perf: libsecp256k1-style addition chain for
+    // a^(p-2) mod p. 256 squarings + 13 multiplications instead of 256
+    // squarings + 248 multiplications -- ~1.9x reduction in mod_mul
+    // calls per inversion.
     //
-    // History:
-    //   v1 (broken): hand-coded addition chain produced wrong exponent.
-    //   v2 (broken): correct binary exponent walk but mod_mul above silently
-    //                dropped a carry from the high*c reduction, corrupting
-    //                ~all multiplications during the long ~248-mul exp chain.
-    //   v3 (fixed):  same exponent walk as v2; mod_mul above is now carry-safe.
-    //                With a correct mod_mul, this walk is correct by inspection.
+    // NOTE on the prior failed port: this file's first addition-chain
+    // attempt (v1.4.0 commit e8fc629, reverted as 5c673c5) faithfully
+    // mirrored kangaroo_kernel.cu's chain, which itself had a bug at
+    // the x223 step -- multiplying by x2 (= a^3) instead of x3 (= a^7).
+    // That made x223 = a^(2^223 - 5), poisoning the rest of the chain
+    // and producing a^(p - 2 - 2^35) instead of a^(p-2). The KAT
+    // tests/test_secp256k1_inv.cu reported 63/64 wrong; reverting
+    // restored the binary walk. This port uses the corrected x3
+    // multiplication and is verified against the same KAT before
+    // landing.
     //
-    // p     = 0xFFFFFFFF FFFFFFFF FFFFFFFF FFFFFFFF
-    //         FFFFFFFF FFFFFFFF FFFFFFFE FFFFFC2F (big-endian)
-    // p - 2 = 0xFFFFFFFF FFFFFFFF FFFFFFFF FFFFFFFF
-    //         FFFFFFFF FFFFFFFF FFFFFFFE FFFFFC2D (big-endian)
+    // The chain naming convention (xN = a^(2^N - 1)):
+    //   x2  = a^3
+    //   x3  = a^7
+    //   x6  = a^(2^6  - 1)
+    //   x9  = a^(2^9  - 1)
+    //   x11 = a^(2^11 - 1)
+    //   x22 = a^(2^22 - 1)
+    //   x44 = a^(2^44 - 1)
+    //   x88 = a^(2^88 - 1)
+    //   x176 = a^(2^176 - 1)
+    //   x220 = a^(2^220 - 1)
+    //   x223 = a^(2^223 - 1)  <-- libsecp256k1 uses x3 here, NOT x2.
     //
-    // In 8 x uint32 LITTLE-endian limbs (limbs[0] = least significant 32 bits):
-    //   limbs[0] = 0xFFFFFC2D, limbs[1] = 0xFFFFFFFE, limbs[2..7] = 0xFFFFFFFF.
-    //
-    // The outer i loop walks limbs LSB->MSB. The inner bit loop walks bits
-    // 0->31 within each limb. So overall we process bit 0 first, bit 255 last,
-    // squaring `base` after each bit (so `base` = a^(2^k) at iteration k) and
-    // accumulating into `result` whenever the corresponding bit of p-2 is 1.
-    //
-    // Total work: 256 squarings + popcount(p-2) = 248 multiplications.
-    //
-    // Aliasing safety: each mod_mul writes to a fresh `tmp`/`tmp2` local,
-    // then we assign back. mod_mul as implemented does NOT require this, but
-    // belt-and-suspenders for a function called ~500 times per inversion.
-    const uint32_t p_minus_2[8] = {
-        0xFFFFFC2Du, 0xFFFFFFFEu, 0xFFFFFFFFu, 0xFFFFFFFFu,
-        0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu
+    // Aliasing safety: lambdas write through a fresh local then assign,
+    // matching the previous binary-walk convention (belt-and-suspenders
+    // for a function called millions of times per kernel launch).
+    auto sqr = [](uint256& r_, const uint256& x) {
+        uint256 t; mod_mul(t, x, x); r_ = t;
+    };
+    auto mul = [](uint256& r_, const uint256& x, const uint256& y) {
+        uint256 t; mod_mul(t, x, y); r_ = t;
     };
 
-    uint256 result;
-    result.limbs[0] = 1u;
-    #pragma unroll
-    for (int i = 1; i < 8; i++) result.limbs[i] = 0u;
+    uint256 x2, x3, x6, x9, x11, x22, x44, x88, x176, x220, x223, t1;
 
-    uint256 base = a;
+    // x2 = a^3
+    sqr(x2, a);  mul(x2, x2, a);
+    // x3 = a^7
+    sqr(x3, x2); mul(x3, x3, a);
 
-    // Force nvcc not to unroll either loop. Unrolling 256 mod_mul calls would
-    // explode register pressure and instruction cache; #pragma unroll 1 keeps
-    // the loop tight with predictable scheduling.
-    #pragma unroll 1
-    for (int i = 0; i < 8; i++) {
-        uint32_t bits = p_minus_2[i];
-        #pragma unroll 1
-        for (int bit = 0; bit < 32; bit++) {
-            if ((bits >> bit) & 1u) {
-                uint256 tmp;
-                mod_mul(tmp, result, base);
-                result = tmp;
-            }
-            uint256 tmp2;
-            mod_mul(tmp2, base, base);
-            base = tmp2;
-        }
-    }
-    r = result;
+    // x6 = a^(2^6 - 1)
+    sqr(x6, x3); sqr(x6, x6); sqr(x6, x6); mul(x6, x6, x3);
+    // x9 = a^(2^9 - 1)
+    sqr(x9, x6); sqr(x9, x9); sqr(x9, x9); mul(x9, x9, x3);
+    // x11 = a^(2^11 - 1)
+    sqr(x11, x9); sqr(x11, x11); mul(x11, x11, x2);
+
+    // x22 = a^(2^22 - 1)
+    sqr(x22, x11);
+    for (int i = 1; i < 11; ++i) sqr(x22, x22);
+    mul(x22, x22, x11);
+
+    // x44 = a^(2^44 - 1)
+    sqr(x44, x22);
+    for (int i = 1; i < 22; ++i) sqr(x44, x44);
+    mul(x44, x44, x22);
+
+    // x88 = a^(2^88 - 1)
+    sqr(x88, x44);
+    for (int i = 1; i < 44; ++i) sqr(x88, x88);
+    mul(x88, x88, x44);
+
+    // x176 = a^(2^176 - 1)
+    sqr(x176, x88);
+    for (int i = 1; i < 88; ++i) sqr(x176, x176);
+    mul(x176, x176, x88);
+
+    // x220 = a^(2^220 - 1)
+    sqr(x220, x176);
+    for (int i = 1; i < 44; ++i) sqr(x220, x220);
+    mul(x220, x220, x44);
+
+    // x223 = a^(2^223 - 1).
+    // CRITICAL: multiply by x3 (a^7), NOT x2 (a^3). The libsecp256k1
+    // chain has (2^220 - 1) * 2^3 + 7 = 2^223 - 1; multiplying by
+    // a^3 instead gives 2^223 - 5 (off by 4) and poisons the tail.
+    sqr(x223, x220); sqr(x223, x223); sqr(x223, x223);
+    mul(x223, x223, x3);
+
+    // Tail: x223^(2^23) * x22 ; ^(2^5) * a ; ^(2^3) * x2 ; ^(2^2) * a.
+    // Produces a^(p-2) where p = 2^256 - 2^32 - 977.
+    sqr(t1, x223);
+    for (int i = 1; i < 23; ++i) sqr(t1, t1);
+    mul(t1, t1, x22);
+    for (int i = 0; i < 5; ++i) sqr(t1, t1);
+    mul(t1, t1, a);
+    for (int i = 0; i < 3; ++i) sqr(t1, t1);
+    mul(t1, t1, x2);
+    sqr(t1, t1); sqr(t1, t1);
+    mul(t1, t1, a);
+
+    r = t1;
 }
 
 // =============================================================================

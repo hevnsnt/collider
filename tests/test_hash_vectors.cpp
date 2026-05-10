@@ -6,6 +6,7 @@
  */
 
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <iostream>
 #include <iomanip>
@@ -265,7 +266,10 @@ bool hex_to_bytes(const char* hex, uint8_t* bytes, size_t* len) {
 
 void bytes_to_hex(const uint8_t* bytes, size_t len, char* hex) {
     for (size_t i = 0; i < len; i++) {
-        sprintf(hex + i*2, "%02x", bytes[i]);
+        // 3 = "XX\0" -- snprintf writes the null terminator for each byte;
+        // the explicit hex[len*2] = '\0' below remains harmless. Avoids the
+        // sprintf deprecation warning on macOS / clang 17+.
+        std::snprintf(hex + i*2, 3, "%02x", bytes[i]);
     }
     hex[len*2] = '\0';
 }

@@ -16,6 +16,7 @@
 #include <unordered_map>
 #include <array>
 #include <stdexcept>
+#include "byte_codec.hpp"
 
 #ifdef _MSC_VER
 #include <intrin.h>
@@ -166,9 +167,19 @@ struct PuzzleInfo {
         return result;
     }
 
-    // Total keys in range: 2^(N-1)
+    // Total keys in range: 2^(N-1).
+    //
+    // Algebraic identity: for puzzle N the range is the inclusive
+    // interval [2^(N-1), 2^N - 1], whose size is
+    //
+    //     2^N - 1 - 2^(N-1) + 1 = 2^(N-1)
+    //
+    // which is exactly range_start(). So returning range_start() is
+    // correct for ALL canonical Bitcoin puzzles -- it is NOT a bug.
+    // (Audited 2026-05-09: confirmed alongside the related
+    // range_bits_from_be inclusive-end fix in src/core/byte_codec.hpp.)
     UInt256 range_size() const {
-        return range_start();  // Size is 2^(N-1), same as start value
+        return range_start();
     }
 };
 
@@ -180,57 +191,88 @@ class PuzzleDatabase {
 public:
     static const std::vector<PuzzleInfo>& get_all() {
         static std::vector<PuzzleInfo> puzzles = {
-            // Solved puzzles (for reference/testing) - hash160 verified via crypto_cpu.hpp
-            {1, 1, "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH", "751e76e8199196d454941c45d1b3a323f1433bd6", true, "0x1", 0.0, ""},
-            {2, 2, "1CUNEBjYrCn2y1SdiUMohaKUi4wpP326Lb", "f430141d8093adec344b08f28aa4d16cea02ad0b", true, "0x3", 0.0, ""},
-            {3, 3, "19ZewH8Kk1PDbSNdJ97FP4EiCjTRaZMZQA", "47362c5544e8bc92763cd39cc5868b46b4dfc894", true, "0x7", 0.0, ""},
-            {4, 4, "1EhqbyUMvvs7BfL8goY6qcPbD6YKfPqb7e", "0b2966c16071eddca446fa7d6f76ba0ed01fba27", true, "0x8", 0.0, ""},
-            {5, 5, "1E6NuFjCi27W5zoXg8TRdcSRq84zJeBW3k", "bb77ba24b3c63f508ed409475a7f2a4efdf0999a", true, "0x15", 0.0, ""},
+            // ALL data below verified 2026-05-09 against the canonical
+            // export at https://privatekeys.pw/puzzles/bitcoin-puzzle-tx
+            // (status=solved and status=unsolved CSV endpoints). Pre-1.4
+            // versions of this table contained:
+            //   - wrong hash160 fields for puzzles 2-5 and 69-70
+            //     (didn't match the listed addresses)
+            //   - fabricated solution_hex for 67, 68, 69, 70, 75, 85,
+            //     90, 95, 100, 105, 110, 115, 120, 125, 130
+            //   - wrong target_address for puzzles 90, 95, 100, 105,
+            //     110, 115, 120, 125, 131, 132, 133, 134, 135, 136, 137,
+            //     140, 145 (mostly off by one or shifted)
+            // Any code or test that branched on these fields produced
+            // wrong results. Re-derive from the canonical CSV when
+            // updating; do not edit one field without verifying the row.
 
-            // Solved puzzles 66-70 (solved 2019-2025)
-            {66, 66, "13zb1hQbWVsc2S7ZTZnP2G4undNNpdh5so", "20d45a6a762535700ce9e0b216e31994335db8a5", true, "0x2832ed74f2b5e35ee", 0.0, ""},
-            {67, 67, "1BY8GQbnueYofwSuFAT3USAhGjPrkxDdW9", "739437bb3dd6d1983e66629c5f08c70e52769371", true, "0x4b5f8303e9a7f9b1d", 0.0, ""},
-            {68, 68, "1MVDYgVaSN6iKKEsbzRUAYFrYJadLYZvvZ", "e0b8a2baee1b77fc703455f39d51477451fc8cfc", true, "0xe9ae4933d6db008e", 0.0, ""},
-            {69, 69, "19vkiEajfhuZ8bs8Zu2jgmC6oqZbWqhxhG", "5fbc8bbee5f5b6f0f0b6b5f5e5f5b6f0f0b6b5f5", true, "0x14f3664f4c0a8a5d0d", 0.0, ""},
-            {70, 70, "19YZECXj3SxEZMoUeJ1yiPsw8xANe7M7QR", "5e5f5b6f0f0b6b5f5e5f5b6f0f0b6b5f5e5f5b6f", true, "0x357d8e60fb95efbf", 0.0, ""},
+            // Solved puzzles 1-5 (solved at puzzle creation; sequential
+            // private keys 1, 3, 7, 8, 0x15 = 21).
+            {1, 1, "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH", "751e76e8199196d454941c45d1b3a323f1433bd6", true, "0x1", 0.0, "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"},
+            {2, 2, "1CUNEBjYrCn2y1SdiUMohaKUi4wpP326Lb", "7dd65592d0ab2fe0d0257d571abf032cd9db93dc", true, "0x3", 0.0, "02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9"},
+            {3, 3, "19ZewH8Kk1PDbSNdJ97FP4EiCjTRaZMZQA", "5dedfbf9ea599dd4e3ca6a80b333c472fd0b3f69", true, "0x7", 0.0, "025cbdf0646e5db4eaa398f365f2ea7a0e3d419b7e0330e39ce92bddedcac4f9bc"},
+            {4, 4, "1EhqbyUMvvs7BfL8goY6qcPbD6YKfPqb7e", "9652d86bedf43ad264362e6e6eba6eb764508127", true, "0x8", 0.0, "022f01e5e15cca351daff3843fb70f3c2f0a1bdd05e5af888a67784ef3e10a2a01"},
+            {5, 5, "1E6NuFjCi27W5zoXg8TRdcSRq84zJeBW3k", "8f9dff39a81ee4abcbad2ad8bafff090415a2be8", true, "0x15", 0.0, "02352bbf4a4cdd12564f93fa332ce333301d9ad40271f8107181340aef25be59d5"},
 
-            // UNSOLVED puzzles 71-80 (NO public keys known - brute force only)
-            {71, 71, "1PWo3JeB9jrGwfHDNpdGK54CRas7fsVzXU", "unknown", false, "", 7.1, ""},
-            {72, 72, "1JTK7s9YVYywfm5XUH7RNhHJH1LshCaRFR", "unknown", false, "", 7.2, ""},
-            {73, 73, "12VVRNPi4SJqUTsp6FmqDqY5sGosDtysn4", "unknown", false, "", 7.3, ""},
-            {74, 74, "1FWGcVDK3JGzCC3WtkYetULPszMaK2Jksv", "unknown", false, "", 7.4, ""},
-            {75, 75, "1J36UjUByGroXcCvmj13U6uwaVv9caEeAt", "unknown", true, "0x6ad2c7f5b1e4d8c3a", 0.0, ""},  // Historical solve
+            // Solved puzzles 66-70, 75, 80, 85-130. These all had
+            // outgoing transactions that exposed the public key, making
+            // Kangaroo ECDLP cracking viable. Solve dates from the
+            // canonical CSV are: 66=2024-09-12, 67=2025-02-21,
+            // 68=2025-04-06, 69=2025-04-30, 70=2019-06-09,
+            // 75=2019-06-10, 80=2019-06-11, 85=2019-06-17, 90=2019-07-01,
+            // 95=2019-07-06, 100=2019-07-08, 105=2019-09-23,
+            // 110=2020-05-30, 115=2020-06-16, 120=2023-02-27,
+            // 125=2023-07-09, 130=2024-09-23.
+            {66, 66, "13zb1hQbWVsc2S7ZTZnP2G4undNNpdh5so", "20d45a6a762535700ce9e0b216e31994335db8a5", true, "0x2832ed74f2b5e35ee", 0.0, "024ee2be2d4e9f92d2f5a4a03058617dc45befe22938feed5b7a6b7282dd74cbdd"},
+            {67, 67, "1BY8GQbnueYofwSuFAT3USAhGjPrkxDdW9", "739437bb3dd6d1983e66629c5f08c70e52769371", true, "0x730fc235c1942c1ae", 0.0, "0212209f5ec514a1580a2937bd833979d933199fc230e204c6cdc58872b7d46f75"},
+            {68, 68, "1MVDYgVaSN6iKKEsbzRUAYFrYJadLYZvvZ", "e0b8a2baee1b77fc703455f39d51477451fc8cfc", true, "0xbebb3940cd0fc1491", 0.0, "031fe02f1d740637a7127cdfe8a77a8a0cfc6435f85e7ec3282cb6243c0a93ba1b"},
+            {69, 69, "19vkiEajfhuZ8bs8Zu2jgmC6oqZbWqhxhG", "61eb8a50c86b0584bb727dd65bed8d2400d6d5aa", true, "0x101d83275fb2bc7e0c", 0.0, "024babadccc6cfd5f0e5e7fd2a50aa7d677ce0aa16fdce26a0d0882eed03e7ba53"},
+            {70, 70, "19YZECXj3SxEZMoUeJ1yiPsw8xANe7M7QR", "5db8cda53a6a002db10365967d7f85d19e171b10", true, "0x349b84b6431a6c4ef1", 0.0, "0290e6900a58d33393bc1097b5aed31f2e4e7cbd3e5466af958665bc0121248483"},
+            {75, 75, "1J36UjUByGroXcCvmj13U6uwaVv9caEeAt", "badf8b0d34289e679ec65c6c61d3a974353be5cf", true, "0x4c5ce114686a1336e07", 0.0, "03726b574f193e374686d8e12bc6e4142adeb06770e0a2856f5e4ad89f66044755"},
+            {80, 80, "1BCf6rHUW6m3iH2ptsvnjgLruAiPQQepLe", "6fe5a36eef0684af0b91f3b6cfc972d68c4f6fab", true, "0xea1a5c66dcc11b5ad180", 0.0, "037e1238f7b1ce757df94faa9a2eb261bf0aeb9f84dbf81212104e78931c2a19dc"},
+            {85, 85, "1Kh22PvXERd2xpTQk3ur6pPEqFeckCJfAr", "cd03c1e6268ce9b89e3c3eeab8d0f1b6e8cac281", true, "0x11720c4f018d51b8cebba8", 0.0, "0329c4574a4fd8c810b7e42a4b398882b381bcd85e40c6883712912d167c83e73a"},
+            {90, 90, "1L12FHH2FHjvTviyanuiFVfmzCy46RRATU", "d06b6e206691295ec345782d7ea0686969d8674b", true, "0x2ce00bb2136a445c71e85bf", 0.0, "035c38bd9ae4b10e8a250857006f3cfd98ab15a6196d9f4dfd25bc7ecc77d788d5"},
+            {95, 95, "19eVSDuizydXxhohGh8Ki9WY9KsHdSwoQC", "5ed822125365274262191d2b77e88d436dd56d88", true, "0x527a792b183c7f64a0e8b1f4", 0.0, "02967a5905d6f3b420959a02789f96ab4c3223a2c4d2762f817b7895c5bc88a045"},
+            {100, 100, "1KCgMv8fo2TPBpddVi9jqmMmcne9uSNJ5F", "c7a7b23f6bd98b8aaf527beb724dda9460b1bc6e", true, "0xaf55fc59c335c8ec67ed24826", 0.0, "03d2063d40402f030d4cc71331468827aa41a8a09bd6fd801ba77fb64f8e67e617"},
+            {105, 105, "1CMjscKB3QW7SDyQ4c3C3DEUHiHRhiZVib", "7c957db6fdd0733bb83bc6d6d747711263ba50b0", true, "0x16f14fc2054cd87ee6396b33df3", 0.0, "03bcf7ce887ffca5e62c9cabbdb7ffa71dc183c52c04ff4ee5ee82e0c55c39d77b"},
+            {110, 110, "12JzYkkN76xkwvcPT6AWKZtGX6w2LAgsJg", "0e5f3c406397442996825fd395543514fd06f207", true, "0x35c0d7234df7deb0f20cf7062444", 0.0, "0309976ba5570966bf889196b7fdf5a0f9a1e9ab340556ec29f8bb60599616167d"},
+            {115, 115, "1NLbHuJebVwUZ1XqDjsAyfTRUPwDQbemfv", "ea0f2b7576bd098921fce9bfebe37f6383e639a4", true, "0x60f4d11574f5deee49961d9609ac6", 0.0, "0248d313b0398d4923cdca73b8cfa6532b91b96703902fc8b32fd438a3b7cd7f55"},
+            {120, 120, "17s2b9ksz5y7abUm92cHwG8jEPCzK3dLnT", "4b46e10a541aeec6be3fac709c256fb7da69308e", true, "0xb10f22572c497a836ea187f2e1fc23", 0.0, "02ceb6cbbcdbdf5ef7150682150f4ce2c6f4807b349827dcdbdd1f2efa885a2630"},
+            {125, 125, "1PXAyUB8ZoH3WD8n5zoAthYjN15yN5CVq5", "f7079256aa027dc437cbb539f955472416725fc8", true, "0x1c533b6bb7f0804e09960225e44877ac", 0.0, "0233709eb11e0d4439a729f21c2c443dedb727528229713f0065721ba8fa46f00e"},
+            {130, 130, "1Fo65aKq8s8iquMt6weF1rku1moWVEd5Ua", "a24922852051a9002ebf4c864a55acb75bb4cf75", true, "0x33e7665705359f04f28b88cf897c603c9", 0.0, "03633cbe3ec02b9401c5effa144c5b4d22f87940259634858fc7e59b1c09937852"},
 
-            // Solved puzzles 85, 90, 95, 100, 105, 110, 115, 120, 125, 130 (solved 2019-2024)
-            {85, 85, "1Kh22PvXERd2xpTQk3ur6pPEqFeckCJfAr", "unknown", true, "0x11720c4f018d51b8ceb", 0.0, ""},
-            {90, 90, "1M92mimvH8Dt4sDpNBo3mjGdRKRHPUnkpS", "unknown", true, "0x349b84b6431a6c4ef1", 0.0, ""},
-            {95, 95, "1LHtnpd8nU5VHEMkG2TMYYNUjjLc992bps", "unknown", true, "0x6abe1f9b67e114f1cd8", 0.0, ""},
-            {100, 100, "1F4KcRs3XqwaVLR2QX82xNr1RQPpT3Xf3i", "unknown", true, "0xaf55fc59c335c8ec67e", 0.0, ""},
-            {105, 105, "1Fo65aKq8s8iquMt6weF1rku1moWVEd5Ua", "unknown", true, "0x146e3c7d1a8f9b5e2c7d", 0.0, ""},
-            {110, 110, "12jbtzBb54r97TCwW3G1gCFoumpckRAPdY", "unknown", true, "0x35c0d7234df7deb0f20", 0.0, ""},
-            {115, 115, "1KbrSKrT3GeEruTWPnU9RMvFm9fhqrqHXa", "unknown", true, "0x6a7c3f8e9b5d2c1a4f7", 0.0, ""},
-            {120, 120, "1LzhS3k3e9Ub8i2W1V8xQFdB8n2MYCHPCa", "unknown", true, "0xb5f1a8c3d7e9f2b6a4c", 0.0, ""},
-            {125, 125, "1KCgMv8fo2TPBpddVi9jqmMmcne9uSNJ5F", "unknown", true, "0x15d8c7f3e2b9a6d4c8f5", 0.0, ""},
-            {130, 130, "1Fo65aKq8s8iquMt6weF1rku1moWVEd5Ua", "unknown", true, "0x2ec18388d544c6fe15f", 0.0, ""},
+            // UNSOLVED 71-74. Plain addresses with no outgoing tx, so
+            // no public key exposed -- pure brute force only, Kangaroo
+            // not viable.
+            {71, 71, "1PWo3JeB9jrGwfHDNpdGK54CRas7fsVzXU", "f6f5431d25bbf7b12e8add9af5e3475c44a0a5b8", false, "", 7.1, ""},
+            {72, 72, "1JTK7s9YVYywfm5XUH7RNhHJH1LshCaRFR", "bf7413e8df4e7a34ce9dc13e2f2648783ec54adb", false, "", 7.2, ""},
+            {73, 73, "12VVRNPi4SJqUTsp6FmqDqY5sGosDtysn4", "105b7f253f0ebd7843adaebbd805c944bfb863e4", false, "", 7.3, ""},
+            {74, 74, "1FWGcVDK3JGzCC3WtkYetULPszMaK2Jksv", "9f1adb20baeacc38b3f49f3df6906a0e48f2df3d", false, "", 7.4, ""},
 
-            // UNSOLVED puzzles - current targets!
-            // Puzzles 131-134: Public key UNKNOWN - Kangaroo impossible, brute force only
-            {131, 131, "1PXAyUB8ZoH3WD8n5zoeQmAEQdGQv8V2s4", "unknown", false, "", 13.1, ""},
-            {132, 132, "16RGFo6hjq9ym6Pj7N5H7L1NR1rVPJyw2v", "unknown", false, "", 13.2, ""},
-            {133, 133, "1UDHPdovvR985NrWSkdWQDEQ1xuRiTALq", "unknown", false, "", 13.3, ""},
-            {134, 134, "13z1JFtDMGTYQvtMq5gs4LmCztNsEbXVRL", "unknown", false, "", 13.4, ""},
+            // UNSOLVED puzzles 131-134: Public key UNKNOWN. Kangaroo
+            // impossible, brute force only.
+            {131, 131, "16zRPnT8znwq42q7XeMkZUhb1bKqgRogyy", "41b4b36a6c036568972380177eca2916cacd71de", false, "", 13.1, ""},
+            {132, 132, "1KrU4dHE5WrW8rhWDsTRjR21r8t3dsrS3R", "cecd3ca4319651bd3afd1e23ab66e111ed38d16d", false, "", 13.2, ""},
+            {133, 133, "17uDfp5r4n441xkgLFmhNoSW1KWp6xVLD",  "014e15e4ea6da460cc7835e262676baa37988e4f", false, "", 13.3, ""},
+            {134, 134, "13A3JrvXmvg5w9XGvyyR4JEJqiLz8ZySY3", "17a5ebfaf62e73f149e33ba674836801f13a80b9", false, "", 13.4, ""},
 
-            // Puzzles 135+: Public key KNOWN - Kangaroo viable!
-            {135, 135, "1PWABE7oUahG2AFFQhhvViQovnCr4rEv7Q", "unknown", false, "", 13.5, "02145d2611c823a396ef6712ce0f712f09b9b4f3135e3e0aa3230fb9b6d08d1e16"},
-            {136, 136, "1J9oGoAiHeLbfDLhH93K2t4HqDDvzMvxPH", "unknown", false, "", 13.6, ""},
-            {137, 137, "1AuYmxQ3wV2C9Xv9jf5WLMT4EVTMgVFXhZ", "unknown", false, "", 13.7, ""},
-            {140, 140, "1EeAxcprB2PpCnr34VWt9Auep8k8gF4vZG", "unknown", false, "", 14.0, "031f6a332d3c5c4f2de2378c012f429cd109ba07d69690c6c701b6bb87860d6640"},
-            {145, 145, "1C8BL7qLXGqLc3jLdAfR2yxM9sSL7GZQoJ", "unknown", false, "", 14.5, "03afdda497369e219a2c1c369954a930e4d3740968e5e4352475bcffce3140dae5"},
+            // UNSOLVED puzzles with KNOWN public keys (creator's
+            // outgoing tx exposed pubkey). Kangaroo viable. These are
+            // the live targets for v1.4.0 pool work.
+            {135, 135, "16RGFo6hjq9ym6Pj7N5H7L1NR1rVPJyw2v", "3b6f58a75a54bfd85d1bc6c51180fdc732992326", false, "", 13.5, "02145d2611c823a396ef6712ce0f712f09b9b4f3135e3e0aa3230fb9b6d08d1e16"},
+            {136, 136, "1UDHPdovvR985NrWSkdWQDEQ1xuRiTALq",  "05257be4b57ee43fc09762d5d3a9ad4a6e1a0364", false, "", 13.6, ""},
+            {137, 137, "15nf31J46iLuK1ZkTnqHo7WgN5cARFK3RA", "3482f8986e13c018692053a784481c63a3554c9c", false, "", 13.7, ""},
+            {140, 140, "1QKBaU6WAeycb3DbKbLBkX7vJiaS8r42Xo", "ffbb35a7bb9bbe16c1aa2534f7ff11d59c8e3d1a", false, "", 14.0, "031f6a332d3c5c4f2de2378c012f429cd109ba07d69690c6c701b6bb87860d6640"},
+            {145, 145, "19GpszRNUej5yYqxXoLnbZWKew3KdVLkXg", "5abf369388deb8072741b4eb43ef10fa9388a729", false, "", 14.5, "03afdda497369e219a2c1c369954a930e4d3740968e5e4352475bcffce3140dae5"},
 
-            // Ultimate prizes (puzzle 150-160) - Public keys KNOWN!
-            {150, 150, "1KRvP3kHJaHD6MzNxPRpKNJGPsFZNfgw8U", "unknown", false, "", 50.0, "03137807790ea7dc6e97901c2bc87411f45ed74a5629315c4e4b03a0a102250c49"},
-            {155, 155, "14u4nA5sugaswb6SZgn5av2vuChdMnD9Ea", "unknown", false, "", 50.0, "035cd1854cae45391ca4ec428cc7e6c7d9984424b954209a8eea197b9e364c05f6"},
-            {160, 160, "1686rUWy4RpN6rBL4tUnNhzNLHTGMHVjcK", "unknown", false, "", 50.0, "02e0a8b039282faf6fe0fd769cfbc4b6b4cf8758ba68220eac420e32b91ddfa673"},
+            // Ultimate prizes (puzzle 150, 155, 160). Public keys KNOWN
+            // (creator outgoing tx). btc_reward fields pre-1.4 were a
+            // hand-typed "50.0" placeholder that didn't match reality;
+            // canonical export shows 15, 15.5, 16 BTC respectively.
+            // Addresses + hash160s also corrected from corrupt values.
+            {150, 150, "1MUJSJYtGPVGkBCTqGspnxyHahpt5Te8jy", "e08c4d3bc9cf2b3e2cb88de2bfaa4fe8c7aa3f24", false, "", 15.0, "03137807790ea7dc6e97901c2bc87411f45ed74a5629315c4e4b03a0a102250c49"},
+            {155, 155, "1AoeP37TmHdFh8uN72fu9AqgtLrUwcv2wJ", "6b8b7830f73c5bf9e8beb9f161ad82b3bde992e4", false, "", 15.5, "035cd1854cae45391ca4ec428cc7e6c7d9984424b954209a8eea197b9e364c05f6"},
+            {160, 160, "1NBC8uXJy1GiJ6drkiZa1WuKn51ps7EPTv", "e84818e1bf7f699aa6e28ef9edfb582099099292", false, "", 16.0, "02e0a8b039282faf6fe0fd769cfbc4b6b4cf8758ba68220eac420e32b91ddfa673"},
         };
         return puzzles;
     }
@@ -354,15 +396,9 @@ public:
             }
 
             // Extract H160 (bytes 1-20)
-            std::string hex;
-            hex.reserve(40);
-            for (size_t i = 1; i <= 20; i++) {
-                char buf[3];
-                std::snprintf(buf, sizeof(buf), "%02x", decoded[i]);
-                hex += buf;
-            }
-
-            return hex;
+            char buf[41];
+            ::collider::hex_encode_lower(decoded.data() + 1, 20, buf);
+            return std::string(buf, 40);
 
         } catch (const std::exception&) {
             return "";

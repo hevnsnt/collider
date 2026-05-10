@@ -684,32 +684,68 @@ __device__ void mod_sqr(U256& r, const U256& a) {
 // (only 7 zero bits in p-2). To rule out aliasing edge cases across mod_mul
 // calls, we multiply via a fresh temporary then assign.
 __device__ void mod_inv(U256& r, const U256& a) {
-    const uint64_t p_minus_2[4] = {
-        0xFFFFFFFEFFFFFC2DULL, 0xFFFFFFFFFFFFFFFFULL,
-        0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL
+    // v1.4.0 phase 4 perf: libsecp256k1-style addition chain. 256
+    // squarings + 13 multiplications instead of 256 + 248 -- ~1.9x
+    // reduction in mod_mul calls per inversion. CRITICAL: x223 step
+    // multiplies by x3 (a^7), NOT x2 (a^3); see the matching comment
+    // in src/gpu/secp256k1.cu for the libsecp256k1 chain derivation.
+    // Verified locally against tests/test_puzzle_optimized_inv.cu (the
+    // KAT tests/test_secp256k1_inv.cu's analogue for U256 type).
+    auto sqr = [](U256& r_, const U256& x) {
+        U256 t; mod_mul(t, x, x); r_ = t;
+    };
+    auto mul = [](U256& r_, const U256& x, const U256& y) {
+        U256 t; mod_mul(t, x, y); r_ = t;
     };
 
-    U256 result;
-    result.set_one();
+    U256 x2, x3, x6, x9, x11, x22, x44, x88, x176, x220, x223, t1;
 
-    U256 base = a;
+    // x2 = a^3, x3 = a^7
+    sqr(x2, a);  mul(x2, x2, a);
+    sqr(x3, x2); mul(x3, x3, a);
 
-    #pragma unroll 1
-    for (int i = 0; i < 4; i++) {
-        uint64_t bits = p_minus_2[i];
-        #pragma unroll 1
-        for (int bit = 0; bit < 64; bit++) {
-            if ((bits >> bit) & 1ULL) {
-                U256 tmp;
-                mod_mul(tmp, result, base);
-                result = tmp;
-            }
-            U256 tmp2;
-            mod_mul(tmp2, base, base);
-            base = tmp2;
-        }
-    }
-    r = result;
+    // xN = a^(2^N - 1) for N = 6, 9, 11
+    sqr(x6, x3); sqr(x6, x6); sqr(x6, x6); mul(x6, x6, x3);
+    sqr(x9, x6); sqr(x9, x9); sqr(x9, x9); mul(x9, x9, x3);
+    sqr(x11, x9); sqr(x11, x11); mul(x11, x11, x2);
+
+    // xN for N = 22, 44, 88, 176, 220
+    sqr(x22, x11);
+    for (int i = 1; i < 11; ++i) sqr(x22, x22);
+    mul(x22, x22, x11);
+
+    sqr(x44, x22);
+    for (int i = 1; i < 22; ++i) sqr(x44, x44);
+    mul(x44, x44, x22);
+
+    sqr(x88, x44);
+    for (int i = 1; i < 44; ++i) sqr(x88, x88);
+    mul(x88, x88, x44);
+
+    sqr(x176, x88);
+    for (int i = 1; i < 88; ++i) sqr(x176, x176);
+    mul(x176, x176, x88);
+
+    sqr(x220, x176);
+    for (int i = 1; i < 44; ++i) sqr(x220, x220);
+    mul(x220, x220, x44);
+
+    // x223 = (2^220 - 1) * 2^3 + 7 = 2^223 - 1.
+    sqr(x223, x220); sqr(x223, x223); sqr(x223, x223);
+    mul(x223, x223, x3);
+
+    // Tail: ^(2^23) * x22 ; ^(2^5) * a ; ^(2^3) * x2 ; ^(2^2) * a.
+    sqr(t1, x223);
+    for (int i = 1; i < 23; ++i) sqr(t1, t1);
+    mul(t1, t1, x22);
+    for (int i = 0; i < 5; ++i) sqr(t1, t1);
+    mul(t1, t1, a);
+    for (int i = 0; i < 3; ++i) sqr(t1, t1);
+    mul(t1, t1, x2);
+    sqr(t1, t1); sqr(t1, t1);
+    mul(t1, t1, a);
+
+    r = t1;
 }
 
 // =============================================================================
@@ -722,9 +758,9 @@ __device__ void mod_inv(U256& r, const U256& a) {
 // 2026-05-04 fix (Defect C): the prior implementation wrote R.Y before
 // computing R.Z = 2 * P.Y * P.Z, which silently corrupted the result
 // whenever R aliased P (which is the common case: ec_double(R, R) is
-// called from ec_mul_glv / ec_mul_precomp and from the precomputed-table
-// generator). All output writes now happen at the very end into local
-// temporaries, then are copied to R, so R may freely alias P.
+// called from ec_mul_glv and from the precomputed-table generator).
+// All output writes now happen at the very end into local temporaries,
+// then are copied to R, so R may freely alias P.
 __device__ void ec_double(PointJ& R, const PointJ& P) {
     if (P.is_infinity()) {
         R.set_infinity();
@@ -957,47 +993,6 @@ __device__ void batch_invert(U256* z, U256* inv, int n) {
 // =============================================================================
 
 // Windowed scalar multiplication using precomputed table
-// Process 4 bits at a time, reducing additions by 4x.
-//
-// WARNING (2026-05-04, Defect B): this function is currently UNUSED in
-// the production search path (search_strided uses ec_mul_glv instead),
-// and as written it suffers from the same window-table mismatch that
-// was just fixed in ec_mul_glv. The table stores entries with the
-// per-window 16^w scaling baked in, but this routine also doubles 4
-// times per window, which double-counts the positional weight.
-// Left in place for now to avoid touching unused code; if it becomes
-// live, fix it the same way ec_mul_glv was fixed (use only the flat
-// d_PRECOMP_TABLE[0..15] = i*G entries and rely on the per-window
-// doublings for positional scaling).
-__device__ void ec_mul_precomp(PointJ& R, const U256& k) {
-    R.set_infinity();
-
-    // Process from most significant window to least
-    for (int w = NUM_WINDOWS - 1; w >= 0; w--) {
-        // Double 4 times (for window size 4)
-        for (int i = 0; i < WINDOW_SIZE; i++) {
-            ec_double(R, R);
-        }
-
-        // Extract window value (4 bits)
-        int shift = (w * WINDOW_SIZE) % 64;
-        int word = (w * WINDOW_SIZE) / 64;
-        uint64_t window = (k.d[word] >> shift) & WINDOW_MASK;
-
-        // Handle window crossing word boundary
-        if (shift > 60 && word < 3) {
-            window |= (k.d[word + 1] << (64 - shift)) & WINDOW_MASK;
-        }
-
-        // Add precomputed point if window != 0
-        if (window != 0) {
-            // Read from global memory (L2 cached via cudaAccessPropertyPersisting)
-            PointA P = d_PRECOMP_TABLE[w * (1 << WINDOW_SIZE) + window];
-            ec_add_mixed(R, R, P);
-        }
-    }
-}
-
 // =============================================================================
 // GLV ENDOMORPHISM - Full Implementation
 // =============================================================================

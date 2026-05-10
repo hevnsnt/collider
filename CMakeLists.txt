@@ -157,6 +157,9 @@ elseif(COLLIDER_USE_CUDA)
         set(CMAKE_CUDA_FLAGS_RELEASE "${CMAKE_CUDA_FLAGS_RELEASE} -lineinfo")
         # Suppress deprecated GPU architecture warnings (for older GPUs like GTX 9xx)
         set(CMAKE_CUDA_FLAGS_RELEASE "${CMAKE_CUDA_FLAGS_RELEASE} -Wno-deprecated-gpu-targets")
+        # Phase 5+ kernels (v1.4.0) use lambdas + relaxed-constexpr inside __device__
+        # functions. Apply to all configurations, not just Release.
+        set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --extended-lambda --expt-relaxed-constexpr")
 
         # Debug/Profile build for detailed profiling
         set(CMAKE_CUDA_FLAGS_RELWITHDEBINFO "-O2 -g -G -lineinfo --use_fast_math")
@@ -202,11 +205,18 @@ endif()
 include(CheckIPOSupported)
 check_ipo_supported(RESULT IPO_SUPPORTED OUTPUT IPO_ERROR)
 
-if(IPO_SUPPORTED AND CMAKE_BUILD_TYPE STREQUAL "Release")
-    message(STATUS "LTO/IPO enabled for Release builds")
+if(IPO_SUPPORTED AND CMAKE_BUILD_TYPE STREQUAL "Release"
+   AND NOT COLLIDER_DISABLE_IPO)
+    message(STATUS "LTO/IPO enabled for Release builds (host C/C++ only)")
     set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
+    # CUDA device LTO (-dlto) pushes nvlink past its 1MB default stack on
+    # Windows for the collider_pro symbol graph.
+    set(CMAKE_CUDA_INTERPROCEDURAL_OPTIMIZATION FALSE)
+    message(STATUS "LTO/IPO disabled for CUDA device link (avoids nvlink stack overflow)")
 else()
-    if(NOT CMAKE_BUILD_TYPE STREQUAL "Release")
+    if(COLLIDER_DISABLE_IPO)
+        message(STATUS "LTO/IPO disabled by COLLIDER_DISABLE_IPO=ON")
+    elseif(NOT CMAKE_BUILD_TYPE STREQUAL "Release")
         message(STATUS "LTO/IPO disabled (not Release build)")
     else()
         message(WARNING "LTO/IPO not supported: ${IPO_ERROR}")
@@ -331,15 +341,99 @@ endif()
 # ============================================================================
 set(CORE_SOURCES
     src/core/rule_engine.cpp
+    src/core/cpu_kangaroo_backend.cpp
+    src/core/kangaroo_backend_factory.cpp
     src/generators/passphrase_generator.cpp
     src/generators/priority_queue.cpp
 )
+
+# Free-licensed Metal SHA-256 benchmark (Mac only). Available in BOTH
+# Free and Pro builds so `--benchmark` can validate the GPU on Metal.
+if(APPLE AND COLLIDER_USE_METAL
+   AND EXISTS "${CMAKE_SOURCE_DIR}/src/gpu/sha256_metal_bench.mm")
+    list(APPEND CORE_SOURCES src/gpu/sha256_metal_bench.mm)
+    set_source_files_properties(src/gpu/sha256_metal_bench.mm
+        PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+endif()
+
+# Metal Kangaroo solver (Phase 1 of Mac pool support, v1.4.0). Free-
+# licensed; available in BOTH Free and Pro Mac builds so pool mining
+# on Apple Silicon stops falling back to CPU kangaroo at ~200 K/s.
+if(APPLE AND COLLIDER_USE_METAL
+   AND EXISTS "${CMAKE_SOURCE_DIR}/src/gpu/kangaroo_metal.mm")
+    list(APPEND CORE_SOURCES src/gpu/kangaroo_metal.mm)
+    set_source_files_properties(src/gpu/kangaroo_metal.mm
+        PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+    # Metal IKangarooBackend adapter -- gated to the same conditions as
+    # the underlying KangarooMetalSolver above.
+    if(EXISTS "${CMAKE_SOURCE_DIR}/src/gpu/metal_kangaroo_backend.mm")
+        list(APPEND CORE_SOURCES src/gpu/metal_kangaroo_backend.mm)
+        set_source_files_properties(src/gpu/metal_kangaroo_backend.mm
+            PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+    endif()
+    # Bake the MSL source into a generated C++ header so neither the
+    # production dispatcher nor the test binaries need to search the
+    # filesystem for kangaroo.metal at runtime. The previous approach
+    # (configure_file COPYONLY + dual-loader candidate-path lists in
+    # kangaroo_metal.mm and tests/test_metal_secp256k1.mm) had three
+    # problems: the candidate lists drifted; running the binary from
+    # an unexpected cwd produced "shader not found"; and the staged
+    # build/ copy could go stale on parallel builds.
+    if(EXISTS "${CMAKE_SOURCE_DIR}/src/gpu/kangaroo.metal")
+        set(_kangaroo_metal_src "${CMAKE_SOURCE_DIR}/src/gpu/kangaroo.metal")
+        set(_kangaroo_metal_hdr "${CMAKE_BINARY_DIR}/generated/kangaroo_metal_source.h")
+        file(READ "${_kangaroo_metal_src}" KANGAROO_METAL_SOURCE_BODY)
+        # Hand the source to the compiler as a raw string literal so
+        # quotes / backslashes / newlines pass through untouched. The
+        # delimiter `KANGAROO_METAL` must not appear in the .metal text
+        # itself; trivially true today.
+        configure_file(
+            "${CMAKE_SOURCE_DIR}/cmake/kangaroo_metal_source.h.in"
+            "${_kangaroo_metal_hdr}"
+            @ONLY)
+        # Re-run the configure step whenever the .metal file changes so
+        # the generated header stays in sync. CMake doesn't track
+        # `file(READ)` inputs automatically.
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+                     "${_kangaroo_metal_src}")
+        # Expose the generated/ directory to anything that needs to
+        # `#include "kangaroo_metal_source.h"`. Production code lives in
+        # collider_core (added below); the test target adds the same
+        # directory directly in its own block.
+        set(KANGAROO_METAL_GENERATED_INCLUDE_DIR
+            "${CMAKE_BINARY_DIR}/generated"
+            CACHE INTERNAL "Generated kangaroo MSL header dir")
+    endif()
+endif()
 
 # Pro-only host-side sources for the brain wallet pipeline.
 # Excluded entirely from the free build (no #ifdef wrapping inside the .cpp;
 # the file simply is not handed to the compiler).
 if(COLLIDER_PRO)
     list(APPEND CORE_SOURCES src/gpu/brain_wallet_gpu.cpp)
+    # gpu_rules.cpp is fully #ifdef-guarded; on non-CUDA backends it
+    # provides stub implementations of GPURuleEngine that return false /
+    # 0 / "". Without it, main.cpp's references to GPURuleEngine fail to
+    # link on Metal/CPU backends. The CUDA-only .cu kernels remain in
+    # GPU_SOURCES under the COLLIDER_BACKEND==CUDA branch.
+    if(EXISTS "${CMAKE_SOURCE_DIR}/src/gpu/gpu_rules.cpp"
+       AND NOT COLLIDER_BACKEND STREQUAL "CUDA")
+        list(APPEND CORE_SOURCES src/gpu/gpu_rules.cpp)
+    endif()
+    # Brain Wallet v2 host orchestrator (Phase 9): pure C++, no CUDA TU.
+    if(EXISTS "${CMAKE_SOURCE_DIR}/src/gpu/v2/v2_orchestrator.cpp")
+        list(APPEND CORE_SOURCES src/gpu/v2/v2_orchestrator.cpp)
+    endif()
+    # Phase 11 (v1.4.0): Metal dispatch (Obj-C++). Built only on macOS;
+    # the file is otherwise ignored (its symbols are referenced from
+    # v2_orchestrator.cpp behind __APPLE__ + COLLIDER_USE_METAL gates).
+    if(APPLE AND COLLIDER_USE_METAL AND
+       EXISTS "${CMAKE_SOURCE_DIR}/src/gpu/v2/v2_metal_dispatch.mm")
+        list(APPEND CORE_SOURCES src/gpu/v2/v2_metal_dispatch.mm)
+        # Mark as Obj-C++ so CMake hands it to the right compiler.
+        set_source_files_properties(src/gpu/v2/v2_metal_dispatch.mm
+            PROPERTIES COMPILE_FLAGS "-fobjc-arc -fobjc-weak")
+    endif()
 endif()
 
 # Check if source files exist
@@ -356,6 +450,16 @@ if(CORE_SOURCES)
         Threads::Threads
     )
     target_include_directories(collider_core PUBLIC ${XXHASH_INCLUDE_DIR})
+    if(KANGAROO_METAL_GENERATED_INCLUDE_DIR)
+        target_include_directories(collider_core PUBLIC
+            ${KANGAROO_METAL_GENERATED_INCLUDE_DIR})
+    endif()
+    # Phase 11: link Metal + Foundation when v2_metal_dispatch.mm is in the build.
+    if(APPLE AND COLLIDER_USE_METAL AND COLLIDER_PRO)
+        target_link_libraries(collider_core
+            ${METAL_LIBRARY} ${FOUNDATION_LIBRARY}
+        )
+    endif()
 else()
     # Create empty library if no sources exist yet
     add_library(collider_core INTERFACE)
@@ -364,6 +468,53 @@ else()
         Threads::Threads
     )
     target_include_directories(collider_core INTERFACE ${XXHASH_INCLUDE_DIR})
+endif()
+
+# ============================================================================
+# JLP Protocol Codegen
+# ============================================================================
+# The C++ wire format header is generated from protocol/jlp.yaml by
+# tools/codegen/jlp_codegen.py. The generated header lives at
+# src/pool/jlp_wire_generated.hpp and is checked into the repo (so Free
+# builds, which lack the codegen tool, can still compile). Pro builds
+# regenerate it on every configure to catch IDL drift early.
+set(JLP_IDL "${CMAKE_SOURCE_DIR}/protocol/jlp.yaml")
+set(JLP_GEN_CPP "${CMAKE_SOURCE_DIR}/src/pool/jlp_wire_generated.hpp")
+set(JLP_GEN_PY  "${CMAKE_SOURCE_DIR}/data/protocol/jlp_protocol_generated.py")
+set(JLP_CODEGEN "${CMAKE_SOURCE_DIR}/tools/codegen/jlp_codegen.py")
+
+if(EXISTS "${JLP_IDL}" AND EXISTS "${JLP_CODEGEN}")
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        # Drift check at configure time: warn but don't fail (the
+        # generated artifacts are committed; CI re-runs --check).
+        execute_process(
+            COMMAND ${Python3_EXECUTABLE} ${JLP_CODEGEN} --check
+            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+            RESULT_VARIABLE JLP_CHECK_RC
+            OUTPUT_VARIABLE JLP_CHECK_OUT
+            ERROR_VARIABLE  JLP_CHECK_ERR
+        )
+        if(NOT JLP_CHECK_RC EQUAL 0)
+            message(WARNING
+                "JLP codegen drift: regenerate via "
+                "`python tools/codegen/jlp_codegen.py`. "
+                "stderr: ${JLP_CHECK_ERR}")
+        endif()
+
+        # Per-build regen rule (only fires when the IDL or codegen change).
+        add_custom_command(
+            OUTPUT ${JLP_GEN_CPP} ${JLP_GEN_PY}
+            COMMAND ${Python3_EXECUTABLE} ${JLP_CODEGEN}
+            DEPENDS ${JLP_IDL} ${JLP_CODEGEN}
+            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+            COMMENT "Regenerating JLP wire format from protocol/jlp.yaml"
+            VERBATIM
+        )
+        add_custom_target(jlp_codegen DEPENDS ${JLP_GEN_CPP} ${JLP_GEN_PY})
+    else()
+        message(STATUS "Python3 not found; skipping JLP codegen (using committed generated files)")
+    endif()
 endif()
 
 # ============================================================================
@@ -384,6 +535,9 @@ endforeach()
 
 if(EXISTING_POOL_SOURCES)
     add_library(collider_pool STATIC ${EXISTING_POOL_SOURCES})
+    if(TARGET jlp_codegen)
+        add_dependencies(collider_pool jlp_codegen)
+    endif()
     target_link_libraries(collider_pool
         Threads::Threads
     )
@@ -462,11 +616,32 @@ if(COLLIDER_BACKEND STREQUAL "CUDA")
             src/gpu/gpu_rules.cpp
             src/gpu/mega_fused_kernel.cu
         )
+
+        # Brain Wallet v2 unity TU (Phase 4..9, v1.4.0). All v2 kernels
+        # are consolidated into src/gpu/v2/v2_kernels_unity.cu so nvlink
+        # has a single device-symbol graph -- the alternative (one .cu
+        # per kernel) overflows nvlink's default 1MB stack on Windows
+        # given the cumulative collider_gpu symbol count.
+        if(EXISTS "${CMAKE_SOURCE_DIR}/src/gpu/v2/v2_kernels_unity.cu" AND
+           NOT COLLIDER_DISABLE_V2)
+            list(APPEND GPU_SOURCES src/gpu/v2/v2_kernels_unity.cu)
+        endif()
     endif()
+
+    # NOTE: src/gpu/v2/v2_orchestrator.cpp is compiled into collider_core,
+    # not collider_gpu, so main.cpp can call it without pulling in CUDA on
+    # Free builds. See the CORE_SOURCES list above.
 
     # Add RCKangaroo wrapper if enabled
     if(COLLIDER_USE_RCKANGAROO AND TARGET rckangaroo)
         list(APPEND GPU_SOURCES src/gpu/rckangaroo_wrapper.cu)
+        # CUDA IKangarooBackend adapter -- only compiled with RCKangaroo
+        # active. Lives in collider_gpu (rather than collider_core)
+        # because it #include's rckangaroo_wrapper.hpp; that keeps the
+        # core lib free of CUDA dependencies on Free builds.
+        if(EXISTS "${CMAKE_SOURCE_DIR}/src/gpu/cuda_rckangaroo_backend.cpp")
+            list(APPEND GPU_SOURCES src/gpu/cuda_rckangaroo_backend.cpp)
+        endif()
     endif()
 
     # Check if source files exist
@@ -505,6 +680,15 @@ elseif(COLLIDER_BACKEND STREQUAL "METAL")
         src/gpu/ripemd160.metal
         src/gpu/bloom_filter.metal
     )
+
+    # Phase 11 (v1.4.0): Brain Wallet v2 puzzle-only Metal shader.
+    # 1:1 port of the CUDA puzzle-mode kernel; loaded at runtime via the
+    # platform HAL. Only included on COLLIDER_PRO builds, mirroring the
+    # CUDA-side gating.
+    if(COLLIDER_PRO AND
+       EXISTS "${CMAKE_SOURCE_DIR}/src/gpu/v2/brain_wallet_v2.metal")
+        list(APPEND METAL_SHADERS src/gpu/v2/brain_wallet_v2.metal)
+    endif()
 
     # For now, create placeholder library
     # Metal compute kernels will be loaded at runtime
@@ -560,10 +744,21 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/src/main.cpp")
         add_executable(collider src/main.cpp)
     endif()
 
-    set(MAIN_LIBS collider_platform Threads::Threads)
+    # collider_core PUBLIC-links collider_platform (and the INTERFACE
+    # fallback does the same), so collider_platform flows through
+    # transitively when we list collider_core. Putting it ALSO in
+    # MAIN_LIBS made Apple ld emit
+    #    ld: warning: ignoring duplicate libraries: 'libcollider_platform.a'
+    # because the link line carried -lcollider_platform twice. Drop the
+    # explicit add; transitive resolution handles it.
+    set(MAIN_LIBS Threads::Threads)
 
     if(TARGET collider_core)
         list(APPEND MAIN_LIBS collider_core)
+    else()
+        # Edge case: no CORE_SOURCES -> no collider_core target was created.
+        # Pull in collider_platform directly so collider still links.
+        list(APPEND MAIN_LIBS collider_platform)
     endif()
 
     if(TARGET collider_gpu)
@@ -642,6 +837,63 @@ if(COLLIDER_BUILD_TESTS)
         add_test(NAME CLIParser COMMAND test_cli_parser)
     endif()
 
+    # KAT for range_bits_from_be in src/core/byte_codec.hpp. Pins the
+    # canonical Bitcoin-puzzle ranges (75/135/160) to expected
+    # range_bits values so a regression in the 256-bit subtraction +
+    # bit_length helper would fail loudly. Used by Phase 1.4
+    # CudaRCKangarooBackend::initialize() to size the kangaroo solver.
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_range_bits.cpp")
+        add_executable(test_range_bits tests/test_range_bits.cpp)
+        # Header-only target -- byte_codec.hpp is inline-only.
+        add_test(NAME RangeBitsKAT COMMAND test_range_bits)
+    endif()
+
+    # KAT for the rest of byte_codec.hpp: hex_encode_lower (~13 call
+    # sites collapsed onto this in v1.4.0 phase 7.1) plus
+    # be32_to_limbs_le / limbs_le_to_be32 roundtrip with the secp256k1
+    # generator x-coordinate as the canonical test vector. Pure host
+    # test, no GPU dependency.
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_byte_codec.cpp")
+        add_executable(test_byte_codec tests/test_byte_codec.cpp)
+        add_test(NAME ByteCodecKAT COMMAND test_byte_codec)
+    endif()
+
+    # KAT for src/core/puzzle_config.hpp puzzle table: derive hash160
+    # from each known solution_hex via cpu::compute_hash160 and verify
+    # it matches the recorded target_h160_hex. Catches the data-
+    # corruption class fixed in v1.4.0 phase 2.1 (mismatched addresses
+    # + fabricated private keys). Pure host, runs everywhere.
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_puzzle_table_kat.cpp")
+        add_executable(test_puzzle_table_kat tests/test_puzzle_table_kat.cpp)
+        add_test(NAME PuzzleTableKAT COMMAND test_puzzle_table_kat)
+    endif()
+
+    # Roundtrip KAT for KangarooWorkFile save/load (src/core/kangaroo.hpp).
+    # The phase 1.8 mismatched-checkpoint rejection in
+    # KangarooSolver::solve() depends on save/load being lossless;
+    # this test pins down that contract.
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_kangaroo_work_file.cpp")
+        add_executable(test_kangaroo_work_file tests/test_kangaroo_work_file.cpp)
+        add_test(NAME KangarooWorkFileKAT COMMAND test_kangaroo_work_file)
+    endif()
+
+    # Metal kangaroo throughput benchmark. Production-shaped config
+    # (1024 kangaroos x 1024 steps x 32 rounds) so dispatch overhead
+    # is amortized and the reported Mops/s reflects kernel throughput.
+    # Used as the baseline for Phase 5 Montgomery batch inversion
+    # before/after comparison. Mac-only.
+    if(APPLE AND COLLIDER_USE_METAL AND
+       EXISTS "${CMAKE_SOURCE_DIR}/tests/bench_metal_kangaroo.mm")
+        add_executable(bench_metal_kangaroo tests/bench_metal_kangaroo.mm)
+        set_target_properties(bench_metal_kangaroo PROPERTIES
+            COMPILE_FLAGS "-fobjc-arc")
+        target_link_libraries(bench_metal_kangaroo
+            collider_core
+            "-framework Foundation"
+            "-framework Metal")
+        # Not added as a ctest target (long-running, perf-only).
+    endif()
+
     # Hashcat rule engine known-answer test. Pins the engine to externally
     # documented rule semantics so a regression vs. hashcat behaviour fails
     # loudly. Header-only, runs everywhere (no GPU / network required).
@@ -649,6 +901,154 @@ if(COLLIDER_BUILD_TESTS)
         add_executable(test_rule_engine_kat tests/test_rule_engine_kat.cpp)
         target_link_libraries(test_rule_engine_kat collider_core)
         add_test(NAME RuleEngineKAT COMMAND test_rule_engine_kat)
+    endif()
+
+    # Brain Wallet v2 host-side correctness test (Phase 9, v1.4.0).
+    # The .cpp file has a CPU section that runs anywhere and a GPU section
+    # gated on COLLIDER_USE_CUDA. The kernel itself is wired into
+    # collider_gpu when COLLIDER_PRO is on. We always build the host
+    # half so puzzle-target mask math is regression-tested.
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/v2/test_brain_wallet_v2.cpp" AND COLLIDER_PRO)
+        add_executable(test_brain_wallet_v2 tests/v2/test_brain_wallet_v2.cpp)
+        target_link_libraries(test_brain_wallet_v2 collider_core)
+        if(TARGET collider_gpu)
+            target_link_libraries(test_brain_wallet_v2 collider_gpu)
+        endif()
+        target_include_directories(test_brain_wallet_v2 PRIVATE
+            ${CMAKE_SOURCE_DIR}
+        )
+        add_test(NAME BrainWalletV2 COMMAND test_brain_wallet_v2)
+        # Skip exit code 77 if no CUDA device available at runtime.
+        set_tests_properties(BrainWalletV2 PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+
+    # Metal secp256k1 known-answer test (Mac only). Validates the field
+    # arithmetic + point-add primitives in src/gpu/kangaroo.metal against
+    # sipa/secp256k1 published priv-to-pub vectors. Returns 77 if no
+    # Metal device is available so headless CI doesn't fail.
+    if(APPLE AND COLLIDER_USE_METAL
+       AND EXISTS "${CMAKE_SOURCE_DIR}/tests/test_metal_secp256k1.mm")
+        add_executable(test_metal_secp256k1 tests/test_metal_secp256k1.mm)
+        set_source_files_properties(tests/test_metal_secp256k1.mm
+            PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+        target_link_libraries(test_metal_secp256k1
+            ${METAL_LIBRARY} ${FOUNDATION_LIBRARY})
+        target_include_directories(test_metal_secp256k1
+            PRIVATE ${KANGAROO_METAL_GENERATED_INCLUDE_DIR})
+        add_test(NAME MetalSecp256k1KAT COMMAND test_metal_secp256k1)
+        set_tests_properties(MetalSecp256k1KAT PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+
+    # Metal Kangaroo smoke test: drives the kangaroo_step kernel through
+    # the host dispatcher, asserts DP detection fires. Pairs with the
+    # secp256k1 KAT to gate Mac Kangaroo shipping.
+    if(APPLE AND COLLIDER_USE_METAL
+       AND EXISTS "${CMAKE_SOURCE_DIR}/tests/test_metal_kangaroo_smoke.mm"
+       AND EXISTS "${CMAKE_SOURCE_DIR}/src/gpu/kangaroo_metal.mm")
+        add_executable(test_metal_kangaroo_smoke
+            tests/test_metal_kangaroo_smoke.mm)
+        set_source_files_properties(tests/test_metal_kangaroo_smoke.mm
+            PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+        # The Metal dispatcher already lives in collider_core (added to
+        # CORE_SOURCES on Mac builds). Link the test against the lib so
+        # we don't double-compile kangaroo_metal.mm and produce duplicate
+        # symbols at link time.
+        target_link_libraries(test_metal_kangaroo_smoke
+            collider_core
+            ${METAL_LIBRARY} ${FOUNDATION_LIBRARY})
+        target_include_directories(test_metal_kangaroo_smoke
+            PRIVATE ${CMAKE_SOURCE_DIR}/src)
+        add_test(NAME MetalKangarooSmoke COMMAND test_metal_kangaroo_smoke)
+        set_tests_properties(MetalKangarooSmoke PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+
+    # Brain Wallet v2 host-side orchestrator test (Phase 9 follow-up).
+    # Pure C++ test; we link collider_gpu too because v2_orchestrator.cpp
+    # (compiled into collider_core) references kernels from collider_gpu
+    # under #if COLLIDER_USE_CUDA -- the host code paths are dead in the
+    # dry-run test, but the linker still needs the symbols.
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/v2/test_v2_orchestrator.cpp" AND COLLIDER_PRO)
+        add_executable(test_v2_orchestrator tests/v2/test_v2_orchestrator.cpp)
+        target_link_libraries(test_v2_orchestrator collider_core)
+        if(TARGET collider_gpu)
+            target_link_libraries(test_v2_orchestrator collider_gpu)
+        endif()
+        target_include_directories(test_v2_orchestrator PRIVATE
+            ${CMAKE_SOURCE_DIR}
+        )
+        add_test(NAME V2Orchestrator COMMAND test_v2_orchestrator)
+    endif()
+
+    # Phase 4: address-derivation CPU reference KATs.
+    # Pure C++ -- header-only SHA-256 + RIPEMD-160 + hash160 reference,
+    # plus the five address-type derivations. Validated against published
+    # test vectors (BIP-49 / BIP-84 / BIP-86 / Bitcoin Core).
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/v2/test_address_derive_cpu.cpp" AND COLLIDER_PRO)
+        add_executable(test_address_derive_cpu tests/v2/test_address_derive_cpu.cpp)
+        target_include_directories(test_address_derive_cpu PRIVATE
+            ${CMAKE_SOURCE_DIR}
+        )
+        add_test(NAME AddressDeriveCPU COMMAND test_address_derive_cpu)
+    endif()
+
+    # Phase 5: weak-PRNG CPU reference KATs.
+    # MT19937, Park-Miller LCG, MSVC rand(), java.util.Random + the
+    # libbitcoin bx and Profanity vulnerable constructions. Validated
+    # against the official MT reference table, Java spec, and the known
+    # MSVC rand() trace.
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/v2/test_weak_prng_cpu.cpp" AND COLLIDER_PRO)
+        add_executable(test_weak_prng_cpu tests/v2/test_weak_prng_cpu.cpp)
+        target_include_directories(test_weak_prng_cpu PRIVATE
+            ${CMAKE_SOURCE_DIR}
+        )
+        add_test(NAME WeakPrngCPU COMMAND test_weak_prng_cpu)
+    endif()
+
+    # Phase 6: encoding-munger CPU reference KATs.
+    # UTF-8 / UTF-16-LE / UTF-16-BE / UTF-32-LE / Latin-1 /
+    # strip-non-ascii / upper-ascii / lower-ascii. Validated against
+    # Python's stdlib codecs.
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/v2/test_encoding_munge_cpu.cpp" AND COLLIDER_PRO)
+        add_executable(test_encoding_munge_cpu tests/v2/test_encoding_munge_cpu.cpp)
+        target_include_directories(test_encoding_munge_cpu PRIVATE
+            ${CMAKE_SOURCE_DIR}
+        )
+        add_test(NAME EncodingMungeCPU COMMAND test_encoding_munge_cpu)
+    endif()
+
+    # Phase 7/8: SHA-512 + HMAC + PBKDF2 reference KATs.
+    # Validated against NIST CAVS, RFC 4231 (HMAC), RFC 6070 (PBKDF2),
+    # and the BIP-39 reference vector for "abandon abandon ... about".
+    # These are the building blocks for the legacy KDF framework
+    # (Phase 7) and Electrum / BIP-39 mnemonic kernels (Phase 8).
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/v2/test_pbkdf2_cpu.cpp" AND COLLIDER_PRO)
+        add_executable(test_pbkdf2_cpu tests/v2/test_pbkdf2_cpu.cpp)
+        target_include_directories(test_pbkdf2_cpu PRIVATE
+            ${CMAKE_SOURCE_DIR}
+        )
+        add_test(NAME Pbkdf2CPU COMMAND test_pbkdf2_cpu)
+    endif()
+
+    # Phase 8: Electrum v1 + v2 mnemonic CPU reference KATs.
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/v2/test_electrum_cpu.cpp" AND COLLIDER_PRO)
+        add_executable(test_electrum_cpu tests/v2/test_electrum_cpu.cpp)
+        target_include_directories(test_electrum_cpu PRIVATE
+            ${CMAKE_SOURCE_DIR}
+        )
+        add_test(NAME ElectrumCPU COMMAND test_electrum_cpu)
+    endif()
+
+    # Phase 10: license cache lifecycle tests.
+    # Validates the HMAC-bound cache that gates Pro features after a
+    # successful remote validation. No filesystem / network -- the test
+    # surface (make_cache_payload / compute_cache_hmac / verify_cache_entry)
+    # is the algorithm under test.
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_license_cache.cpp"
+       AND TARGET collider_license)
+        add_executable(test_license_cache tests/test_license_cache.cpp)
+        target_link_libraries(test_license_cache collider_license)
+        add_test(NAME LicenseCache COMMAND test_license_cache)
+        set_tests_properties(LicenseCache PROPERTIES SKIP_RETURN_CODE 77)
     endif()
 
     # JLP pool TLS handshake live integration test. Connects to
@@ -680,6 +1080,17 @@ if(COLLIDER_BUILD_TESTS)
         add_executable(test_jlp_pool_manager tests/test_jlp_pool_manager.cpp)
         target_link_libraries(test_jlp_pool_manager collider_pool Threads::Threads)
         add_test(NAME JLPPoolManager COMMAND test_jlp_pool_manager)
+    endif()
+
+    # JLP wire generated-vs-legacy drift detector. Static_asserts only,
+    # plus three runtime byte-layout sanity checks. No threads, no sockets.
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_jlp_wire_generated.cpp" AND TARGET collider_pool)
+        add_executable(test_jlp_wire_generated tests/test_jlp_wire_generated.cpp)
+        target_link_libraries(test_jlp_wire_generated collider_pool)
+        if(TARGET jlp_codegen)
+            add_dependencies(test_jlp_wire_generated jlp_codegen)
+        endif()
+        add_test(NAME JLPWireGenerated COMMAND test_jlp_wire_generated)
     endif()
 
     # JLP pool wire-protocol tests against an in-process mock TCP server on
@@ -723,6 +1134,23 @@ if(COLLIDER_BUILD_TESTS)
             target_link_libraries(test_secp256k1_inv collider_gpu CUDA::cudart)
             add_test(NAME Secp256k1Inv COMMAND test_secp256k1_inv)
             set_tests_properties(Secp256k1Inv PROPERTIES SKIP_RETURN_CODE 77)
+        endif()
+
+        # Device HMAC-SHA512 KAT (RFC 4231 TC1/TC2/TC4/TC6). Pins the
+        # output of device::hmac_sha512 in src/gpu/v2/device_hashes.cuh
+        # against the published vectors -- catches regressions in the
+        # streaming-rewrite stack-reduction refactor.
+        if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_device_hmac_sha512.cu")
+            add_executable(test_device_hmac_sha512 tests/test_device_hmac_sha512.cu)
+            set_target_properties(test_device_hmac_sha512 PROPERTIES
+                CUDA_SEPARABLE_COMPILATION ON
+                CUDA_RUNTIME_LIBRARY Shared
+            )
+            target_include_directories(test_device_hmac_sha512
+                PRIVATE ${CMAKE_SOURCE_DIR}/src)
+            target_link_libraries(test_device_hmac_sha512 CUDA::cudart)
+            add_test(NAME DeviceHmacSha512KAT COMMAND test_device_hmac_sha512)
+            set_tests_properties(DeviceHmacSha512KAT PROPERTIES SKIP_RETURN_CODE 77)
         endif()
 
         if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_ec_table_consistency.cu")

@@ -24,6 +24,7 @@
 #include <cmath>
 #include <cstring>
 #include <array>
+#include "../core/byte_codec.hpp"
 #include <stdexcept>
 #include <algorithm>
 #include <chrono>
@@ -167,11 +168,8 @@ struct H160 {
     // Convert to hex string
     std::string to_hex() const {
         char hex[41];
-        for (size_t i = 0; i < 20; i++) {
-            std::snprintf(hex + i * 2, 3, "%02x", data[i]);
-        }
-        hex[40] = '\0';
-        return std::string(hex);
+        ::collider::hex_encode_lower(data, 20, hex);
+        return std::string(hex, 40);
     }
 };
 

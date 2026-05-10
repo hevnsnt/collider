@@ -112,6 +112,7 @@ constexpr uint8_t TYPE_AUTH_OK   = 0x02;
 constexpr uint8_t TYPE_AUTH_FAIL = 0x03;
 constexpr uint8_t TYPE_WORK_ASN  = 0x11;
 constexpr uint8_t TYPE_DP_BATCH  = 0x22;
+constexpr uint8_t TYPE_DP_BATCH_V2 = 0x24;  // v2 with work_id attestation
 constexpr uint8_t TYPE_STATS_RSP = 0x31;
 constexpr uint8_t TYPE_SOLUTION  = 0x40;
 constexpr uint8_t TYPE_PING      = 0x50;
@@ -1031,11 +1032,13 @@ bool test_dp_submission_wire_format() {
                      bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]);
         return fail("dp_wire_format", "DP frame magic != KANG");
     }
-    // The current sender always uses DP_BATCH (even for size 1).
-    if (bytes[4] != TYPE_DP_BATCH) {
-        std::fprintf(stderr, "[debug] dp_wire_format: type 0x%02x (want 0x%02x)\n",
-                     bytes[4], TYPE_DP_BATCH);
-        return fail("dp_wire_format", "DP frame type != DP_BATCH (0x22)");
+    // The current sender uses DP_BATCH_V2 (0x24) by default with work_id
+    // attestation. v1 (0x22) is still accepted by the server for older
+    // clients but the in-process client always emits v2.
+    if (bytes[4] != TYPE_DP_BATCH && bytes[4] != TYPE_DP_BATCH_V2) {
+        std::fprintf(stderr, "[debug] dp_wire_format: type 0x%02x (want 0x22 or 0x24)\n",
+                     bytes[4]);
+        return fail("dp_wire_format", "DP frame type != DP_BATCH or DP_BATCH_V2");
     }
 
     // Drain whatever payload was advertised so subsequent tests in the suite

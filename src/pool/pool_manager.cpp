@@ -1,10 +1,13 @@
 // pool_manager.cpp - Pool manager implementation
 
 #include "pool_manager.hpp"
+#include <chrono>
+#include <cstdio>
 #include <iostream>
+#include <random>
+#include <regex>
 #include <sstream>
 #include <iomanip>
-#include <regex>
 
 namespace collider {
 namespace pool {
@@ -25,6 +28,7 @@ PoolManager::PoolManager()
 }
 
 PoolManager::~PoolManager() {
+    stop_supervisor();
     disconnect();
 }
 
@@ -73,9 +77,16 @@ bool PoolManager::connect() {
     });
 
     client_->set_work_callback([this](const WorkAssignment& work) {
-        std::lock_guard<std::mutex> lock(work_mutex_);
-        current_work_ = work;
-        has_work_ = true;
+        {
+            std::lock_guard<std::mutex> lock(work_mutex_);
+            current_work_ = work;
+            has_work_ = true;
+        }
+        // Atomic snapshot of dp_bits so dp_callback_hook (kernel-callback
+        // hot path) doesn't have to take work_mutex_ to read it. Pool
+        // assignments don't change dp_bits mid-chunk; if a future
+        // protocol does, the snapshot lags by at most one DP submit.
+        current_dp_bits_.store(work.dp_bits, std::memory_order_release);
         std::cout << "[PoolManager] Received new work: " << work.puzzle_name
                   << " (DP bits: " << work.dp_bits << ")" << std::endl;
     });
@@ -97,15 +108,25 @@ bool PoolManager::connect() {
     submitted_count_ = 0;
 
     std::cout << "[PoolManager] Connected to pool as " << config_.worker_name << std::endl;
+
+    // Spawn the reconnect supervisor. The receiver loop in JLPPoolClient
+    // exits cleanly on transient network errors and waits for an
+    // "external supervisor" to call connect() / authenticate() -- this
+    // is that supervisor.
+    if (config_.auto_reconnect) {
+        start_supervisor();
+    }
     return true;
 }
 
 void PoolManager::disconnect() {
+    stop_supervisor();
     if (client_) {
         client_->disconnect();
         client_.reset();
     }
     connected_ = false;
+    current_dp_bits_.store(0, std::memory_order_release);
 }
 
 bool PoolManager::is_connected() const {
@@ -117,7 +138,7 @@ bool PoolManager::get_work(WorkAssignment& work) {
         return false;
     }
 
-    // Check if we already have work
+    // Fast path: cached work assignment from the work-callback.
     {
         std::lock_guard<std::mutex> lock(work_mutex_);
         if (has_work_) {
@@ -126,11 +147,19 @@ bool PoolManager::get_work(WorkAssignment& work) {
         }
     }
 
-    // Request work from pool
+    // Slow path: explicit request to the pool. The previous version held
+    // work_mutex_ across this blocking I/O call -- any concurrent
+    // submit_dp from the kernel-callback path was forced to wait for the
+    // entire request_work round-trip (multiple seconds at TLS handshake
+    // + receive timeout). Now we make the call WITHOUT the lock; only
+    // the (X, Y) state-update under the result is locked.
     if (client_->request_work(work)) {
-        std::lock_guard<std::mutex> lock(work_mutex_);
-        current_work_ = work;
-        has_work_ = true;
+        {
+            std::lock_guard<std::mutex> lock(work_mutex_);
+            current_work_ = work;
+            has_work_ = true;
+        }
+        current_dp_bits_.store(work.dp_bits, std::memory_order_release);
         return true;
     }
 
@@ -148,11 +177,33 @@ void PoolManager::submit_dp(const uint8_t* x, const uint8_t* d, uint8_t type, ui
 
 void PoolManager::submit_dp(const DistinguishedPoint& dp) {
     if (!is_connected()) {
+        // Queue is decoupled from connection state, but we should not
+        // accept DPs while disconnected -- the supervisor may take a
+        // while to come back, by which point the work_id might have
+        // rolled and these DPs are stale.
+        dropped_count_.fetch_add(1, std::memory_order_relaxed);
         return;
     }
 
-    client_->submit_dp(dp);
-    submitted_count_++;
+    if (client_->submit_dp(dp)) {
+        submitted_count_.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        // Queue full -- the JLP client's bounded MAX_DP_QUEUE_SIZE
+        // backpressure rejected this. Pre-1.4 we silently incremented
+        // submitted_count_, hiding the drop from operators. Now we
+        // count + emit a rate-limited stderr warning.
+        const uint64_t dropped =
+            dropped_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+        // Warn every Nth drop to avoid log spam during sustained backpressure.
+        constexpr uint64_t kWarnEvery = 1024;
+        if ((dropped & (kWarnEvery - 1)) == 0) {
+            std::fprintf(stderr,
+                "[pool] WARN DP submission queue full -- dropped %llu DP(s) "
+                "since startup. The pool sender thread is not draining fast "
+                "enough; check network latency or DP rate.\n",
+                static_cast<unsigned long long>(dropped));
+        }
+    }
 }
 
 PoolStats PoolManager::get_stats() const {
@@ -200,17 +251,170 @@ std::string PoolManager::get_status_string() const {
     return ss.str();
 }
 
-// Static callback hook for RCKangaroo integration
+// Static callback hook for RCKangaroo integration. Reads dp_bits from
+// the atomic snapshot rather than locking work_mutex_ -- the kernel
+// callback fires per-DP and contended locking would serialize an
+// otherwise-parallel hot path.
 void PoolManager::dp_callback_hook(void* user_data, const uint8_t* x, const uint8_t* d, uint8_t type) {
     PoolManager* manager = static_cast<PoolManager*>(user_data);
     if (manager && manager->is_connected()) {
-        // Get DP bits from current work
-        uint32_t dp_bits = 0;
-        {
-            std::lock_guard<std::mutex> lock(manager->work_mutex_);
-            dp_bits = manager->current_work_.dp_bits;
-        }
+        const uint32_t dp_bits =
+            manager->current_dp_bits_.load(std::memory_order_acquire);
         manager->submit_dp(x, d, type, dp_bits);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reconnect supervisor
+//
+// JLPPoolClient::receiver_loop() exits cleanly when its socket dies or
+// the server tears down the session. The header at jlp_pool_client.cpp:897
+// says "external supervisor must call connect() / authenticate() to
+// recover" -- and prior to v1.4.0 there was no such supervisor, so
+// transient failures silently killed the worker.
+//
+// This thread polls is_connected() and, when it sees the receiver has
+// exited, drives a full reconnect: disconnect() + connect() + authenticate()
+// with jittered exponential backoff. After kMaxReconnectAttempts
+// consecutive failures, supervisor_gave_up_ is set and the host loop
+// can react. The receiver thread inside the client is a fresh thread
+// per connect() because connect() calls replace_thread().
+// ---------------------------------------------------------------------------
+
+void PoolManager::start_supervisor() {
+    // Idempotent: only one supervisor at a time.
+    if (supervisor_thread_.joinable()) return;
+    supervisor_stop_.store(false, std::memory_order_release);
+    supervisor_gave_up_.store(false, std::memory_order_release);
+    supervisor_thread_ = std::thread([this]() { this->supervisor_loop(); });
+}
+
+void PoolManager::stop_supervisor() {
+    supervisor_stop_.store(true, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(supervisor_mutex_);
+        supervisor_cv_.notify_all();
+    }
+    if (supervisor_thread_.joinable()) {
+        supervisor_thread_.join();
+    }
+}
+
+void PoolManager::supervisor_loop() {
+    // Backoff state. Reset to kInitialBackoffMs on every successful
+    // reconnect; doubles up to kMaxBackoffMs on each consecutive
+    // failure. Jitter avoids thundering-herd against the pool when
+    // a fleet of workers reconnects together.
+    uint32_t backoff_ms = kInitialBackoffMs;
+    uint32_t consecutive_failures = 0;
+    std::random_device rd;
+    std::mt19937 rng(rd());
+
+    while (!supervisor_stop_.load(std::memory_order_acquire)) {
+        // Sleep on the condition variable so disconnect() / shutdown
+        // can wake us promptly. Wake either every 500ms (probe) or
+        // when the stop flag flips.
+        {
+            std::unique_lock<std::mutex> lock(supervisor_mutex_);
+            supervisor_cv_.wait_for(lock, std::chrono::milliseconds(500),
+                [this]() { return supervisor_stop_.load(std::memory_order_acquire); });
+        }
+        if (supervisor_stop_.load(std::memory_order_acquire)) break;
+
+        // Healthy: do nothing. is_connected() reads connected_ (the host
+        // sentinel) AND the client's own connection flag, so a receiver
+        // thread that exited will flip the second to false.
+        if (is_connected()) {
+            backoff_ms = kInitialBackoffMs;
+            consecutive_failures = 0;
+            continue;
+        }
+
+        // Receiver has exited. Drive a full reconnect.
+        if (consecutive_failures >= kMaxReconnectAttempts) {
+            std::cerr << "[PoolManager] Reconnect supervisor: "
+                      << kMaxReconnectAttempts
+                      << " consecutive attempts failed; giving up. "
+                      << "The pool client will remain disconnected; "
+                      << "host code can re-call connect() to retry."
+                      << std::endl;
+            supervisor_gave_up_.store(true, std::memory_order_release);
+            return;
+        }
+
+        // Jitter: pick uniform delay in [backoff/2, backoff].
+        std::uniform_int_distribution<uint32_t> jitter(backoff_ms / 2, backoff_ms);
+        const uint32_t delay = jitter(rng);
+        std::cerr << "[PoolManager] Reconnect attempt " << (consecutive_failures + 1)
+                  << "/" << kMaxReconnectAttempts
+                  << " in " << (delay / 1000.0) << "s..." << std::endl;
+        // Sleep with periodic wake-on-stop so shutdown is responsive.
+        for (uint32_t slept = 0; slept < delay && !supervisor_stop_.load(std::memory_order_acquire);
+             slept += 100)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        if (supervisor_stop_.load(std::memory_order_acquire)) break;
+
+        reconnect_attempts_.fetch_add(1, std::memory_order_relaxed);
+
+        // Tear down the old client (if still around) and construct a
+        // fresh one. Using the public connect() helper would race with
+        // ourselves; we follow its body inline.
+        if (client_) {
+            client_->disconnect();
+            client_.reset();
+        }
+        connected_.store(false);
+
+        // Recreate the JLP client (same path as PoolManager::connect).
+        if (config_.type != POOL_TYPE_JLP) {
+            std::cerr << "[PoolManager] Supervisor refusing to reconnect non-JLP "
+                      << "config; HTTP path is deleted." << std::endl;
+            supervisor_gave_up_.store(true);
+            return;
+        }
+        auto fresh = std::make_unique<JLPPoolClient>();
+        fresh->set_timeout(config_.timeout_ms);
+        fresh->set_reconnect(config_.auto_reconnect);
+        fresh->set_debug_mode(config_.debug_mode);
+        fresh->set_use_tls(config_.use_tls);
+        fresh->set_verify_cert(config_.verify_cert);
+        client_ = std::move(fresh);
+
+        client_->set_solution_callback([this](const uint8_t* key) {
+            std::cout << "\n[PoolManager] SOLUTION FOUND BY POOL!" << std::endl;
+            if (solution_callback_) {
+                solution_callback_(key, config_.worker_name);
+            }
+        });
+        client_->set_work_callback([this](const WorkAssignment& work) {
+            {
+                std::lock_guard<std::mutex> lock(work_mutex_);
+                current_work_ = work;
+                has_work_ = true;
+            }
+            current_dp_bits_.store(work.dp_bits, std::memory_order_release);
+        });
+
+        if (!client_->connect(config_.host, config_.port)) {
+            ++consecutive_failures;
+            backoff_ms = std::min(kMaxBackoffMs, backoff_ms * 2);
+            continue;
+        }
+        if (!client_->authenticate(config_.worker_name, config_.password)) {
+            client_->disconnect();
+            ++consecutive_failures;
+            backoff_ms = std::min(kMaxBackoffMs, backoff_ms * 2);
+            continue;
+        }
+
+        connected_.store(true);
+        reconnect_successes_.fetch_add(1, std::memory_order_relaxed);
+        backoff_ms = kInitialBackoffMs;
+        consecutive_failures = 0;
+        std::cout << "[PoolManager] Reconnected to pool as "
+                  << config_.worker_name << std::endl;
     }
 }
 

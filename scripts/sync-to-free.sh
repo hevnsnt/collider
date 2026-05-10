@@ -77,6 +77,15 @@ PRO_PATHS=(
     "tools/"
     "processed/"
 
+    # Protocol IDL: source of truth for JLP wire format. The generated
+    # C++ header at src/pool/jlp_wire_generated.hpp is the only artifact
+    # Free needs; the IDL + codegen tool stay private.
+    "protocol/"
+
+    # Test trees that touch private generators / kernels. Keep the
+    # protocol smoke tests though (added to PRESERVE_PATHS below).
+    "tests/protocol/"
+
     # Commercial website (collisionprotocol.com -- Stripe, NextAuth,
     # license issuance, Firebase functions). Not part of the CLI tool.
     "website/"
@@ -94,6 +103,14 @@ PRO_PATHS=(
     "*_hits.txt"
     "utxodump.csv"
     "funded_addresses.blf"
+
+    # Pro-side CI plumbing: these workflows orchestrate the pro->free
+    # sync itself and the JLP protocol push to collision-protocol.
+    # They have no place in the free repo (no source repo to pull from,
+    # no SYNC_DEPLOY_KEY secret), and leaving them on the free side
+    # would also re-trigger sync-free.yml on every tag pushed to free.
+    ".github/workflows/sync-free.yml"
+    ".github/workflows/sync-protocol.yml"
 )
 
 # -----------------------------------------------------------------------------

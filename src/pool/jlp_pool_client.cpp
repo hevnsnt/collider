@@ -19,6 +19,7 @@
 //   - C++23 [thread.thread.assign]/p2 (assigning to joinable thread terminates)
 
 #include "jlp_pool_client.hpp"
+#include "../core/byte_codec.hpp"
 #include <cstring>
 #include <iostream>
 #include <chrono>
@@ -911,6 +912,11 @@ void JLPPoolClient::sender_loop() {
     // in the field; freshly-built binaries always emit v2.
     std::vector<JLPDistinguishedPointV2> batch;
     batch.reserve(100);
+    // Hoisted out of the per-iteration body (Gemini PR review): payload
+    // is the staging buffer for DP_BATCH_V2 emission. Reusing it across
+    // iterations avoids re-allocating on every drain.
+    std::vector<uint8_t> payload;
+    payload.reserve(4 + 100 * sizeof(JLPDistinguishedPointV2));
 
     // Keepalive: the server's per-message read timeout is 30s. With
     // dp_bits=35, a single CPU worker may take many minutes to find a DP,
@@ -928,27 +934,43 @@ void JLPPoolClient::sender_loop() {
                           - STATS_INTERVAL_SECONDS;  // fire once on first iteration
 
     while (running_) {
-        // Snapshot the work_id once per drain iteration. current_work_ is
-        // protected by work_mutex_ and updated when WORK_ASN arrives; we
-        // copy the 64-bit field out so the sender doesn't have to hold
-        // work_mutex_ for the duration of the queue scan or network send.
+        // 1. Wait for queue activity (releases dp_mutex_ during the wait).
+        {
+            std::unique_lock<std::mutex> lock(dp_mutex_);
+            dp_cv_.wait_for(lock, std::chrono::milliseconds(100), [this] {
+                return !dp_queue_.empty() || !running_;
+            });
+        }
+
+        // 2. Snapshot the current work_id AFTER the wait (Gemini PR
+        //    review): a pre-wait snapshot becomes stale if WORK_ASN
+        //    arrives during the 100ms wait, leading to DPs being tagged
+        //    with the previous chunk's work_id and rejected by the
+        //    server. Lock order: PoolManager::dp_callback_hook acquires
+        //    (work_mutex_ then dp_mutex_); we mirror that order here to
+        //    avoid a deadlock cycle.
         uint64_t current_work_id = 0;
         {
             std::lock_guard<std::mutex> wlock(work_mutex_);
             current_work_id = current_work_.work_id;
         }
 
+        // 3. Drain the queue under dp_mutex_ alone.
         {
-            std::unique_lock<std::mutex> lock(dp_mutex_);
-            dp_cv_.wait_for(lock, std::chrono::milliseconds(100), [this] {
-                return !dp_queue_.empty() || !running_;
-            });
-
-            // Collect batch
+            std::lock_guard<std::mutex> lock(dp_mutex_);
             while (!dp_queue_.empty() && batch.size() < 100) {
                 const auto& dp = dp_queue_.front();
                 JLPDistinguishedPointV2 jlp_dp;
-                jlp_dp.work_id = current_work_id;
+                // Wire is little-endian little-end on x86/ARM-LE; convert
+                // explicitly so this remains correct on big-endian builds
+                // (Gemini PR review). Manual byte assembly avoids the
+                // missing-htole64 portability headache (Windows lacks it).
+                {
+                    uint8_t* p = reinterpret_cast<uint8_t*>(&jlp_dp.work_id);
+                    for (int i = 0; i < 8; ++i) {
+                        p[i] = static_cast<uint8_t>((current_work_id >> (8 * i)) & 0xFFu);
+                    }
+                }
                 memcpy(jlp_dp.x, dp.x, 32);
                 memcpy(jlp_dp.d, dp.d, 32);
                 jlp_dp.type = dp.type;
@@ -967,12 +989,13 @@ void JLPPoolClient::sender_loop() {
             // capped at 10000 server-side, so without it the first 4 bytes of
             // the first DP get interpreted as the count and the server tears
             // down the connection with "Batch count N exceeds max 10000".)
-            std::vector<uint8_t> payload;
-            payload.reserve(4 + batch.size() * sizeof(JLPDistinguishedPointV2));
+            payload.clear();
             uint32_t count = static_cast<uint32_t>(batch.size());
-            payload.insert(payload.end(),
-                           reinterpret_cast<uint8_t*>(&count),
-                           reinterpret_cast<uint8_t*>(&count) + sizeof(count));
+            // Explicit little-endian count (Gemini PR review).
+            payload.push_back(static_cast<uint8_t>( count        & 0xFFu));
+            payload.push_back(static_cast<uint8_t>((count >>  8) & 0xFFu));
+            payload.push_back(static_cast<uint8_t>((count >> 16) & 0xFFu));
+            payload.push_back(static_cast<uint8_t>((count >> 24) & 0xFFu));
             payload.insert(payload.end(),
                            reinterpret_cast<uint8_t*>(batch.data()),
                            reinterpret_cast<uint8_t*>(batch.data())
@@ -1064,13 +1087,9 @@ void JLPPoolClient::handle_server_message(const JLPHeader& header,
 
                 // Debug: show parsed public key (only when debug enabled)
                 if (debug_mode_) {
-                    std::cerr << "[DEBUG] Parsed pubkey: ";
-                    for (int i = 0; i < 33; i++) {
-                        char buf[4];
-                        snprintf(buf, sizeof(buf), "%02x", config->public_key[i]);
-                        std::cerr << buf;
-                    }
-                    std::cerr << std::endl;
+                    char pk_hex[67];
+                    ::collider::hex_encode_lower(config->public_key, 33, pk_hex);
+                    std::cerr << "[DEBUG] Parsed pubkey: " << pk_hex << std::endl;
                 }
 
                 // Copy work data and callback pointer INSIDE lock, then call OUTSIDE

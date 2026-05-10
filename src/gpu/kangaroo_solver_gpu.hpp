@@ -37,7 +37,7 @@ struct GPUKangarooResult {
 class GPUKangarooManager {
 public:
     // Configuration
-    int dp_bits = 20;
+    uint32_t dp_bits = 20;
     int num_kangaroos = 1 << 18;
     int steps_per_round = 256;
     bool debug_mode = false;
@@ -66,8 +66,17 @@ private:
  */
 class MultiGPUKangarooManager {
 public:
+    // dp_bits acceptance window for this in-house multi-GPU backend.
+    // Narrower than RCKangaroo's [14, 60] because the kernel's DP-buffer
+    // sizing assumes <= 28 bits to avoid stalling kangaroos on
+    // unreachable DP densities, and below 16 the host->device DP traffic
+    // saturates PCIe with non-distinguishing points. Validate against
+    // these in the standalone CLI.
+    static constexpr int kMinDpBits = 16;
+    static constexpr int kMaxDpBits = 28;
+
     // Configuration (applied to all GPUs)
-    int dp_bits = 20;
+    uint32_t dp_bits = 20;
     int num_kangaroos_per_gpu = 1 << 18;  // 262K per GPU
     int steps_per_round = 256;
     bool debug_mode = false;
@@ -100,7 +109,7 @@ private:
  */
 class GPUKangarooManager {
 public:
-    int dp_bits = 20;
+    uint32_t dp_bits = 20;
     int num_kangaroos = 1 << 18;
     int steps_per_round = 256;
     bool debug_mode = false;
@@ -119,7 +128,15 @@ public:
 
 class MultiGPUKangarooManager {
 public:
-    int dp_bits = 20;
+    // Mirror the dp_bits acceptance window from the CUDA-enabled
+    // declaration so callers (main.cpp standalone path) compile on
+    // non-CUDA builds even though init() will refuse. The stub returns
+    // false from init, so these constants are decorative on Mac, but
+    // their absence breaks the unconditional reference at the call site.
+    static constexpr int kMinDpBits = 16;
+    static constexpr int kMaxDpBits = 28;
+
+    uint32_t dp_bits = 20;
     int num_kangaroos_per_gpu = 1 << 18;
     int steps_per_round = 256;
     bool debug_mode = false;

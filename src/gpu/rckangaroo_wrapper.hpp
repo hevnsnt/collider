@@ -58,9 +58,21 @@ struct RCKangarooResult {
  */
 class RCKangarooManager {
 public:
+    // Per-backend dp_bits and range_bits acceptance windows. RCKangaroo's
+    // command-line parser rejects anything outside these ranges (see
+    // third_party/RCKangaroo/RCKangaroo.cpp:319 and :534), so we mirror
+    // them here and validate at standalone call sites before invoking
+    // the backend. Centralizing the constants keeps the standalone CLI,
+    // the pool backend (cuda_rckangaroo_backend.cpp), and any future
+    // tooling consistent.
+    static constexpr int kMinDpBits    = 14;
+    static constexpr int kMaxDpBits    = 60;
+    static constexpr int kMinRangeBits = 32;
+    static constexpr int kMaxRangeBits = 170;
+
     // Configuration
-    int dp_bits = 20;           // Distinguished point bits (14-60)
-    int range_bits = 135;       // Search range in bits (32-170)
+    uint32_t dp_bits = 20;      // Distinguished point bits (kMinDpBits..kMaxDpBits)
+    int range_bits = 135;       // Search range in bits (kMinRangeBits..kMaxRangeBits)
     bool benchmark_mode = false;
     std::atomic<bool> stop_flag{false};
 

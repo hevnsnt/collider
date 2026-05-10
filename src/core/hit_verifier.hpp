@@ -14,6 +14,7 @@
 #pragma once
 
 #include "types.hpp"
+#include "byte_codec.hpp"
 #include "../tools/utxo_bloom_builder.hpp"
 #include <string>
 #include <vector>
@@ -551,11 +552,9 @@ public:
                       << "Passphrase: " << hit.passphrase << "\n"
                       << "Private Key: ";
 
-            for (int i = 0; i < 32; i++) {
-                char hex[3];
-                std::snprintf(hex, sizeof(hex), "%02x", hit.private_key[i]);
-                hits_log_ << hex;
-            }
+            char pk_hex[65];
+            ::collider::hex_encode_lower(hit.private_key, 32, pk_hex);
+            hits_log_ << pk_hex;
 
             hits_log_ << "\n"
                       << "Balance: " << hit.satoshis << " satoshis ("
