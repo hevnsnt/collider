@@ -16,6 +16,8 @@
 #include "types.hpp"
 #include "byte_codec.hpp"
 #include "../tools/utxo_bloom_builder.hpp"
+#include <cstring>   // std::memcpy used below; MSVC pulls it transitively
+                     // via <string>, strict GCC/Clang do not.
 #include <string>
 #include <vector>
 #include <unordered_set>

@@ -11,6 +11,10 @@
 #pragma once
 
 #include <cstdint>
+#include <cstring>   // std::memset / std::memcpy used by Base58 helpers below;
+                     // MSVC pulls these transitively, GCC/Clang do not, so
+                     // omitting this include is a Linux-only build break
+                     // (caught by CI Build on the public Free repo).
 #include <string>
 #include <vector>
 #include <unordered_map>
