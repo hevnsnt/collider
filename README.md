@@ -107,7 +107,7 @@ What theCollider adds on top:
 | Automatic puzzle selection (ROI ranking)                       | No                       | Yes                                                         |
 | Graceful kangaroo to brute-force fallback on no-pubkey puzzles | No                       | Yes (v1.4.1)                                                |
 | Live BTC balance on the solved banner (mempool.space)          | No                       | Yes (v1.4.1)                                                |
-| Brain-wallet passphrase pipeline                               | No                       | Yes, Pro edition                                            |
+| Brain-wallet + funded-address scanner (100M+ addresses)        | No                       | Yes, Pro edition                                            |
 | Hashcat-style rule engine + bloom-filter lookup                | No                       | Yes, Pro edition                                            |
 | License                                                        | GPLv3                    | MIT (Free), commercial (Pro)                                |
 
@@ -150,23 +150,57 @@ The reference server is the [Collision Protocol](https://github.com/hevnsnt/coll
 
 theCollider ships in two editions from one source tree.
 
-| Capability                                           | Free (MIT) | Pro (commercial) |
-| ---------------------------------------------------- | ---------- | ---------------- |
-| Pollard's Kangaroo (CUDA, Metal)                     | Yes        | Yes              |
-| Brute-force puzzle search (CUDA, Metal)              | Yes        | Yes              |
-| Pool client (JLP, TLS)                               | Yes        | Yes              |
-| Bundled puzzle history (all 82 solved)               | Yes        | Yes              |
-| Multi-GPU support with calibration                   | Yes        | Yes              |
-| Save / resume checkpoints                            | Yes        | Yes              |
-| GPU benchmark                                        | Yes        | Yes              |
-| Brain-wallet passphrase pipeline                     |            | Yes              |
-| Hashcat-style rule engine (GPU)                      |            | Yes              |
-| Funded-address bloom filter (100+ million addresses) |            | Yes              |
-| PCFG + Markov passphrase generators                  |            | Yes              |
-| v2 puzzle-mode multi-scheme kernel                   |            | Yes              |
-| License gating (Ed25519, offline-verifiable)         |            | Yes              |
+| Capability                                                              | Free (MIT) | Pro (commercial) |
+| ----------------------------------------------------------------------- | ---------- | ---------------- |
+| Pollard's Kangaroo (CUDA, Metal)                                        | Yes        | Yes              |
+| Brute-force puzzle search (CUDA, Metal)                                 | Yes        | Yes              |
+| Pool client (JLP, TLS)                                                  | Yes        | Yes              |
+| Bundled puzzle history (all 82 solved)                                  | Yes        | Yes              |
+| Multi-GPU support with calibration                                      | Yes        | Yes              |
+| Save / resume checkpoints                                               | Yes        | Yes              |
+| GPU benchmark                                                           | Yes        | Yes              |
+| Brain-wallet passphrase pipeline + 100M+ funded-address bloom filter    |            | Yes              |
+| Hashcat-style rule engine on GPU (mutate any wordlist into billions)    |            | Yes              |
+| PCFG + Markov passphrase generators (high-probability candidates first) |            | Yes              |
+| v2 multi-scheme kernel: weak-PRNG sweeps (Milk Sad, Profanity, etc.)    |            | Yes              |
+| License gating (Ed25519, offline-verifiable)                            |            | Yes              |
 
-Pro licenses are available at [collisionprotocol.com/pro](https://collisionprotocol.com/pro). The Pro source tree is not public; the Free build is the same source minus the Pro modules, generated automatically by Github and published at [github.com/hevnsnt/collider](https://github.com/hevnsnt/collider).
+Pro licenses are available at [collisionprotocol.com/pro](https://collisionprotocol.com/pro). The Pro source tree is not public; the Free build is the same source minus the Pro modules, generated automatically by GitHub and published at [github.com/hevnsnt/collider](https://github.com/hevnsnt/collider).
+
+---
+
+## Why Pro: two lottery tickets, one install
+
+Free gets you onto puzzle 135. Pro points the same GPU at a second class of targets entirely. You already paid for the hardware. You already pay the power bill. Pro just gives you more things to find with it.
+
+### Brain wallets: your GPU is already a key factory
+
+Bitcoin's earliest users protected coins with a passphrase that hashes directly to a private key. `SHA256("correct horse battery staple")` is a private key. No wallet file, no mnemonic, just words. Tens of thousands of these wallets were created between 2011 and 2014, and **many of them still hold real Bitcoin today**.
+
+Your GPU is already computing tens of millions of keys per second when you run puzzle mode. The Pro brain-wallet pipeline points the same hardware at a different target set:
+
+- **Generators**: PCFG and Markov chains produce high-probability passphrases first (the cracks that hit in seconds), then descend the curve. Hashcat-style rule engines mutate any wordlist (`rockyou.txt`, custom lists) into billions of candidates via case, leetspeak, append, prepend, and 200+ standard rules.
+- **Bloom filter**: 100M+ funded Bitcoin addresses, queried on-GPU inside the same kernel that hashed the passphrase. A "maybe-present" hit triggers a definitive CPU-side check.
+- **Throughput**: on an RTX 4090, the fused pipeline (SHA-256 then secp256k1 then RIPEMD-160 then bloom) runs at hundreds of millions of candidates per second. On the same machine that's mining puzzle 135 today.
+
+If puzzle 135 is the moonshot, brain wallets are the side hustle on the same electricity bill. Mine puzzle 135 by day, sweep brain wallets overnight, same install.
+
+### Weak-PRNG sweeps (v2 multi-scheme kernel)
+
+Every few years a popular wallet ships with a broken random number generator and quietly drains user funds for months before anyone notices. Pro's v2 kernel scans for keys generated by those generators, dispatched in a single GPU pass per candidate seed:
+
+- **Milk Sad** (CVE-2023-39910): libbitcoin's 32-bit entropy bug, 2014 to 2017.
+- **Profanity / 1inch** (CVE-2022-40769): predictable seed in a popular vanity tool.
+- **Trust Wallet** weak-entropy derivations (2018 to 2022).
+- **glibc, MSVC, Java** weak PRNG seed ranges.
+
+Five address types (P2PKH, P2SH, P2WPKH, P2WSH, P2TR), eight scheme variants, every candidate seed checked against the same 100M+ funded-address bloom filter as the brain-wallet path.
+
+### Same binary, same UI, license-gated
+
+Pro is the same install you already run. Features unlock when a valid Ed25519-signed license key is present (offline-verifiable; the public key and license slot are embedded in the binary). The interactive UI gains brain-wallet and weak-PRNG modes; everything else behaves identically.
+
+Pro licenses are at [collisionprotocol.com/pro](https://collisionprotocol.com/pro).
 
 ---
 
