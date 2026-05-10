@@ -1,8 +1,22 @@
 # theCollider Architecture
 
-A high-level map of the codebase. The goal of this document is to let a new contributor (or a third-party reader) understand where things live and why, without having to grep the tree.
+A high-level map of the codebase: layered view, CMake targets, source tree, backend selection, free/Pro split, pool-client lifecycle, testing layout, and dependencies. Intended for new contributors and third-party readers who want the lay of the land without grepping the tree.
 
 This document describes the **free** edition. **(PRO VERSION ONLY)** modules (brain-wallet pipeline, license verification, scrapers, the v2 puzzle-mode kernel) live in this private dev tree but are excluded from the public Free repo by `scripts/sync-to-free.sh`. They are referenced here only at a high level.
+
+---
+
+## Table of contents
+
+- [Layered view](#layered-view)
+- [CMake library targets](#cmake-library-targets)
+- [Source tree, top-down](#source-tree-top-down)
+- [Backend selection](#backend-selection)
+- [Free / Pro split](#free--pro-split)
+- [Pool client lifecycle](#pool-client-lifecycle)
+- [Testing layout](#testing-layout)
+- [Dependency summary](#dependency-summary)
+- [Where to go next](#where-to-go-next)
 
 ---
 
@@ -266,10 +280,24 @@ C++ standard: C++20. CUDA standard: CUDA C++ 20.
 
 ---
 
-## Where to start reading
+## Contributor walks
 
 If you are debugging a feature, walk down from the entry point: `src/main.cpp` -> `src/runtime/<mode>_solver.cpp` -> the GPU dispatcher -> the kernel. Most code paths terminate in one or two kernels.
 
 If you are adding a CLI flag: edit `src/cli/cli_parser.cpp`, add a matching `CLIFlags` bit in `src/core/yaml_config.hpp`, propagate it in `apply_config_to_args()`, then update [README.md](../README.md) and [CONFIGURATION.md](CONFIGURATION.md). The flag must appear in `print_usage()` in `cli_parser.cpp` (gated by `COLLIDER_PRO` if Pro-only).
 
 If you are touching the wire protocol: edit `protocol/jlp.yaml`, regenerate via `tools/codegen/jlp_codegen.py`, update both the C++ and Python sides in lockstep, and update [JLP-PROTOCOL.md](JLP-PROTOCOL.md). Wire changes also require a corresponding update in the `collision-protocol` repo (the Python pool server) plus a passing protocol-drift round-trip test.
+
+---
+
+## Where to go next
+
+| For                                                     | See                                                        |
+| ------------------------------------------------------- | ---------------------------------------------------------- |
+| User-facing CLI surface and quick start                 | [README.md](../README.md)                                  |
+| Building from source on each platform                   | [INSTALL.md](INSTALL.md), [BUILD-MACOS.md](BUILD-MACOS.md) |
+| `config.yml` schema and precedence                      | [CONFIGURATION.md](CONFIGURATION.md)                       |
+| Wire format (third-party clients, alternative servers)  | [JLP-PROTOCOL.md](JLP-PROTOCOL.md)                         |
+| Pool operator concerns (etiquette, accrual, anti-cheat) | [POOL.md](POOL.md)                                         |
+| GPU crypto correctness tests and how to extend them     | [CRYPTO-VALIDATION.md](CRYPTO-VALIDATION.md)               |
+| Release history                                         | [CHANGELOG.md](CHANGELOG.md)                               |

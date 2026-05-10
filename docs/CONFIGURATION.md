@@ -213,4 +213,13 @@ theCollider validates configuration on startup. Common errors:
 
 ---
 
-For runtime usage examples and the full CLI surface, see the [README](../README.md). For the JLP wire format used in pool mode, see [JLP-PROTOCOL.md](JLP-PROTOCOL.md).
+## Where to go next
+
+| For                                             | See                                |
+| ----------------------------------------------- | ---------------------------------- |
+| Runtime usage examples and the full CLI surface | [README.md](../README.md)          |
+| Building from source on each platform           | [INSTALL.md](INSTALL.md)           |
+| Pool client setup, accrual, etiquette           | [POOL.md](POOL.md)                 |
+| JLP wire format (third-party clients)           | [JLP-PROTOCOL.md](JLP-PROTOCOL.md) |
+| Source-tree map for contributors                | [ARCHITECTURE.md](ARCHITECTURE.md) |
+| Release history                                 | [CHANGELOG.md](CHANGELOG.md)       |

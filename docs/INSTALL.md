@@ -371,8 +371,13 @@ If a build issue is not covered here, open an issue at <https://github.com/hevns
 
 ---
 
-## Next Steps
+## Where to go next
 
-- Read the [README](../README.md) for the CLI surface and quick-start examples.
-- Read [CONFIGURATION.md](CONFIGURATION.md) for the full `config.yml` schema.
-- For pool mining, see the README's "Pool mode usage" section and [JLP-PROTOCOL.md](JLP-PROTOCOL.md) for the wire format.
+| For                                     | See                                  |
+| --------------------------------------- | ------------------------------------ |
+| CLI surface and quick-start examples    | [README.md](../README.md)            |
+| `config.yml` schema and precedence      | [CONFIGURATION.md](CONFIGURATION.md) |
+| Pool client setup, accrual, etiquette   | [POOL.md](POOL.md)                   |
+| Wire format (third-party clients)       | [JLP-PROTOCOL.md](JLP-PROTOCOL.md)   |
+| macOS Metal specifics, embedded shaders | [BUILD-MACOS.md](BUILD-MACOS.md)     |
+| Release history                         | [CHANGELOG.md](CHANGELOG.md)         |
