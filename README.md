@@ -93,7 +93,7 @@ theCollider is not the first GPU solver for this problem. Several open-source pr
 
 ### RCKangaroo (RetiredCoder)
 
-[RCKangaroo](https://github.com/RetiredCoder/RCKangaroo) is the current state-of-the-art kangaroo implementation. It introduced the SOTA method with K=1.15 (versus K=2.1 for classic three-way kangaroo, ~1.8x fewer operations and ~1.8x less DP storage), and it benchmarks at roughly 8 GKeys/s on an RTX 4090. **theCollider uses RCKangaroo as its CUDA kangaroo backend.** Credit where it belongs: the kernel doing the heavy lifting on Windows and Linux is RetiredCoder's, redistributed here under its GPLv3 license in `third_party/RCKangaroo/`.
+[RCKangaroo](https://github.com/RetiredCoder/RCKangaroo) is a state-of-the-art kangaroo implementation. It introduced the SOTA method with K=1.15 (versus K=2.1 for classic three-way kangaroo, ~1.8x fewer operations and ~1.8x less DP storage), and it benchmarks at roughly 8 GKeys/s on an RTX 4090. **theCollider uses RCKangaroo as its CUDA kangaroo backend.** Credit where it belongs: the kernel doing the heavy lifting on Windows and Linux is RetiredCoder's, redistributed here under its GPLv3 license in `third_party/RCKangaroo/`.
 
 What theCollider adds on top:
 
@@ -111,7 +111,7 @@ What theCollider adds on top:
 | Hashcat-style rule engine + bloom-filter lookup                | No                       | Yes, Pro edition                                            |
 | License                                                        | GPLv3                    | MIT (Free), commercial (Pro)                                |
 
-RCKangaroo wins on raw CUDA kangaroo benchmark tuning. theCollider wins on platform coverage, distributed-solving infrastructure, and operator ergonomics. The two are complementary, not competitive; theCollider is "RCKangaroo plus everything around it that you would otherwise have to build yourself".
+On raw CUDA kangaroo throughput the two are identical, because theCollider links RCKangaroo's kernel directly (see `third_party/RCKangaroo/` and `src/gpu/rckangaroo_wrapper.cu`). RCKangaroo gives you the solver kernel; theCollider gives you the solver kernel plus Apple Silicon support (Metal kangaroo, our own implementation), a pool client and JLP protocol, multi-GPU orchestration, brute-force kernels for the smaller puzzles, and the operator tooling around all of it. The two are complementary, not competitive: theCollider is "RCKangaroo plus everything around it that you would otherwise have to build yourself."
 
 ### Other solvers in the space
 
@@ -128,8 +128,7 @@ theCollider treats kangaroo, brute force, and the brain-wallet path (Pro) as one
 For puzzles above #135, no single machine has the compute budget to finish in a reasonable time. The pool solves this by sharding the search range across many workers and letting them share distinguished points (DPs). When a collision is detected on the server, the private key falls out of the math.
 
 ```bash
-./collider --pool jlps://collisionprotocol.com:17403 \
-           --worker 1YourBitcoinAddressForRewards
+./collider --pool jlps://collisionprotocol.com:17403 --worker 1YourBitcoinAddressForRewards
 ```
 
 What happens after AUTH:
