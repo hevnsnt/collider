@@ -16,7 +16,7 @@ This document covers the **free** edition. **(PRO VERSION ONLY)** builds are iss
 - [Verifying the Build](#verifying-the-build)
 - [Troubleshooting](#troubleshooting)
 
----
+--- 
 
 ## Prerequisites
 
