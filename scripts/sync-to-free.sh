@@ -172,10 +172,19 @@ PRO_PATHS=(
     # Pro-side CI plumbing: these workflows orchestrate the pro->free
     # sync itself and the JLP protocol push to collision-protocol.
     # They have no place in the free repo (no source repo to pull from,
-    # no SYNC_DEPLOY_KEY secret), and leaving them on the free side
-    # would also re-trigger sync-free.yml on every tag pushed to free.
+    # no COLLIDER_SYNC_DEPLOY_KEY secret), and leaving them on the free
+    # side would also re-trigger sync-free.yml on every tag pushed to free.
     ".github/workflows/sync-free.yml"
     ".github/workflows/sync-protocol.yml"
+
+    # Pro's build-release.yml builds Pro binaries (COLLIDER_EDITION_PRO=ON).
+    # The free repo needs its own variant. It lives in scripts/templates/ and
+    # is installed by the sync script below as .github/workflows/build-release.yml.
+    # Exclude the pro version so it never lands in the free tree.
+    ".github/workflows/build-release.yml"
+
+    # Template directory: internal to the sync toolchain; never published.
+    "scripts/templates/"
 )
 
 # -----------------------------------------------------------------------------
@@ -185,7 +194,6 @@ PRESERVE_PATHS=(
     "LICENSE"
     "build_macos.sh"
     "src/core/edition.hpp"
-    ".github/workflows/build-release.yml"
 
     # v1.4.1: README.md is now sync'd from this repo. Pre-1.4.1 it was
     # in PRESERVE_PATHS because the private README pitched Pro features
@@ -414,8 +422,10 @@ done
 echo "[sync] removed $orphan_removed orphan path(s) of ${#ORPHAN_PATHS[@]} listed"
 
 # -----------------------------------------------------------------------------
-# Defense-in-depth: prove no Pro source file slipped through. If any
-# survive, abort BEFORE pushing.
+# Defense-in-depth: prove no Pro source file slipped through the copy.
+# Run this BEFORE template installation so the check only covers files
+# that came from the copy step; the template writes build-release.yml
+# intentionally afterward.
 # -----------------------------------------------------------------------------
 LEAKED=()
 for p in "${PRO_PATHS[@]}"; do
@@ -431,6 +441,22 @@ if (( ${#LEAKED[@]} > 0 )); then
     exit 1
 fi
 echo "[sync] verified: 0 Pro paths in staged free tree"
+
+# -----------------------------------------------------------------------------
+# Install the free-repo CI workflow from the pro-side template.
+# scripts/templates/free-build-release.yml is the canonical source of
+# truth for the free build pipeline. It is listed in PRO_PATHS so the
+# pro's build-release.yml never lands in free; the template is installed
+# here under the correct name after the Pro-leak check completes.
+# -----------------------------------------------------------------------------
+FREE_WORKFLOW_TEMPLATE="$PRIVATE_DIR/scripts/templates/free-build-release.yml"
+if [[ -f "$FREE_WORKFLOW_TEMPLATE" ]]; then
+    mkdir -p ".github/workflows"
+    cp "$FREE_WORKFLOW_TEMPLATE" ".github/workflows/build-release.yml"
+    echo "[sync] installed free CI workflow from template"
+else
+    echo "[sync] WARNING: free-build-release.yml template not found at $FREE_WORKFLOW_TEMPLATE" >&2
+fi
 
 # -----------------------------------------------------------------------------
 # Stage everything, commit, tag, push.
