@@ -96,6 +96,36 @@ public:
     void set_target_pubkey(const cpu::uint256_t& x, const cpu::uint256_t& y);
     GPUKangarooResult solve();
 
+    // Tier C (v1.4.2 builder-kangaroo): herd state serialization.
+    // save_herd_state writes the current per-kangaroo (px, py, dist, type,
+    // wild_offset) tuples for every GPU into a single host-side file.
+    // load_herd_state restores them, validating that the file's header
+    // matches the current solver configuration (num_kangaroos_per_gpu,
+    // num_gpus, dp_bits, range hash). Both functions are usable only
+    // after init() has succeeded but before/between solve() invocations.
+    // Returns false on any I/O failure or configuration mismatch.
+    // Intended use: the runner-side checkpoint loop persists state every
+    // N seconds so a crashed / SIGINT'd solver can resume without losing
+    // its accumulated DP traversal. The runner wires this; the backend
+    // only exposes the read/write primitives.
+    // File format:
+    //   - 16-byte magic "COLLIDER_KANG\x01\x00\x00" (NUL-padded to 16 bytes)
+    //   - 4-byte uint32 version (= 1)
+    //   - 4-byte uint32 num_gpus
+    //   - 4-byte uint32 num_kangaroos_per_gpu
+    //   - 4-byte uint32 dp_bits
+    //   - 32-byte SHA256 of [range_start_be || range_end_be]
+    //   - Per-GPU per-kangaroo records (little-endian):
+    //       32 bytes px (4 x uint64 LE)
+    //       32 bytes py
+    //       32 bytes dist
+    //       32 bytes wild_offset
+    //       4 bytes type (uint32)
+    //       4 bytes padding
+    //     -> 136 bytes per kangaroo.
+    bool save_herd_state(const std::string& path);
+    bool load_herd_state(const std::string& path);
+
 private:
     struct Impl;
     Impl* impl_;
@@ -106,7 +136,7 @@ private:
 /**
  * GPU Kangaroo Solver (Metal, macOS).
  *
- * v1.4.1: Standalone puzzle solving on Mac now uses the Metal Jacobian
+ * Standalone puzzle solving on Mac now uses the Metal Jacobian
  * kangaroo (D.1 rewrite) via MultiGPUKangarooManager. Pre-1.4.1 the
  * Metal-only build hit the no-CUDA stub which returned false from
  * init() and silently fell back to CPU kangaroo -- meaning Mac
@@ -152,11 +182,18 @@ public:
     static constexpr int kMaxDpBits = 28;
 
     uint32_t dp_bits = 20;
-    // 1024 matches kangaroo_metal.hpp::kDefaultKangaroos (tuned for
-    // M1/M2/M3 occupancy; the threadgroup batch-inversion trick
-    // requires a multiple of 32, and 1024 = 32 * 32 is the sweet
-    // spot for L1 / threadgroup memory pressure).
-    int num_kangaroos_per_gpu = 1024;
+    // 0 = auto-tune at init() time from the Metal device name. The
+    // threadgroup batch-inversion contract requires this to be a
+    // multiple of 32; the auto-tuner picks 1024 / 2048 / 4096 / 8192
+    // depending on whether the chip is base / Pro / Max / Ultra
+    // (counts that empirically saturate the corresponding GPU core
+    // ranges of 8-10 / 14-20 / 24-40 / 48-76). Callers who want a
+    // specific value can still set this field directly before init().
+    // The 1024 baseline was tuned on M1 (8 GPU cores) and starved the
+    // wider GPUs on M2 Pro / M3 Pro / M4 Pro and up; that miss-tuning
+    // surfaced as DoctorNigel's 24 MKeys/s M4 mac mini measurement
+    // in issue #4 (https://github.com/hevnsnt/collider/issues/4).
+    int num_kangaroos_per_gpu = 0;
     int steps_per_round = 1024;
     bool debug_mode = false;
     std::atomic<bool> stop_flag{false};
@@ -171,6 +208,13 @@ public:
     void set_target_h160(const std::array<uint8_t, 20>& h160);
     void set_target_pubkey(const cpu::uint256_t& x, const cpu::uint256_t& y);
     GPUKangarooResult solve();
+
+    // Tier C (v1.4.2 builder-kangaroo): herd state serialization stubs.
+    // Metal backend will track CUDA's API surface once Tier C is wired
+    // to the Mac runner; until then these return false so the runner
+    // checkpoint loop falls back to "no checkpoint persistence on Mac".
+    bool save_herd_state(const std::string& /*path*/) { return false; }
+    bool load_herd_state(const std::string& /*path*/) { return false; }
 
 private:
     struct Impl;
@@ -223,6 +267,10 @@ public:
     void set_target_h160(const std::array<uint8_t, 20>& /*h160*/) {}
     void set_target_pubkey(const cpu::uint256_t& /*x*/, const cpu::uint256_t& /*y*/) {}
     GPUKangarooResult solve() { return GPUKangarooResult{false, {}, 0, 0, 0}; }
+
+    // no-op stubs for the no-GPU build.
+    bool save_herd_state(const std::string& /*path*/) { return false; }
+    bool load_herd_state(const std::string& /*path*/) { return false; }
 };
 
 #endif  // COLLIDER_USE_CUDA / COLLIDER_USE_METAL / stub

@@ -1,0 +1,52 @@
+# theCollider plugin registry (example).
+#
+# Copy this file to ~/.collider/plugins.yml (or
+# %USERPROFILE%\.collider\plugins.yml on Windows) and edit. The collider
+# binary loads it once at scan start.
+#
+# Schema reference: docs/plugin-protocol.md
+#
+# Required per-plugin fields:
+#   name     : unique label used in the Plugins panel
+#   command  : argv as a list of strings (NOT a single shell string)
+#   events   : subset of [hit, empty-hit, phase-change, periodic]
+#
+# Optional:
+#   enabled  : defaults to true; set to false to keep the entry but skip the subprocess
+#
+# All reference plugins ship disabled. Uncomment any block below and set
+# `enabled: true` to activate. See tools/plugins/README.md for what each
+# plugin does and what command-line flags it accepts.
+
+plugins: []
+
+# Buffer empty-hit events and run them through the existing balance
+# scanner tool. The adapter (tools/plugins/balance-scanner.py) batches
+# stdin events and invokes tools/balance_scanner.py against the batch.
+# - name: balance-scanner
+#   command: ["python", "tools/plugins/balance-scanner.py", "--batch-size", "50"]
+#   events: [empty-hit]
+#   enabled: false
+
+# POST every hit and empty-hit to a webhook URL. Configure the URL via
+# the --url argument (or the COLLIDER_WEBHOOK_URL environment variable)
+# before enabling.
+# - name: webhook-poster
+#   command: ["python", "tools/plugins/webhook-poster.py", "--url", "https://your-webhook.example.com"]
+#   events: [hit, empty-hit]
+#   enabled: false
+
+# Show a desktop notification on confirmed hits. Cross-platform: Windows
+# toast (winrt or BurntToast), macOS Notification Center, Linux
+# notify-send.
+# - name: desktop-notifier
+#   command: ["python", "tools/plugins/desktop-notifier.py"]
+#   events: [hit]
+#   enabled: false
+
+# Minimal example: prints every periodic heartbeat. Useful for sanity
+# checking the plugin pipeline end to end.
+# - name: example-plugin
+#   command: ["python", "tools/plugins/example-plugin.py"]
+#   events: [periodic, phase-change]
+#   enabled: false

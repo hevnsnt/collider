@@ -660,13 +660,11 @@ inline void scalar_mul_g(thread ulong rx[4], thread ulong ry[4], thread ulong rz
 
 // ---------------------------------------------------------------------------
 // Fused brute-force kernel.
-//
 // One thread per candidate key. Thread global id `gid` selects the candidate
 // k = (start_lo, start_hi) + gid (256-bit add restricted to the bottom 128).
 // Puzzle ranges are < 2^160, so 128-bit math on the bottom limbs is enough;
 // we still propagate the carry into limb 2 / 3 for correctness on hypothetical
 // callers.
-//
 // Buffers (matching PuzzleMetalSolver dispatch order):
 //   0: g_table             (precomputed table; const after setup)
 //   1: target_h160         (20 bytes)
@@ -676,7 +674,6 @@ inline void scalar_mul_g(thread ulong rx[4], thread ulong ry[4], thread ulong rz
 //   5: match_lo  (plain ulong; written by the unique CAS winner)
 //   6: match_hi  (plain ulong)
 //   7: match_found (atomic uint; 0 = no match, 1 = match)
-//
 // Atomicity contract: match_found is a 32-bit CAS gate. Only the first
 // thread to flip 0->1 owns match_lo / match_hi for the rest of the
 // dispatch. Subsequent threads see match_found != 0 (their atomic_load

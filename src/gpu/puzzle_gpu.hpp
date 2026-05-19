@@ -182,13 +182,11 @@ private:
 
 // =============================================================================
 // MULTI-GPU PUZZLE SOLVER (Metal, macOS)
-//
 // Pre-1.4.1 the Mac standalone puzzle path hit the no-CUDA stub below and
 // silently fell back to the CPU reference at ~30 KKeys/s. This branch
 // implements the full surface on top of PuzzleMetalSolver. Apple silicon
 // has one unified GPU per device, so num_gpus() always reports 1; gpu_ids
 // in Config is honored for API parity but the solver only ever uses [0].
-//
 // GPUPuzzleSolver is intentionally a stub on Metal -- the CUDA single-GPU
 // class is a v1.0-era convenience that the multi-GPU class supersedes;
 // puzzle_solver.cpp uses MultiGPUPuzzleSolver exclusively. Implementation

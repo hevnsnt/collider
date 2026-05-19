@@ -16,8 +16,25 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 #include <cstdio>
+#include <array>
+#include <atomic>
 
 #include "hash_rounds.cuh"
+#include "glv_decompose.cuh"
+
+// T1.6: shared pre-launch context-state probe.
+#include "cuda_helpers.hpp"
+
+// Q-T1.1 inversion (2026-05-17): pull the dispatch cap from the gpu-layer
+// caps header (gpu::kMaxDispatchableGpus). The static_assert below uses it
+// to catch any future drift between this file's slot table (kMaxDevices)
+// and the dispatch ceiling. Formerly included ../runtime/runtime_control.hpp
+// for the same constant; that was a leaf-points-at-caller include. The
+// runtime side static_asserts that RuntimeControlState::kMaxGpus equals
+// gpu::kMaxDispatchableGpus (see src/runtime/runtime_control.hpp), so the
+// two stay locked together without this file knowing about the runtime
+// layer.
+#include "gpu_caps.hpp"
 
 namespace collider {
 namespace gpu {
@@ -347,106 +364,41 @@ __device__ __constant__ uint64_t SECP_GY[4] = {
     0x5DA4FBFC0E1108A8ULL, 0x483ADA7726A3C465ULL
 };
 
-// GLV endomorphism: lambda where lambda^3 = 1 mod n
-// beta where (x, y) -> (beta*x, y) is equivalent to scalar mult by lambda
-__device__ __constant__ uint64_t GLV_LAMBDA[4] = {
-    0xDF02967C1B23BD72ULL, 0x122E22EA20816678ULL,
-    0xA5261C028812645AULL, 0x5363AD4CC05C30E0ULL
-};
-
-// 2026-05-05 fix: prior beta value 0x7ae96a2b657c07106e64479eac3434e9... was
-// corrupted in limbs d[0..2] -- the canonical secp256k1 beta is the cube root
-// of 1 in the field where (x, y) -> (beta*x, y) implements lambda*P. The
-// previous low limbs (D765..., 7A9C..., 51CA...) didn't satisfy beta^3 = 1
-// mod p. Verified canonical value below pow(beta, 3, p) == 1.
+// GLV beta: cube root of 1 in F_p such that (x, y) -> (beta * x, y) implements
+// the lambda endomorphism on points. Used by apply_endomorphism() to compute
+// lambda*P without a full scalar multiplication. The lattice / rounding /
+// scalar-decomposition constants (lambda, a1, b1, a2, b2, g1, g2) live in
+// the shared header src/gpu/glv_decompose.cuh (Phase C.1 of v1.4.2).
 // Canonical beta = 0x7ae96a2b657c07106e64479eac3434e99cf0497512f58995c1396c28719501ee
-// Stored little-endian (d[0] = LSB):
+// Stored little-endian (d[0] = LSB).
 __device__ __constant__ uint64_t GLV_BETA[4] = {
     0xC1396C28719501EEULL, 0x9CF0497512F58995ULL,
     0x6E64479EAC3434E9ULL, 0x7AE96A2B657C0710ULL
 };
 
-// GLV Lattice basis vectors for scalar decomposition
-// These form a short basis of the lattice L = {(a,b) : a + b*lambda = 0 mod n}
-// Reference: Guide to Elliptic Curve Cryptography, Section 3.5
-__device__ __constant__ uint64_t GLV_A1[2] = {
-    0xE86C90E49284EB15ULL, 0x3086D221A7D46BCDULL  // a1 = 0x3086d221a7d46bcde86c90e49284eb15
-};
-
-__device__ __constant__ uint64_t GLV_B1[2] = {
-    0x6F547FA90ABFE4C3ULL, 0xE4437ED6010E8828ULL  // -b1 (stored positive, sign handled separately)
-};
-
-// a2 = 0x114CA50F7A8E2F3F657C1108D9D44CFD8 (129 bits, NOT equal to a1).
-//
-// 2026-05-05 fix (Defect D): the previous GLV_A2_LOW value was the wrong
-// canonical reference -- 0x...656E48F0E8717E37D was lifted from an old
-// "Guide to ECC" example that does not satisfy the lattice identity
-// a1^2 + |b1|*a2 = n for our basis with b2 = a1. With the wrong a2, the
-// k1 computation k = c1*a1 + c2*a2 + k1 fails to cancel down to the small
-// Babai residual for full 256-bit scalars (k near n), producing a 129-bit
-// k1 with d[2] holding garbage instead of the expected ~128-bit residual.
-// The correct value is derived from a2 = (-a1*lambda) mod n, which gives
-// a 129-bit number with the high bit at position 128. Verified: with the
-// new value, a1^2 + |b1|*a2 == n exactly.
-//
-// 2026-05-04 fix (Defect A): the prior code approximated a2 ~= a1 in the
-// glv_decompose c2*a2 multiply. That produces an error of c2 * (a2 - a1)
-// which, for full 256-bit scalars (c2 ~ 2^127), can reach ~2^254 -- the
-// decomposition becomes garbage and ec_mul_glv returns the wrong point.
-//
-// a2 has 129 bits, so it does not fit in two uint64s. We store the low
-// 128 bits explicitly here; the high bit (bit 128) is exactly 1, so
-// a2 = 2^128 + GLV_A2_LOW. The c2 * a2 multiply is split as
-//   c2 * a2 = (c2 << 128) + c2 * GLV_A2_LOW
-// in glv_decompose below, using the existing mul_128x128 routine for the
-// low half and a 128-bit shift for the high half. This is byte-exact with
-// the canonical lambda decomposition (libsecp256k1 secp256k1_scalar_split_lambda).
-__device__ __constant__ uint64_t GLV_A2_LOW[2] = {
-    0x57C1108D9D44CFD8ULL, 0x14CA50F7A8E2F3F6ULL  // low 128 bits of a2
-};
-
-__device__ __constant__ uint64_t GLV_B2[2] = {
-    0xE86C90E49284EB15ULL, 0x3086D221A7D46BCDULL  // b2 = a1 (same value)
-};
-
-// g1, g2 precomputed for efficient decomposition:
-// g1 = floor(b2 * 2^384 / n), g2 = floor((-b1) * 2^384 / n)
-//
-// 2026-05-04 fix: Originally these were documented as `* 2^256 / n`, but the
-// stored values are actually `* 2^384 / n` -- you can sanity-check this by
-// observing that g2.d[3] = 0xE4437ED6010E8828 has its high bit set, which is
-// only possible if g2 is on the order of 2^256. With the true `* 2^256 / n`
-// scaling, g2 would be around 2^127 (since |-b1| ~ 2^127 and 2^256/n ~ 1).
-// The corresponding extraction is therefore `(k * g_i) >> 384`, NOT `>> 256`.
-// See glv_decompose() for the matching shift fix.
-// g1 = round(b2 * 2^384 / n) = round(a1 * 2^384 / n)
-// Matches libsecp256k1 secp256k1_scalar_split_lambda g1 constant.
-// In little-endian u64 limbs (d[0]=LSB, d[3]=MSB):
-//   full hex (big-endian): 3086d221a7d46bcde86c90e49284eb153da4445121181820ffa7bd168f1d4808
-__device__ __constant__ uint64_t GLV_G1[4] = {
-    0xFFA7BD168F1D4808ULL, 0x3DA4445121181820ULL,
-    0xE86C90E49284EB15ULL, 0x3086D221A7D46BCDULL
-};
-
-// g2 = round((-b1) * 2^384 / n)
-// Matches libsecp256k1 secp256k1_scalar_split_lambda g2 constant.
-// In little-endian u64 limbs (d[0]=LSB, d[3]=MSB):
-//   full hex (big-endian): e4437ed6010e88286f547fa90abfe4c423eb5cdc18462a36f7a70f55b96c7540
-__device__ __constant__ uint64_t GLV_G2[4] = {
-    0xF7A70F55B96C7540ULL, 0x23EB5CDC18462A36ULL,
-    0x6F547FA90ABFE4C4ULL, 0xE4437ED6010E8828ULL
-};
-
-// Precomputed table: G, 2G, 3G, ..., 15G for window multiplication
-// Each window has 16 points (including 0*G at index 0)
-// Total: 64 windows * 16 points = 1024 points = 64KB per table
-//
-// NOTE: Tables are stored in GLOBAL DEVICE MEMORY (not constant memory)
-// because combined tables exceed CUDA's 64KB constant memory limit.
-// Access via __ldg() intrinsic provides L2 caching for good performance.
+// Precomputed table: 0G, G, 2G, ..., 15G (i.e. the first window only).
+// (v1.4.2 builder-kangaroo): pre-fix this table was sized for
+// NUM_WINDOWS * (1 << WINDOW_SIZE) = 64 * 16 = 1024 entries (~64 KB per
+// table, ~128 KB combined). The post-2026-05-04 left-to-right
+// scalar-multiplication switch in ec_mul_glv made all 63 windows past
+// the first one dead code: ec_mul_glv only reads `d_PRECOMP_TABLE[n1]`
+// and `d_PRECOMP_TABLE_LAMBDA[n2]` with n in [1..15], i.e. flat indices
+// 0..15 (window 0 only). The remaining 63 * 16 = 1008 entries cost L2
+// space and table-init time but contributed nothing to results.
+// Post-fix: each table is just 16 PointA = 1024 bytes. Combined with the
+// lambda table that is 2 KB total, a 64x reduction over the pre-fix
+// 128 KB combined footprint. The smaller working set fits comfortably
+// inside one cache line set on Ada+ and reduces table-init kernel time
+// from ~63 ec_double * 32 lanes * 64 windows to just the single-window
+// build (the win is small in absolute terms, but it eliminates one-time
+// initialization latency on every solver start).
+// NOTE: tables are still GLOBAL DEVICE MEMORY (not constant) for cudaMemcpy
+// flexibility; the L2 cache persistence hint is still applied below.
 __device__ PointA* d_PRECOMP_TABLE = nullptr;
 __device__ PointA* d_PRECOMP_TABLE_LAMBDA = nullptr;
+
+// Number of entries actually populated and read in each table (P-B5).
+#define PRECOMP_TABLE_ENTRIES (1 << WINDOW_SIZE)  // 16
 
 // =============================================================================
 // MODULAR ARITHMETIC (Optimized)
@@ -626,15 +578,26 @@ __device__ void mod_mul(U256& r, const U256& a, const U256& b) {
     // Final reduction if >= p
     r.d[0] = p[0]; r.d[1] = p[1]; r.d[2] = p[2]; r.d[3] = p[3];
 
-    // Wave 1 / C-CRIT-2 fix (2026-05-04): loop until canonical, mirroring the
-    // mod_reduce while-loop in secp256k1.cu. The reduce-by-c overflow handling
-    // above can leave r in roughly [0, k*p) for small k on pathological inputs;
-    // a single `if` is not always enough. Use the proper subc_cc borrow chain
-    // (matching mod_sub) to avoid the broken `r.d[i] - borrow` truncation
-    // pattern previously here.
-    while (r.d[3] > SECP_P[3] ||
-           (r.d[3] == SECP_P[3] && r.d[2] == SECP_P[2] &&
-            r.d[1] == SECP_P[1] && r.d[0] >= SECP_P[0])) {
+    // (v1.4.2 builder-kangaroo): the c-fold loop above bounds the
+    // result so a single conditional subtract is sufficient. Proof:
+    //   After the 256x256->512 multiply, p[7..0] holds the full product
+    //   in [0, p_max^2) where p_max < 2^256.
+    //   The first c-fold pass (lines 519-532) computes
+    //     r' = p[3..0] + c * p[7..4]
+    //   where c = 2^32 + 977 < 2^33. Since p[7..4] < 2^256, c * p[7..4]
+    //   is at most ~2^289, so r' has at most 33 bits of carry-out.
+    //   The carry-out handler (lines 535-547) folds that 33-bit residue
+    //   back via another c multiply (carry * c < 2^66), which contributes
+    //   at most one additional limb of overflow. After this second fold,
+    //   r in [0, 2^256 + c^2) which is bounded by [0, 2p) since
+    //   2p - 2^256 > c^2 (p = 2^256 - c, so 2p = 2^257 - 2c, and
+    //   2p - 2^256 = 2^256 - 2c >> c^2 for c << 2^128).
+    // KAT validation: this bound is exercised by tests/test_puzzle_optimized_inv.cu
+    // (64 random scalars) and tests/test_kangaroo_small_puzzle.cu (KAT vectors).
+    // Mirrors the secp256k1.cu::mod_reduce while -> if change (G-B6).
+    if (r.d[3] > SECP_P[3] ||
+        (r.d[3] == SECP_P[3] && r.d[2] == SECP_P[2] &&
+         r.d[1] == SECP_P[1] && r.d[0] >= SECP_P[0])) {
         uint64_t borrow;
         r.d[0] = sub_cc(r.d[0], SECP_P[0], borrow);
         r.d[1] = subc_cc(r.d[1], SECP_P[1], borrow, borrow);
@@ -654,25 +617,22 @@ __device__ void mod_sqr(U256& r, const U256& a) {
 }
 
 // Modular inverse using Fermat's little theorem: a^(-1) = a^(p-2) mod p
-//
 // Wave 1 / C-CRIT-2 fix (2026-05-04): the prior implementation used a
 // hand-coded addition chain that produced the wrong exponent. Tracing the
 // chain showed it computed approximately a^(2^255 - 2^31 - 493) instead of
 // a^(p-2) = a^(2^256 - 2^32 - 979), so a * mod_inv(a) was almost never 1
 // mod p. Replaced with right-to-left binary exponentiation over all 256
 // bits of p-2; verifiable by inspection.
-//
 // p     = 0xFFFFFFFFFFFFFFFF FFFFFFFFFFFFFFFF
 //         FFFFFFFFFFFFFFFF FFFFFFFEFFFFFC2F
 // p - 2 = 0xFFFFFFFFFFFFFFFF FFFFFFFFFFFFFFFF
 //         FFFFFFFFFFFFFFFF FFFFFFFEFFFFFC2D
-//
 // p_minus_2[0] is the LEAST significant 64-bit word so the per-iteration
 // bit walk processes bit 0 first. ~256 squarings + ~249 multiplications
 // (only 7 zero bits in p-2). To rule out aliasing edge cases across mod_mul
 // calls, we multiply via a fresh temporary then assign.
 __device__ void mod_inv(U256& r, const U256& a) {
-    // v1.4.0 phase 4 perf: libsecp256k1-style addition chain. 256
+    // phase 4 perf: libsecp256k1-style addition chain. 256
     // squarings + 13 multiplications instead of 256 + 248 -- ~1.9x
     // reduction in mod_mul calls per inversion. CRITICAL: x223 step
     // multiplies by x3 (a^7), NOT x2 (a^3); see the matching comment
@@ -742,7 +702,6 @@ __device__ void mod_inv(U256& r, const U256& a) {
 
 // Point doubling: R = 2*P (Jacobian)
 // Uses optimized formula for a=0 curves (secp256k1)
-//
 // 2026-05-04 fix (Defect C): the prior implementation wrote R.Y before
 // computing R.Z = 2 * P.Y * P.Z, which silently corrupted the result
 // whenever R aliased P (which is the common case: ec_double(R, R) is
@@ -804,7 +763,6 @@ __device__ void ec_double(PointJ& R, const PointJ& P) {
 
 // Point addition: R = P + Q (Jacobian + Affine -> Jacobian)
 // Mixed addition is faster than full Jacobian addition
-//
 // 2026-05-04 fix (Defect C, related): same aliasing hazard as ec_double.
 // ec_mul_glv calls ec_add_mixed(R, R, P1), so the R output aliases the P
 // input. The previous code read P.Y at line 913 and P.Z at line 918
@@ -832,7 +790,7 @@ __device__ void ec_add_mixed(PointJ& R, const PointJ& P, const PointA& Q) {
     // U2 = X2*Z1Z1
     mod_mul(U2, Q.x, Z1Z1);
 
-    // S2 = Y2*Z1*Z1Z1
+    // = Y2*Z1*Z1Z1
     mod_mul(S2, Q.y, PZ);
     mod_mul(S2, S2, Z1Z1);
 
@@ -989,230 +947,21 @@ __device__ void batch_invert(U256* z, U256* inv, int n) {
 // Result: k*G = k1*G + k2*(λ*G) computed via Shamir's trick (~30% faster)
 // =============================================================================
 
-// 128-bit type for intermediate GLV calculations
-struct U128 {
-    uint64_t lo, hi;
+// Multi-precision helpers used by the GLV scalar decomposition were moved
+// to src/gpu/glv_decompose.cuh in Phase C.1 of v1.4.2 (the U128 type, the
+// 384-bit rounding multiply mul_256x128_high, the 128x128->256 multiply
+// mul_128x128, and sub_256/add_256). They live in collider::gpu::glv with
+// internal linkage and use __umul64hi directly so they need no PTX helpers.
+// All callers in this file went away with the inline glv_decompose body.
 
-    __device__ __forceinline__ void set_zero() { lo = hi = 0; }
-    __device__ __forceinline__ bool is_zero() const { return (lo | hi) == 0; }
-    __device__ __forceinline__ bool is_negative() const { return (hi >> 63) != 0; }
-};
-
-// Multiply 256-bit by 128-bit, return high 128 bits (for rounding)
-__device__ void mul_256x128_high(const U256& a, const uint64_t b[2], U128& high) {
-    // We need the high 128 bits of a * b where b is 128 bits
-    // Full product is 384 bits, we want bits [256..383]
-
-    uint64_t p[6] = {0};  // 384-bit product
-
-    // Multiply each limb of a by each limb of b
-    for (int i = 0; i < 4; i++) {
-        uint64_t carry = 0;
-        for (int j = 0; j < 2; j++) {
-            // 64x64 -> 128 multiply + add using CUDA intrinsics
-            uint64_t lo = a.d[i] * b[j];
-            uint64_t hi = __umul64hi(a.d[i], b[j]);
-            // Add p[i+j]
-            lo += p[i+j];
-            hi += (lo < p[i+j]) ? 1 : 0;
-            // Add carry
-            lo += carry;
-            hi += (lo < carry) ? 1 : 0;
-            p[i+j] = lo;
-            carry = hi;
-        }
-        p[i+2] += carry;
-        if (p[i+2] < carry && i+3 < 6) p[i+3]++;
-    }
-
-    // Return high 128 bits (p[4], p[5])
-    high.lo = p[4];
-    high.hi = p[5];
-}
-
-// 128-bit multiply producing 256-bit result
-__device__ void mul_128x128(const U128& a, const uint64_t b[2], U256& result) {
-    uint64_t p[4] = {0};
-
-    // a.lo * b[0] -> (p[0], carry)
-    p[0] = a.lo * b[0];
-    uint64_t carry = __umul64hi(a.lo, b[0]);
-
-    // a.lo * b[1] + carry
-    uint64_t lo1 = a.lo * b[1];
-    uint64_t hi1 = __umul64hi(a.lo, b[1]);
-    lo1 += carry;
-    hi1 += (lo1 < carry) ? 1 : 0;
-
-    // a.hi * b[0] + lo1
-    uint64_t lo2 = a.hi * b[0];
-    uint64_t hi2 = __umul64hi(a.hi, b[0]);
-    lo2 += lo1;
-    hi2 += (lo2 < lo1) ? 1 : 0;
-    p[1] = lo2;
-
-    // Combine carries: hi1 + hi2
-    carry = hi1 + hi2;
-
-    // a.hi * b[1] + carry
-    uint64_t lo3 = a.hi * b[1];
-    uint64_t hi3 = __umul64hi(a.hi, b[1]);
-    lo3 += carry;
-    hi3 += (lo3 < carry) ? 1 : 0;
-    p[2] = lo3;
-    p[3] = hi3;
-
-    result.d[0] = p[0];
-    result.d[1] = p[1];
-    result.d[2] = p[2];
-    result.d[3] = p[3];
-}
-
-// Subtract 256-bit values, returning borrow (for signed arithmetic)
-__device__ bool sub_256(U256& r, const U256& a, const U256& b) {
-    uint64_t borrow;
-    r.d[0] = sub_cc(a.d[0], b.d[0], borrow);
-    r.d[1] = subc_cc(a.d[1], b.d[1], borrow, borrow);
-    r.d[2] = subc_cc(a.d[2], b.d[2], borrow, borrow);
-    r.d[3] = subc_cc(a.d[3], b.d[3], borrow, borrow);
-    return borrow != 0;
-}
-
-// Add 256-bit values
-__device__ void add_256(U256& r, const U256& a, const U256& b) {
-    uint64_t carry;
-    r.d[0] = add_cc(a.d[0], b.d[0], carry);
-    r.d[1] = addc_cc(a.d[1], b.d[1], carry, carry);
-    r.d[2] = addc_cc(a.d[2], b.d[2], carry, carry);
-    r.d[3] = addc_cc(a.d[3], b.d[3], carry, carry);
-}
-
-// GLV scalar decomposition: k = k1 + k2*lambda (mod n)
-// Uses Babai's nearest plane algorithm with precomputed lattice basis
-// k1, k2 will be ~128 bits each (half the size of k)
-// Returns sign flags: k1_neg, k2_neg (true if that component should be negated)
+// GLV scalar decomposition (Phase C.1 of v1.4.2): k = +/-k1 +/- k2*lambda (mod n).
+// The full implementation now lives in src/gpu/glv_decompose.cuh as
+// collider::gpu::glv::decompose, shared with ec_optimized.cuh and exercised
+// directly by tests/test_glv_decompose.cu. This thin wrapper preserves the
+// in-namespace U256 interface used by ec_mul_glv. U256 is a POD type whose
+// only field is uint64_t d[4]; the cast is layout-safe.
 __device__ void glv_decompose(const U256& k, U256& k1, U256& k2, bool& k1_neg, bool& k2_neg) {
-    // Compute c1 = round(k * g1 / 2^384) and c2 = round(k * g2 / 2^384)
-    // where g1, g2 are precomputed as floor(b2 * 2^384 / n) and floor(-b1 * 2^384 / n).
-    //
-    // 2026-05-04 fix (test_kangaroo_small_puzzle k=2,3,7 failing):
-    // The previous code extracted p[4],p[5] which corresponds to (k*g_i) >> 256.
-    // That was inconsistent with the actual magnitudes of GLV_G1/GLV_G2 (which
-    // are computed mod 2^384/n, not 2^256/n). For small k like k=2, the spurious
-    // carry-bit of the (k*g2) product would set c2 = 1 instead of 0, producing
-    // a totally wrong decomposition (k1 = k - a1 instead of k1 = k). Fixed by
-    // extracting p[6],p[7] = (k*g_i) >> 384, matching the libsecp256k1 algorithm
-    // (see secp256k1_scalar_split_lambda in src/scalar_impl.h).
-
-    U128 c1, c2;
-
-    // c1 = (k * g1) >> 384  (top 128 bits of full 512-bit product)
-    {
-        uint64_t p[8] = {0};
-        for (int i = 0; i < 4; i++) {
-            uint64_t carry = 0;
-            for (int j = 0; j < 4; j++) {
-                // 64x64 -> 128 multiply + add using CUDA intrinsics
-                uint64_t lo = k.d[i] * GLV_G1[j];
-                uint64_t hi = __umul64hi(k.d[i], GLV_G1[j]);
-                // Add p[i+j]
-                lo += p[i+j];
-                hi += (lo < p[i+j]) ? 1 : 0;
-                // Add carry
-                lo += carry;
-                hi += (lo < carry) ? 1 : 0;
-                p[i+j] = lo;
-                carry = hi;
-            }
-            p[i+4] = carry;
-        }
-        c1.lo = p[6];
-        c1.hi = p[7];
-    }
-
-    // c2 = (k * g2) >> 384  (top 128 bits of full 512-bit product)
-    {
-        uint64_t p[8] = {0};
-        for (int i = 0; i < 4; i++) {
-            uint64_t carry = 0;
-            for (int j = 0; j < 4; j++) {
-                // 64x64 -> 128 multiply + add using CUDA intrinsics
-                uint64_t lo = k.d[i] * GLV_G2[j];
-                uint64_t hi = __umul64hi(k.d[i], GLV_G2[j]);
-                // Add p[i+j]
-                lo += p[i+j];
-                hi += (lo < p[i+j]) ? 1 : 0;
-                // Add carry
-                lo += carry;
-                hi += (lo < carry) ? 1 : 0;
-                p[i+j] = lo;
-                carry = hi;
-            }
-            p[i+4] = carry;
-        }
-        c2.lo = p[6];
-        c2.hi = p[7];
-    }
-
-    // k1 = k - c1*a1 - c2*a2
-    // k2 = -c1*b1 + c2*b2  (note: our stored b1 is negative of the actual b1)
-    //    = c1*(-b1) + c2*b2
-    //    = c1*GLV_B1 + c2*GLV_B2  (both stored as positive)
-
-    U256 c1_a1, c2_a2;
-    mul_128x128(c1, GLV_A1, c1_a1);
-
-    // 2026-05-04 fix (Defect A): use the real a2, not a1. a2 is 129 bits
-    // and decomposes as 2^128 + GLV_A2_LOW, so
-    //   c2 * a2 = c2 * GLV_A2_LOW + (c2 << 128)
-    // We compute the low product with mul_128x128, then add c2 into the
-    // upper 128 bits with proper carry propagation. The result is
-    // truncated mod 2^256 since the subsequent k - c1*a1 - c2*a2 chain
-    // wraps mod 2^256 anyway and the final |k1| fits in 128 bits.
-    mul_128x128(c2, GLV_A2_LOW, c2_a2);
-    {
-        // Add c2 (interpreted at offset 128, i.e. into limbs [2] and [3])
-        uint64_t carry;
-        c2_a2.d[2] = add_cc(c2_a2.d[2], c2.lo, carry);
-        c2_a2.d[3] = c2_a2.d[3] + c2.hi + carry;
-    }
-
-    // k1 = k - c1*a1 - c2*a2
-    k1 = k;
-    bool borrow1 = sub_256(k1, k1, c1_a1);
-    bool borrow2 = sub_256(k1, k1, c2_a2);
-
-    // Handle underflow - if k1 went negative, we need to adjust
-    k1_neg = (k1.d[3] >> 63) != 0;
-    if (k1_neg) {
-        // Negate k1: k1 = -k1 = 0 - k1
-        U256 zero; zero.set_zero();
-        sub_256(k1, zero, k1);
-    }
-
-    // k2 = c1*b1 + c2*b2 (where b1 is stored as -b1, b2 = a1)
-    U256 c1_b1, c2_b2;
-    mul_128x128(c1, GLV_B1, c1_b1);  // c1 * (-b1)
-    mul_128x128(c2, GLV_B2, c2_b2);  // c2 * b2
-
-    // k2 = -c1*b1 + c2*b2 = c2_b2 - c1_b1  (since GLV_B1 stores -b1)
-    // Actually for secp256k1: k2 = -c1*b1 - c2*b2 where b1 < 0 originally
-    // So k2 = c1*|b1| - c2*b2
-    k2_neg = false;
-    bool k2_borrow = sub_256(k2, c1_b1, c2_b2);
-    if (k2_borrow || (k2.d[3] >> 63)) {
-        // k2 is negative, swap and negate
-        sub_256(k2, c2_b2, c1_b1);
-        k2_neg = true;
-    }
-
-    // k1 and k2 are bounded by the GLV Babai lattice: |k1|, |k2| < 2^128.5.
-    // For scalars near n (e.g. k = n-1), the rounding gives k1 = a1+a2-j
-    // which is a 129-bit number (d[2] = 1). We must NOT truncate d[2] here;
-    // ec_mul_glv uses max_window = 33 to cover that extra bit.
-    // d[3] is always 0 (Babai bound keeps |k1|,|k2| < 2^192).
-    k1.d[3] = 0;
-    k2.d[3] = 0;
+    collider::gpu::glv::decompose(k.d, k1.d, k2.d, k1_neg, k2_neg);
 }
 
 // Apply beta endomorphism to point: (x, y) -> (beta*x, y)
@@ -1246,7 +995,6 @@ __device__ void ec_negate_j(PointJ& P) {
 // GLV-accelerated scalar multiplication using Shamir's trick.
 // Computes k*G = k1*G + k2*(λG) where k1, k2 are ~128-bit non-negative
 // magnitudes (with separate sign flags from glv_decompose).
-//
 // 2026-05-04 fix (Defect B): the prior implementation combined two
 // incompatible windowed-mul conventions. The precomputed table stores
 //   table[w*16 + i] = i * 16^w * G
@@ -1256,7 +1004,6 @@ __device__ void ec_negate_j(PointJ& P) {
 // positional weight: contributions from window w ended up multiplied by
 // 16^(2w) instead of 16^w, so the final point was completely wrong for
 // any non-trivial scalar.
-//
 // Fix: switch to the textbook left-to-right method using a flat table
 //   table_flat[i] = i * G   (i = 0..15)
 // which is exactly what the existing table generator stores at
@@ -1495,7 +1242,19 @@ static bool g_glv_enabled = true;
 
 /**
  * Kernel to generate precomputed table on GPU.
- * Table[w * 16 + i] = i * 2^(w*4) * G for each window w and value i (0-15).
+ *
+ * P-B5 (v1.4.2 builder-kangaroo): only the first window (16 entries each
+ * for G-table and lambda*G-table) is built. The ec_mul_glv consumer
+ * (puzzle_optimized.cu) is a textbook left-to-right Strauss double-and-add
+ * that derives all higher window contributions via 4-doublings-per-step
+ * of the accumulator, NOT via per-window precomputed tables. The pre-fix
+ * 63 extra windows were generated but never read.
+ *
+ * Table layout post-fix:
+ *   table[i]        = i*G     for i in 0..15
+ *   table_lambda[i] = i*lambda*G for i in 0..15
+ * (index 0 is conventionally point-at-infinity (0,0); ec_mul_glv skips
+ * the n=0 case so 0 is never dereferenced.)
  */
 __global__ void generate_precomputed_table_kernel_opt(PointA* table, PointA* table_lambda) {
     // Load generator G
@@ -1505,19 +1264,19 @@ __global__ void generate_precomputed_table_kernel_opt(PointA* table, PointA* tab
     G.y.d[0] = SECP_GY[0]; G.y.d[1] = SECP_GY[1];
     G.y.d[2] = SECP_GY[2]; G.y.d[3] = SECP_GY[3];
 
-    // Compute λG = endomorphism(G) = (β*Gx, Gy)
+    // Compute lambda*G = endomorphism(G) = (beta*Gx, Gy)
     PointA LG;
     apply_endomorphism(LG, G);
 
-    // Build table for window 0: 0*G, 1*G, 2*G, ..., 15*G
-    PointJ points[1 << WINDOW_SIZE];
-    PointJ points_lambda[1 << WINDOW_SIZE];
+    // Build table for window 0: 0*G, 1*G, 2*G, ..., 15*G (and same for lambda*G).
+    PointJ points[PRECOMP_TABLE_ENTRIES];
+    PointJ points_lambda[PRECOMP_TABLE_ENTRIES];
 
     // 0 * G = infinity
     points[0].set_infinity();
     points_lambda[0].set_infinity();
 
-    // 1 * G and 1 * λG
+    // 1 * G and 1 * lambda*G
     points[1].X = G.x;
     points[1].Y = G.y;
     points[1].Z.set_one();
@@ -1526,14 +1285,16 @@ __global__ void generate_precomputed_table_kernel_opt(PointA* table, PointA* tab
     points_lambda[1].Y = LG.y;
     points_lambda[1].Z.set_one();
 
-    // 2*G through 15*G via repeated addition
-    for (int i = 2; i < (1 << WINDOW_SIZE); i++) {
+    // 2*G through 15*G via repeated addition.
+    for (int i = 2; i < PRECOMP_TABLE_ENTRIES; i++) {
         ec_add_mixed(points[i], points[i-1], G);
         ec_add_mixed(points_lambda[i], points_lambda[i-1], LG);
     }
 
-    // Convert window 0 to affine and store
-    for (int i = 0; i < (1 << WINDOW_SIZE); i++) {
+    // Convert window 0 to affine and store. This is the ONLY window kept
+    // post P-B5; the consumer uses ec_double in the outer loop to walk
+    // higher windows.
+    for (int i = 0; i < PRECOMP_TABLE_ENTRIES; i++) {
         if (points[i].is_infinity()) {
             table[i].x.set_zero();
             table[i].y.set_zero();
@@ -1559,58 +1320,6 @@ __global__ void generate_precomputed_table_kernel_opt(PointA* table, PointA* tab
             mod_mul(table_lambda[i].y, points_lambda[i].Y, z_inv3);
         }
     }
-
-    // For GLV, we only need 32 windows (128-bit scalars) instead of 64
-    int num_glv_windows = 32;
-
-    // For each subsequent window, double all points WINDOW_SIZE times
-    for (int w = 1; w < NUM_WINDOWS; w++) {
-        // Double each point WINDOW_SIZE times
-        for (int d = 0; d < WINDOW_SIZE; d++) {
-            for (int i = 1; i < (1 << WINDOW_SIZE); i++) {
-                PointJ temp;
-                ec_double(temp, points[i]);
-                points[i] = temp;
-
-                // Only compute lambda table for first 32 windows (GLV uses 128-bit scalars)
-                if (w < num_glv_windows) {
-                    ec_double(temp, points_lambda[i]);
-                    points_lambda[i] = temp;
-                }
-            }
-        }
-
-        // Convert to affine and store for this window
-        for (int i = 0; i < (1 << WINDOW_SIZE); i++) {
-            int table_idx = w * (1 << WINDOW_SIZE) + i;
-            if (points[i].is_infinity() || i == 0) {
-                table[table_idx].x.set_zero();
-                table[table_idx].y.set_zero();
-            } else {
-                U256 z_inv, z_inv2, z_inv3;
-                mod_inv(z_inv, points[i].Z);
-                mod_sqr(z_inv2, z_inv);
-                mod_mul(z_inv3, z_inv2, z_inv);
-                mod_mul(table[table_idx].x, points[i].X, z_inv2);
-                mod_mul(table[table_idx].y, points[i].Y, z_inv3);
-            }
-
-            // Lambda table (only for first 32 windows)
-            if (w < num_glv_windows) {
-                if (points_lambda[i].is_infinity() || i == 0) {
-                    table_lambda[table_idx].x.set_zero();
-                    table_lambda[table_idx].y.set_zero();
-                } else {
-                    U256 z_inv, z_inv2, z_inv3;
-                    mod_inv(z_inv, points_lambda[i].Z);
-                    mod_sqr(z_inv2, z_inv);
-                    mod_mul(z_inv3, z_inv2, z_inv);
-                    mod_mul(table_lambda[table_idx].x, points_lambda[i].X, z_inv2);
-                    mod_mul(table_lambda[table_idx].y, points_lambda[i].Y, z_inv3);
-                }
-            }
-        }
-    }
 }
 
 // Host function to initialize precomputed tables
@@ -1619,8 +1328,12 @@ extern "C" cudaError_t init_puzzle_optimized(cudaStream_t stream) {
         return cudaSuccess;  // Already initialized
     }
 
-    // Allocate device memory for both tables (G and λG)
-    size_t table_size = NUM_WINDOWS * (1 << WINDOW_SIZE) * sizeof(PointA);
+    // (v1.4.2 builder-kangaroo): allocate just one window (16 entries)
+    // per table. Pre-fix was NUM_WINDOWS * 16 = 1024 entries (~64 KB);
+    // post-fix is 16 entries (~1 KB). The consumer ec_mul_glv only reads
+    // table[1..15] and table_lambda[1..15]; higher windows came from a
+    // pre-2026-05-04 right-to-left convention that no longer exists.
+    size_t table_size = PRECOMP_TABLE_ENTRIES * sizeof(PointA);
     cudaError_t err = cudaMalloc(&g_precomputed_table_device, table_size);
     if (err != cudaSuccess) {
         return err;
@@ -1634,6 +1347,9 @@ extern "C" cudaError_t init_puzzle_optimized(cudaStream_t stream) {
     }
 
     // Generate both tables on GPU (single thread - table generation is one-time cost)
+    // T1.6: sticky context error attribution.
+    (void)collider::gpu::pre_launch_context_probe(
+        "generate_precomputed_table_kernel_opt");
     generate_precomputed_table_kernel_opt<<<1, 1, 0, stream>>>(
         g_precomputed_table_device, g_precomputed_table_lambda_device);
     err = cudaGetLastError();
@@ -1693,7 +1409,10 @@ extern "C" cudaError_t init_puzzle_optimized(cudaStream_t stream) {
     #endif
 
     g_glv_enabled = true;
-    fprintf(stderr, "[EC] Precomputed tables initialized in global memory (128KB, L2 cached)\n");
+    // (v1.4.2 builder-kangaroo): "1 KB per table" reflects the
+    // 16-entry single-window precomputation. Pre-fix message said
+    // "128KB" but only the first 16 entries were ever read.
+    fprintf(stderr, "[EC] Precomputed tables initialized in global memory (~2KB combined, L2 cached)\n");
     fprintf(stderr, "[GLV] Lambda table ready, GLV endomorphism enabled (~30%% speedup)\n");
 
     g_table_initialized = true;
@@ -1715,9 +1434,48 @@ extern "C" cudaError_t cleanup_puzzle_optimized() {
     return cudaSuccess;
 }
 
+// opaque accessors that let the on-curve test
+// (tests/test_ec_table_consistency.cu) download the post-P-B5 trimmed
+// precomp tables to host memory for y^2 = x^3 + 7 validation. Returned
+// pointers are still device-side; caller does cudaMemcpy.
+// Layout (per entry):
+//   bytes 0..31:  x (little-endian u64[4])
+//   bytes 32..63: y (little-endian u64[4])
+//   64 bytes per entry; PRECOMP_TABLE_ENTRIES (16) entries per table.
+// Both tables have the same shape; index 0 is the point-at-infinity
+// (x=y=0) and the test skips it.
+extern "C" size_t puzzle_optimized_table_entry_count() {
+    return PRECOMP_TABLE_ENTRIES;
+}
+extern "C" size_t puzzle_optimized_table_entry_bytes() {
+    return sizeof(PointA);  // 64
+}
+extern "C" const void* puzzle_optimized_get_table_device() {
+    return g_precomputed_table_device;
+}
+extern "C" const void* puzzle_optimized_get_table_lambda_device() {
+    return g_precomputed_table_lambda_device;
+}
+
 // =============================================================================
 // GPU DEVICE INFO CACHING
 // =============================================================================
+// T1.4 (2026-05-17). The original implementation cached one
+// `GPUDeviceInfo` for the entire process and seeded it lazily from
+// device 0. On heterogeneous rigs (e.g. RTX 3090 + RTX 4090) every
+// subsequent launch on every other device reused device 0's
+// compute_major / sm_count, producing wrong block / thread counts
+// (e.g. an Ada GPU dispatched with Ampere's 256 threads-per-block
+// instead of the Ada-tuned 128, and any GPU got the SM count from
+// whichever card happened to be selected first).
+//
+// The fix replaces the single static with a per-device array indexed
+// by device id, populated lazily on first reference, with the
+// caller passing in the device id obtained from cudaGetDevice().
+// kMaxDevices mirrors the existing convention in
+// src/ui/tui/panels/gpu_panel.cpp (16) so the slot table fits any
+// reasonable multi-GPU rig (the runner-side kMaxGpus is 8, this
+// pads to 16 for headroom).
 
 struct GPUDeviceInfo {
     int sm_count;
@@ -1731,47 +1489,144 @@ struct GPUDeviceInfo {
     bool initialized;
 };
 
-static GPUDeviceInfo g_gpu_info = {0, 0, 0, 0, 0, 0, 0, 0, false};
+static constexpr int kMaxDevices = 16;
 
-// Query and cache GPU device properties
-static void ensure_gpu_info(int device = 0) {
-    if (g_gpu_info.initialized) return;
+// Re-audit 5/7 (2026-05-17): the slot table pads to kMaxDevices=16 but
+// the dispatch only iterates kMaxDispatchableGpus (8 in gpu_caps.hpp).
+// A 9th physical device would otherwise silently populate a slot that
+// the dispatch loop never visits. The static_assert here makes the
+// invariant "slot table is at least as wide as the dispatch ceiling"
+// explicit, so any future bump of kMaxDispatchableGpus past kMaxDevices
+// fails at compile time rather than silently re-introducing the OOB
+// drift. The runtime-layer RuntimeControlState::kMaxGpus is wired to
+// gpu::kMaxDispatchableGpus via a static_assert in runtime_control.hpp,
+// so the two stay locked.
+static_assert(
+    kMaxDevices >= ::collider::gpu::kMaxDispatchableGpus,
+    "GPU slot table (kMaxDevices) must be at least as wide as the "
+    "dispatch ceiling (gpu::kMaxDispatchableGpus). Bumping "
+    "kMaxDispatchableGpus past kMaxDevices would leave higher-id slots "
+    "unreachable from the dispatch loop.");
 
-    cudaDeviceProp props;
-    cudaGetDeviceProperties(&props, device);
+// Per-device slot. `initialized` is the publication bit. We
+// double-check under load() to keep the fast path lock-free while
+// preventing two threads from racing on the property query.
+struct GPUInfoSlot {
+    std::atomic<bool> initialized{false};
+    GPUDeviceInfo info{0, 0, 0, 0, 0, 0, 0, 0, false};
+};
 
-    g_gpu_info.sm_count = props.multiProcessorCount;
-    g_gpu_info.max_threads_per_sm = props.maxThreadsPerMultiProcessor;
-    g_gpu_info.max_blocks_per_sm = props.maxBlocksPerMultiProcessor;
-    g_gpu_info.warp_size = props.warpSize;
-    g_gpu_info.compute_major = props.major;
-    g_gpu_info.compute_minor = props.minor;
-    g_gpu_info.shared_mem_per_block = props.sharedMemPerBlock;
-    g_gpu_info.l2_cache_size = props.l2CacheSize;
-    g_gpu_info.initialized = true;
+static std::array<GPUInfoSlot, kMaxDevices> g_gpu_info_per_device;
 
-    fprintf(stderr, "[GPU] %s: %d SMs, CC %d.%d, L2 %zu MB\n",
-            props.name, g_gpu_info.sm_count,
-            g_gpu_info.compute_major, g_gpu_info.compute_minor,
-            g_gpu_info.l2_cache_size / (1024 * 1024));
+// Resolve the device id to query. Callers pass an explicit id; the
+// default of -1 means "use the currently bound device". We never want
+// to silently fall back to device 0 here (that's the bug T1.4 fixes).
+static int resolve_device_id(int device) {
+    if (device >= 0) return device;
+    int current = 0;
+    cudaError_t err = cudaGetDevice(&current);
+    if (err != cudaSuccess) {
+        // Fall back to device 0 only when the runtime can't tell us
+        // which device is bound. This is a degenerate case; the
+        // returned slot will still be populated against device 0
+        // which matches the pre-T1.4 behavior for single-GPU rigs.
+        return 0;
+    }
+    return current;
 }
 
-// Calculate optimal launch configuration based on GPU capabilities
+// Query and cache GPU device properties for the given device.
+// device < 0 means "use cudaGetDevice() result".
+static const GPUDeviceInfo& ensure_gpu_info(int device = -1) {
+    int dev = resolve_device_id(device);
+    // Re-audit 5/7 (2026-05-17): clamp against kMaxDispatchableGpus (the
+    // dispatch ceiling) rather than kMaxDevices (the slot table width).
+    // A 9th+ device routes to slot 0 with a stderr warning instead of
+    // silently populating a slot the dispatch loop never iterates. The
+    // static_assert above guarantees kMaxDevices >= kMaxDispatchableGpus
+    // so this clamp stays within the slot array. Q-T1.1: pull the cap
+    // from gpu_caps.hpp instead of reaching up into runtime/.
+    constexpr int kDispatchCeiling =
+        ::collider::gpu::kMaxDispatchableGpus;
+    if (dev < 0 || dev >= kDispatchCeiling) {
+        fprintf(stderr, "[GPU] WARNING: device id %d outside dispatch "
+                "ceiling kMaxDispatchableGpus=%d (slot table width "
+                "kMaxDevices=%d). Reusing slot 0; launch config may be "
+                "off and the device will not be visited by the dispatch "
+                "loop.\n",
+                dev, kDispatchCeiling, kMaxDevices);
+        dev = 0;
+    }
+
+    GPUInfoSlot& slot = g_gpu_info_per_device[dev];
+    if (slot.initialized.load(std::memory_order_acquire)) {
+        return slot.info;
+    }
+
+    cudaDeviceProp props;
+    cudaError_t err = cudaGetDeviceProperties(&props, dev);
+    if (err != cudaSuccess) {
+        // Property query failed. Leave the slot uninitialized so the
+        // next call retries; populate with the safest defaults
+        // (Ampere-class assumptions) so the launch config we return
+        // is at least valid. Do not flip `initialized` to true.
+        fprintf(stderr, "[GPU] cudaGetDeviceProperties(dev=%d) failed: %s. "
+                "Using fallback launch config.\n",
+                dev, cudaGetErrorString(err));
+        static const GPUDeviceInfo fallback = {
+            /*sm_count*/ 32,
+            /*max_threads_per_sm*/ 2048,
+            /*max_blocks_per_sm*/ 32,
+            /*warp_size*/ 32,
+            /*compute_major*/ 8,
+            /*compute_minor*/ 0,
+            /*shared_mem_per_block*/ 48 * 1024,
+            /*l2_cache_size*/ 4 * 1024 * 1024,
+            /*initialized*/ false,
+        };
+        return fallback;
+    }
+
+    slot.info.sm_count = props.multiProcessorCount;
+    slot.info.max_threads_per_sm = props.maxThreadsPerMultiProcessor;
+    slot.info.max_blocks_per_sm = props.maxBlocksPerMultiProcessor;
+    slot.info.warp_size = props.warpSize;
+    slot.info.compute_major = props.major;
+    slot.info.compute_minor = props.minor;
+    slot.info.shared_mem_per_block = props.sharedMemPerBlock;
+    slot.info.l2_cache_size = props.l2CacheSize;
+    slot.info.initialized = true;
+    slot.initialized.store(true, std::memory_order_release);
+
+    fprintf(stderr, "[GPU %d] %s: %d SMs, CC %d.%d, L2 %zu MB\n",
+            dev, props.name, slot.info.sm_count,
+            slot.info.compute_major, slot.info.compute_minor,
+            slot.info.l2_cache_size / (1024 * 1024));
+
+    return slot.info;
+}
+
+// Calculate optimal launch configuration based on GPU capabilities.
+// `device` selects which device's properties to use (default: the
+// currently bound device per cudaGetDevice()). T1.4: previously this
+// silently used device 0's properties for every launch on every
+// device, producing wrong configs on heterogeneous rigs.
 static void get_optimal_launch_config(
     uint64_t total_work,
     int* out_blocks,
     int* out_threads,
-    int work_per_thread = KEYS_PER_THREAD
+    int work_per_thread = KEYS_PER_THREAD,
+    int device = -1
 ) {
-    ensure_gpu_info();
+    const GPUDeviceInfo& info = ensure_gpu_info(device);
 
     // Blackwell/Ada: prefer 128 threads for better register usage
     // Ampere/Turing: 256 threads is fine
-    int threads_per_block = (g_gpu_info.compute_major >= 9) ? 128 : 256;
+    int threads_per_block = (info.compute_major >= 9) ? 128 : 256;
 
     // Target: 4-8 blocks per SM for good occupancy
     int target_blocks_per_sm = 6;
-    int target_blocks = g_gpu_info.sm_count * target_blocks_per_sm;
+    int target_blocks = info.sm_count * target_blocks_per_sm;
 
     // Calculate blocks needed for the work
     int64_t work_items = (total_work + work_per_thread - 1) / work_per_thread;
@@ -1802,10 +1657,18 @@ extern "C" cudaError_t puzzle_search_batch_optimized(
     // Clear match flag
     cudaMemsetAsync(d_match_found, 0, sizeof(uint32_t), stream);
 
-    // Dynamic launch configuration based on GPU capabilities
+    // Dynamic launch configuration based on GPU capabilities.
+    // T1.4: query the device currently bound to this thread/stream, NOT
+    // the process-wide cache. cudaGetDevice() returns the device this
+    // stream's launches will target.
+    int device = -1;
+    cudaGetDevice(&device);
     int blocks, threads_per_block;
-    get_optimal_launch_config(batch_size, &blocks, &threads_per_block);
+    get_optimal_launch_config(batch_size, &blocks, &threads_per_block,
+                              KEYS_PER_THREAD, device);
 
+    // T1.6: sticky context error attribution.
+    (void)collider::gpu::pre_launch_context_probe("puzzle_search_optimized");
     puzzle_search_optimized<<<blocks, threads_per_block, 0, stream>>>(
         range_start_lo, range_start_hi, batch_size,
         d_target_hash160, d_match_key_lo, d_match_key_hi, d_match_found
@@ -1814,12 +1677,14 @@ extern "C" cudaError_t puzzle_search_batch_optimized(
     return cudaGetLastError();
 }
 
-// Get GPU info for external use (e.g., progress display)
+// Get GPU info for external use (e.g., progress display).
+// T1.4: returns the currently bound device's info. For per-device
+// querying, the caller should cudaSetDevice() before invocation.
 extern "C" void get_gpu_info(int* sm_count, int* compute_major, int* compute_minor) {
-    ensure_gpu_info();
-    if (sm_count) *sm_count = g_gpu_info.sm_count;
-    if (compute_major) *compute_major = g_gpu_info.compute_major;
-    if (compute_minor) *compute_minor = g_gpu_info.compute_minor;
+    const GPUDeviceInfo& info = ensure_gpu_info();
+    if (sm_count) *sm_count = info.sm_count;
+    if (compute_major) *compute_major = info.compute_major;
+    if (compute_minor) *compute_minor = info.compute_minor;
 }
 
 // =============================================================================
@@ -1871,6 +1736,9 @@ extern "C" cudaError_t puzzle_optimized_test_inverse_correctness_kernel_launch(
     if (count == 0) return cudaSuccess;
     const int threads = 64;
     int blocks = (int)((count + threads - 1) / threads);
+    // T1.6: sticky context error attribution.
+    (void)collider::gpu::pre_launch_context_probe(
+        "test_puzzle_opt_mod_inv_correctness_kernel");
     test_puzzle_opt_mod_inv_correctness_kernel<<<blocks, threads, 0, stream>>>(
         reinterpret_cast<const U256*>(d_scalars),
         d_results,
@@ -1881,7 +1749,6 @@ extern "C" cudaError_t puzzle_optimized_test_inverse_correctness_kernel_launch(
 
 // =============================================================================
 // EC mul GLV known-answer test kernel
-//
 // KangarooSmallPuzzle replacement (2026-05-04). The original
 // test_kangaroo_small_puzzle.cu drove puzzle_search_batch_optimized end to end
 // on a tiny 256-key range to verify EC + SHA + RIPEMD recover known privkeys.
@@ -1890,14 +1757,12 @@ extern "C" cudaError_t puzzle_optimized_test_inverse_correctness_kernel_launch(
 // success/failure through a single match flag. No intermediate state is
 // observable, so any failure becomes "no match found" with no actionable
 // signal.
-//
 // This kernel exposes the EC math used by the kangaroo / puzzle search path
 // (ec_mul_glv via the precomputed table built by init_puzzle_optimized).
 // Each thread runs ec_mul_glv on an input scalar, jacobian->affine via
 // mod_inv, and writes (x, y) to the output. The host test compares against
 // known compressed-pubkey vectors, exactly mirroring EcMulKnownAnswers but
 // for the puzzle_optimized.cu code path instead of secp256k1.cu.
-//
 // One thread per scalar; small input set (handful of vectors).
 // =============================================================================
 __global__ void test_puzzle_opt_ec_mul_glv_kernel(
@@ -1943,6 +1808,9 @@ extern "C" cudaError_t puzzle_optimized_test_ec_mul_glv_kernel_launch(
     if (count == 0) return cudaSuccess;
     const int threads = 32;
     int blocks = (int)((count + threads - 1) / threads);
+    // T1.6: sticky context error attribution.
+    (void)collider::gpu::pre_launch_context_probe(
+        "test_puzzle_opt_ec_mul_glv_kernel");
     test_puzzle_opt_ec_mul_glv_kernel<<<blocks, threads, 0, stream>>>(
         reinterpret_cast<const U256*>(d_scalars),
         reinterpret_cast<U256*>(d_out_x),

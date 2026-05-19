@@ -1,12 +1,10 @@
 # theColliderPro
 
-> Every key your GPU computes is a lottery ticket. Pro just gives you more lotteries to win.
-
 theCollider Free is one of the most complete open-source Bitcoin Puzzle Challenge solvers in the world. **theColliderPro turns the same binary into a treasure hunter.**
 
-You are running a GPU. It is grinding millions, billions, eventually trillions of private keys. In Free, every one of those keys is checked against exactly one target: the puzzle you are solving. In Pro, **every single key is also checked against 100 million funded Bitcoin addresses, automatically, in the same GPU kernel pass, at zero marginal cost.**
+You are running a GPU. It is grinding millions, billions, eventually trillions of private keys. In Free, every one of those keys is checked against exactly one target: the puzzle you are solving. In Pro, **every distinguished-point pubkey is also handed to a CPU-side checker that probes it against a 100 million entry funded-address bloom filter**, alongside whatever puzzle work you were doing anyway.
 
-If puzzle 135 is the moonshot, Pro is the lottery ticket that comes free with the moonshot.
+If puzzle 135 is the moonshot, Pro adds a parallel scan of every recoverable wallet that human passphrase choice has ever leaked.
 
 [Buy a Pro license](https://collisionprotocol.com/pro) | [Back to README](../README.md)
 
@@ -19,20 +17,17 @@ There are roughly **3 to 4 million Bitcoin permanently lost** to forgotten passw
 Some of that is unrecoverable in principle (the keys are gone, full stop). But a measurable slice is recoverable in principle:
 
 - **Brain wallets**: thousands of wallets where the private key is `SHA256(password)` of a passphrase a human picked. People used song lyrics, Bible verses, "correct horse battery staple", their dog's name. Most were drained by automated scanners within months. A long tail were not. **Some still hold real Bitcoin today.**
-- **Weak-PRNG wallets**: every few years a popular wallet ships with a broken random-number generator. Milk Sad. Profanity. Trust Wallet. Each of those CVEs left tens of thousands of wallets with enumerable private keys. Most got scanned and emptied within weeks of public disclosure. The ones that did not got forgotten.
 - **Lost-and-forgotten wallets**: addresses that received Bitcoin in 2011 and have never moved. The owner has the keys somewhere. Or used to.
 
 Pro is built to find these.
 
 ---
 
-## The killer feature: opportunistic scanning while you solve
+## Opportunistic scanning while you solve puzzles
 
-This is the part of Pro that nobody else does. It is the reason ColliderPro exists.
+While your GPU is grinding puzzle 135 in pool or standalone mode, the distinguished points it produces are also handed to a CPU-side checker that derives a Bitcoin H160 from each one and probes the 100 million entry funded-address bloom filter. The GPU pipeline is the same one Free runs. The opportunistic check happens after the DP leaves the GPU, on the CPU; the only added work on the GPU is the small bookkeeping needed to keep the pubkey alongside the DP.
 
-**While your GPU is solving puzzle 135 in pool or standalone mode, every key it computes is also being checked against a 100 million entry funded-address bloom filter.** Inside the same GPU kernel pass. With no additional GPU time, no additional electricity, no additional anything.
-
-Here is what is happening, simplified:
+Here is the shape of the pipeline:
 
 ```
 Free build, pool mode:
@@ -40,39 +35,61 @@ Free build, pool mode:
   (One target. Puzzle 135. That is the whole story.)
 
 Pro build, pool mode:
-  GPU computes pubkey -> derives DP -> hashes to H160 (Bitcoin address) ->
-    queries bloom filter for 100M+ funded addresses ->
-    if hit: writes candidate to bloom_hits.txt for CPU verification ->
-  Sends DP to pool server.
-  (Still mining puzzle 135. But also scanning every key for any
-   funded wallet, anywhere, ever, in history.)
+  GPU computes pubkey -> derives DP -> sends DP to pool server.
+  CPU also takes each DP's pubkey -> hashes to H160 -> probes the
+    bloom for funded Bitcoin addresses.
+  If a bloom hit shows up: candidate gets logged for verification.
 ```
 
-The marginal cost is **zero**. The DP is already on the GPU. The H160 is already a few ops away. The bloom query is a handful of memory reads. The Pro kernel does all of it in the same pass that the Free kernel uses to just send the DP.
+Empirically, enabling the opportunistic CPU checker has a small effect on overall pool throughput (a few percent on a 4090, depending on how saturated the pool client is). The trade is a few percent of puzzle-135 odds for an entirely separate scan of every distinguished-point pubkey against the funded-address set.
 
-A 4090 doing 8 GKeys/s in pool mode is, in Pro, also doing 8 GKeys/s of opportunistic funded-address checking. **Per machine. Every machine. All the time.**
-
-Will you find an address? Probably not. The chance on any given key is roughly 1 in 2^130. But you are computing trillions of keys. And if your DP X coordinate ever happens to be the X coordinate of a key behind a funded wallet, **the bloom filter catches it**, the hit gets logged, and you can spend the result.
-
-It is the most expensive Bitcoin scratch-off in the world, and you were buying it anyway.
+Will you find an address? Almost certainly not. The chance on any given pubkey is roughly 1 in 2^229 even after collapsing the search to the funded subset. **The point is not "you will probably find one." The point is "the marginal cost of looking is small, so you might as well look."**
 
 ---
 
 ## Dedicated brain-wallet mode: your GPU is a key factory
 
-When you are not mining puzzles, flip to **dedicated brain-wallet mode**: a purpose-built pipeline that systematically scans human-chosen passphrases against the same 100M+ funded-address bloom.
+When you are not pool-mining puzzle 135 (overnight, between work assignments, when the pool is quiet), Pro flips to **dedicated brain-wallet mode**: a purpose-built pipeline that systematically scans human-chosen passphrases against the same 100M+ funded-address bloom.
 
 Bitcoin's earliest users protected coins with a passphrase that hashes directly to a private key. `SHA256("correct horse battery staple")` is a private key. No wallet file. No mnemonic. Just words. **Tens of thousands of these wallets were created between 2011 and 2014, and many of them still hold real Bitcoin today.**
 
-The Pro brain-wallet pipeline runs at hundreds of millions of candidates per second on a 4090, through a fused GPU kernel:
+The Pro brain-wallet pipeline runs a fully on-GPU fused kernel:
 
 ```
 passphrase -> SHA-256 -> secp256k1 (private to public key) ->
-RIPEMD-160(SHA-256(pubkey)) -> Bitcoin address ->
-bloom filter query -> hit?
+RIPEMD-160(SHA-256(pubkey)) -> Bitcoin H160 ->
+multi-address bloom probe -> hit?
 ```
 
-Every stage stays on the GPU. Nothing rolls back to the CPU until a bloom hit needs definitive verification.
+Every stage stays on the GPU until a bloom hit needs definitive CPU verification.
+
+### Measured throughput
+
+The `--benchmark` flag drives the production fused kernel against a synthetic on-device passphrase buffer and reports per-stage and end-to-end rates. Sample measurement from `bench_gpu_pipeline --time 30 --batch 4000000` on an RTX 3060 (Ampere, sm_86):
+
+```
+Stage                          Rate              Window
+-----                          ----              ------
+SHA-256 (passphrase)             334.6 MH/s    30.01 s
+secp256k1 mul                      1.33 MH/s   30.01 s
+hash160 (SHA + RIPEMD)           318.7 MH/s    30.01 s
+bloom probe                       11.92 GH/s   30.00 s
+FUSED end-to-end                   7.48 MH/s   30.50 s
+```
+
+The end-to-end rate is the **production scan rate**. Per-stage rates are reported in isolation: SHA-256, hash160, and bloom probe all run at hundreds of millions to multiple billions of checks per second on this card. The secp256k1 scalar multiply standalone rate (~1 MH/s) is the per-stage cost of the EC kernel run in isolation; inside the fused kernel the inlined arithmetic and the SHA + RIPEMD + bloom probe pipelined across the same threads yields the ~7.5 MH/s end-to-end figure. The EC stage remains the dominant pipeline cost and is what the v1.5.0 crypto pipeline rewrite targets (32-bit limb PTX arithmetic, GLV decomposition).
+
+Expected ranges by GPU generation: **tens to hundreds of millions of passphrase checks per second on Ampere through Blackwell GPUs under representative workloads**, scaling roughly with SM count and clock. Run the benchmark on your own card before planning a scan window. Numbers vary 2 to 3x across the supported architectures and a further 30 to 50% with driver version.
+
+Reproduce on your hardware:
+
+```bash
+./collider --benchmark --benchmark-time 30
+# OR for the standalone driver with stage-by-stage tables:
+./bench_gpu_pipeline --time 30 --gpu 0
+```
+
+The reported rate **is** the rate the brain-wallet runner achieves in production. Do not extrapolate; run the benchmark.
 
 ### Generators that are smarter than dumb enumeration
 
@@ -82,44 +99,23 @@ You do not want to enumerate every 12-character string. There are too many. Pro 
 - **Markov chains**: character-level transition models trained on human-readable passphrases. Outputs that look like words, not random gibberish.
 - **Hashcat-style rule engine**: take any wordlist (`rockyou.txt`, the Wikipedia corpus, your own custom list) and mutate it into **billions** of candidates via 200+ standard rules (case, leetspeak, append digits, prepend symbols, reverse, duplicate, capitalize-every-Nth, etc.).
 
-`rockyou.txt` is 14 million words. `rockyou.txt × best64.rule` is roughly 9 billion candidates. Pro can rip through it in hours on a single 4090.
-
----
-
-## Weak-PRNG sweeps: catch the next Milk Sad
-
-Every few years a popular wallet ships with a broken random-number generator and quietly drains user funds for months before anyone notices. The disclosures hit, the scanners come out, and the long tail of wallets that nobody noticed gets emptied. Some never do.
-
-Pro's **v2 multi-scheme kernel** scans for keys generated by historically-broken generators. Each candidate seed is dispatched through every known vulnerable scheme in a single GPU pass:
-
-| Scheme                  | CVE / Disclosure  | Notes                                                |
-| ----------------------- | ----------------- | ---------------------------------------------------- |
-| **libbitcoin Milk Sad** | CVE-2023-39910    | 32-bit entropy bug, 2014 to 2017. Millions affected. |
-| **Profanity / 1inch**   | CVE-2022-40769    | Predictable vanity-address seed.                     |
-| **Trust Wallet**        | 2018 to 2022      | Documented weak-entropy derivation paths.            |
-| **glibc PRNG**          | Various           | Known seed ranges, cheap to enumerate.               |
-| **MSVC rand()**         | Various           | Predictable seed pattern on Windows.                 |
-| **Java SecureRandom**   | Pre-Java 8 issues | Documented predictability on early Android.          |
-
-Five Bitcoin address types (P2PKH, P2SH, P2WPKH, P2WSH, P2TR) get derived from every candidate seed. Eight scheme variants. **Every derived address checked against the same 100M+ funded-address bloom.** One GPU pass per seed.
-
-This is the kind of attack surface that paid private tools have charged $5000/year for. Pro ships it.
+`rockyou.txt` is 14 million words. `rockyou.txt × best64.rule` is roughly 9 billion candidates. At the measured rate on an RTX 3060 a full pass through `rockyou.txt × best64.rule` takes well over a day; on Ada/Blackwell-class silicon the rule-engine output rate grows in proportion to the per-card MH/s figure above. Measure your card, then plan your scan window.
 
 ---
 
 ## The secret weapon: the 100M+ funded-address bloom
 
-The opportunistic check, the brain-wallet pipeline, the weak-PRNG sweeps — all three sit on top of a single foundational dataset: **every Bitcoin address that has ever held a non-zero balance.**
+The opportunistic check and the brain-wallet pipeline both sit on top of a single foundational dataset: **every Bitcoin address that has ever held a non-zero balance.**
 
-Pro ships with `funded_addresses.blf`, a 142 MB GPU-resident bloom filter built from:
+Pro ships with `funded_addresses.blf`, a GPU-resident bloom filter built from:
 
 - Every output address on every transaction on the Bitcoin blockchain.
-- All five address types: P2PKH, P2SH, P2WPKH, P2WSH, P2TR.
+- Three distinct H160 derivation paths per candidate pubkey: **compressed P2PKH** (which shares its H160 with **P2WPKH / BIP-84**), **uncompressed P2PKH**, and **P2SH-P2WPKH / BIP-49**. P2TR (BIP-86) requires a separate tweak-add EC computation and is in flight for a future release.
 - Built fresh against recent UTXO snapshots; updates ship with each Pro release.
 
-False positive rate at the shipped capacity: roughly **1 in 1 billion**. False negatives: zero by construction. Every bloom-positive hit triggers a definitive CPU-side check against the full address set, so spurious hits never produce false alarms in `bloom_hits.txt`.
+False positive rate at the shipped capacity: roughly **1 in 1 billion**. False negatives: zero by construction. Every bloom-positive hit triggers a definitive CPU-side check against the full address set, so spurious bloom positives never produce false alarms in your hits log.
 
-The bloom is structured for **GPU-resident queries**: bit array on device memory, xxHash64 lookups per candidate, no CPU round-trip per check. That is what makes the opportunistic scanning during kangaroo work essentially free; queries happen at memory-bandwidth speed inside the same kernel that computed the address.
+The bloom is structured for **GPU-resident queries**: bit array on device memory, MurmurHash3-128 double-hashing per candidate, no CPU round-trip per check. Queries happen at memory-bandwidth speed inside the same kernel that computed the H160.
 
 Build your own bloom from a custom address list with `build_bloom` (ships in `tools/`).
 
@@ -132,14 +128,13 @@ Build your own bloom from a custom address list with `build_bloom` (ships in `to
 | Solve puzzle 71 to 135 (kangaroo, brute force, pool)  | Yes        | Yes            |
 | **Opportunistic bloom scan during pool / standalone** | **No**     | **Yes**        |
 | **Dedicated brain-wallet mode (PCFG, Markov, rules)** | **No**     | **Yes**        |
-| **Weak-PRNG sweeps (v2 multi-scheme kernel)**         | **No**     | **Yes**        |
 | **100M+ funded-address bloom filter (shipped)**       | **No**     | **Yes**        |
-| **Real-time hit logging to `bloom_hits.txt`**         | **No**     | **Yes**        |
-| All five Bitcoin address types in derivation          | Limited    | Yes            |
+| **Real-time hit logging**                             | **No**     | **Yes**        |
+| Multi-address derivation (3 H160 paths per pubkey)    | Limited    | Yes            |
 | Hashcat-style rule engine (GPU)                       | No         | Yes            |
 | License                                               | MIT (Free) | Commercial Pro |
 
-Pro is the same binary you already run. Features unlock when a valid Ed25519-signed license key is present. The license verifies **offline** (the public key and license slot are embedded in the binary at build time). Once activated, your interactive UI gains the brain-wallet and weak-PRNG modes; pool and puzzle mode silently enable the opportunistic bloom scan; everything else behaves identically to Free.
+Pro is the same binary you already run. Features unlock when a valid HMAC-SHA256-signed license key is present. The license verifies **offline** (the shared key and license slot are embedded in the binary at build time). Once activated, your interactive UI gains the brain-wallet mode; pool and puzzle modes silently enable the opportunistic bloom scan; everything else behaves identically to Free.
 
 ---
 
@@ -159,29 +154,27 @@ Once the pool client connects, the banner reads:
 [*] Bloom filter loaded - opportunistic address checking enabled
 ```
 
-From that moment, every DP your GPU produces also gets its address checked. Hits log to `bloom_hits.txt` in the working directory. You can `tail -f bloom_hits.txt` in another terminal and walk away.
+From that moment, every DP your GPU produces also gets its pubkey turned into H160 and probed. Hits log to your configured hits file. You can tail it in another terminal and walk away.
 
 ### Dedicated brain-wallet mode
 
-```bash
-./collider_pro --brainwallet \
-               --wordlist rockyou.txt \
-               --rules rules/best64.rule \
-               --bloom funded_addresses.blf
-```
-
-This is pure scanner mode. No puzzle work. Every passphrase from `rockyou.txt`, mutated through `best64.rule`, hashed to a Bitcoin address, checked against the bloom. 9 billion candidates on `rockyou × best64`. Hours, not days, on a 4090.
-
-### v2 weak-PRNG sweep
+Brain-wallet mode is configured through the **setup wizard** plus `config.yml`, not via CLI flags. The setup wizard walks you through choosing wordlists, dedup behavior, PCFG training, and where to write hits.
 
 ```bash
-./collider_pro --puzzle-only-v2 \
-               --schemes all \
-               --addr-types puzzle_only \
-               --bloom funded_addresses.blf
+# First run: configure wordlists, dedup, PCFG, hit log path
+./collider_pro --brainwallet-setup
+
+# Subsequent runs: scan
+./collider_pro --brainwallet --bloom funded_addresses.blf
 ```
 
-Scans every supported broken-PRNG scheme across the supported seed ranges, against every Bitcoin address type, with the bloom filter as the result gate.
+The setup wizard writes its decisions into `config.yml` (see [CONFIGURATION.md](CONFIGURATION.md) for the schema). Wordlists, rule files, generators, dedup, and hit log all live in that file. You can also enable v1.4.2's multi-address derivation explicitly:
+
+```bash
+./collider_pro --brainwallet-v2 --bloom funded_addresses.blf
+```
+
+`--brainwallet-v2` probes every pubkey against all three H160 paths (compressed P2PKH, uncompressed P2PKH, P2SH-P2WPKH/BIP-49) inside the fused kernel.
 
 ---
 
@@ -189,23 +182,23 @@ Scans every supported broken-PRNG scheme across the supported seed ranges, again
 
 Pro licenses are tier-priced by use case. See [collisionprotocol.com/pro](https://collisionprotocol.com/pro) for current pricing, terms, and license keys.
 
-Every license is delivered as an Ed25519-signed key file. Activation is offline. No phone-home, no telemetry, no per-run server check. The license file lives next to the binary; the binary verifies the signature against the embedded public key.
+Every license is delivered as a key string. On first activation the binary POSTs the key once over TLS to the issuer's license endpoint, receives a signed validation record, and caches it locally at `~/.collider/license.cache` (HMAC-SHA256 over the cache contents against an embedded shared key). Subsequent runs verify the cache HMAC offline; the cache is refreshed against the issuer endpoint after a 24-hour TTL. There is no per-run server check inside that 24-hour window, no usage telemetry, and no per-DP or per-solve reporting. If you need a fully air-gapped deployment, contact the issuer for an offline-validation license (separate product).
 
 ---
 
 ## FAQ
 
-**Q: Is the opportunistic scan really free? It cannot be free.**
+**Q: Is the opportunistic scan really free?**
 
-A: It is essentially free. The GPU is already computing the pubkey and hashing it to derive the DP for the pool. The H160 derivation is one extra RIPEMD-160 pass (which is cheap relative to the secp256k1 group operation that dominates the kernel). The bloom query is a few memory reads. Empirically, enabling the opportunistic scan costs roughly 1 to 3 percent of overall GPU throughput. You give up 1 to 3 percent of your puzzle-135 odds in exchange for an entirely separate lottery against 100 million funded addresses. The math is clearly favorable.
+A: It is cheap, not zero. The GPU still does the same kernel pass it would do in Free. The added cost is on the CPU: each distinguished point's pubkey gets one extra SHA-256 + RIPEMD-160 + bloom probe (and, with `--brainwallet-v2` enabled, two extra per-pubkey hashes for the uncompressed P2PKH and P2SH-P2WPKH paths). Empirically that costs a few percent of overall pool throughput on a 4090. You give up a few percent of your puzzle-135 odds in exchange for a separate scan against 100 million funded addresses on every DP your GPU produces. The math is clearly favorable.
 
 **Q: What is the probability of an opportunistic hit?**
 
-A: Astronomically low on any given key. Bitcoin's keyspace is 2^256; the funded-address set is roughly 2^27. The probability of any random key happening to produce an H160 in the funded set is roughly 1 in 2^229. But you are computing trillions of keys per day per machine. If you mine for a year, you compute somewhere around 2^57 to 2^60 keys (rough estimate; depends on hardware and uptime). The expected number of hits per year on a single machine is still vanishingly small. **The point is not "you will probably find one." The point is "the marginal cost of looking is zero, so you might as well look."**
+A: Astronomically low on any given key. Bitcoin's keyspace is 2^256; the funded-address set is roughly 2^27. The probability of any random key happening to produce an H160 in the funded set is roughly 1 in 2^229. But you are computing trillions of keys per day per machine. If you mine for a year, you compute somewhere around 2^57 to 2^60 keys (rough estimate; depends on hardware and uptime). The expected number of hits per year on a single machine is still vanishingly small. **The point is not "you will probably find one." The point is "the marginal cost of looking is small, so you might as well look."**
 
 **Q: What happens if I do find a hit?**
 
-A: Pro writes the candidate to `bloom_hits.txt` with the H160, the candidate private key (in hex), and the timestamp. **Pro never spends the funds automatically.** You verify the hit manually (check the address on a block explorer; sweep the funds with a wallet you control if it is non-zero). Spending found funds is a separate workflow Pro does not touch; that is on purpose, because hits can be your own test addresses, dust, or honeypots.
+A: Pro writes the candidate to your configured hits log with the H160, the candidate private key (in hex), and the timestamp. **Pro never spends the funds automatically.** You verify the hit manually (check the address on a block explorer; sweep the funds with a wallet you control if it is non-zero). Spending found funds is a separate workflow Pro does not touch; that is on purpose, because hits can be your own test addresses, dust, or honeypots.
 
 **Q: Is this legal?**
 
@@ -225,7 +218,7 @@ A: Pro ships the same telemetry as Free (DP rate, accepted-by-pool counter, bloo
 
 Head to [collisionprotocol.com/pro](https://collisionprotocol.com/pro).
 
-Pick a tier. Pay. Receive your Ed25519-signed license file by email. Drop it next to your `collider_pro` binary. The next run unlocks Pro features and prints your license fingerprint at startup.
+Pick a tier. Pay. Receive your HMAC-SHA256-signed license file by email. Drop it next to your `collider_pro` binary. The next run unlocks Pro features and prints your license fingerprint at startup.
 
 You bought the hardware. You pay the power bill. **Pro makes sure every key you compute is doing as much work for you as it can.**
 
@@ -235,6 +228,6 @@ You bought the hardware. You pay the power bill. **Pro makes sure every key you 
 
 - [Back to README](../README.md) — overview and quick-start.
 - [POOL.md](POOL.md) — pool mode, share-of-pool accrual, picking a worker address.
-- [CONFIGURATION.md](CONFIGURATION.md) — `config.yml` schema, including the `bloom:` block.
-- [ARCHITECTURE.md](ARCHITECTURE.md) — source-tree map; the Pro pipeline lives in `src/gpu/mega_fused_kernel.cu` and `src/gpu/rckangaroo_wrapper.cu` (opportunistic path).
+- [CONFIGURATION.md](CONFIGURATION.md) — `config.yml` schema, including the `bloom:` and brain-wallet blocks.
+- [ARCHITECTURE.md](ARCHITECTURE.md) — source-tree map; the Pro brain-wallet pipeline lives in `src/gpu/fused_pipeline.cu` and `src/gpu/mega_fused_kernel.cu` (rule-engine fast path).
 - [collisionprotocol.com/pro](https://collisionprotocol.com/pro) — buy a license.

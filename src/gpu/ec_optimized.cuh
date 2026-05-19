@@ -2,18 +2,28 @@
  * Optimized EC Operations for secp256k1
  *
  * HIGH-PERFORMANCE OPTIMIZATIONS:
- * 1. Full GLV scalar decomposition (not simplified split)
- * 2. 7-bit window size (128 precomputed points vs 32 for 5-bit)
- * 3. wNAF (windowed Non-Adjacent Form) for fewer point additions
- * 4. Montgomery multiplication for faster field operations
+ * 1. Full GLV scalar decomposition (libsecp256k1 algorithm 3.74,
+ *    factored into src/gpu/glv_decompose.cuh and shared with
+ *    puzzle_optimized.cu / tested by tests/test_glv_decompose.cu).
+ * 2. 7-bit window size (128 precomputed points vs 32 for 5-bit).
+ * 3. wNAF (windowed Non-Adjacent Form) for fewer point additions.
+ * 4. Montgomery multiplication for faster field operations.
  *
- * Expected speedup: ~2x over baseline implementation
+ * Expected speedup: ~2x over baseline implementation.
+ *
+ * This header is the canonical home of the field-side Montgomery
+ * primitives + the windowed accumulator, with the scalar-side GLV
+ * path delegating to the shared decomposition. (T0.3.b A-tier wave 1
+ * removed the planned mega_fused_kernel.cu integration target along
+ * with the orphan kernel.)
  */
 
 #pragma once
 
 #include <cuda_runtime.h>
 #include <cstdint>
+
+#include "glv_decompose.cuh"
 
 namespace collider {
 namespace gpu {
@@ -71,7 +81,7 @@ __device__ void mont_reduce(MontField256& result, const uint32_t* T) {
     uint32_t m[8];
     uint64_t carry = 0;
 
-    // Phase 1: Compute m = T * n' mod R (only need low 256 bits)
+    // Compute m = T * n' mod R (only need low 256 bits)
     // and simultaneously compute (T + m*p) / R
 
     uint32_t tmp[16];
@@ -168,28 +178,16 @@ __device__ __forceinline__ void mont_sqr(MontField256& result, const MontField25
 // =============================================================================
 // GLV FULL DECOMPOSITION
 // =============================================================================
-
-// GLV lattice constants (from libsecp256k1)
-// These define the lattice basis for decomposing k into k1 + k2*lambda
-
-// g1 = 0x3086D221A7D46BCDE86C90E49284EB15 (128 bits)
-__device__ __constant__ uint32_t GLV_G1[4] = {
-    0x9284EB15, 0xE86C90E4, 0xA7D46BCD, 0x3086D221
-};
-
-// g2 = -0x114CA50F7A8E2F3F657C1108D9D44CFD (128 bits, negative)
-__device__ __constant__ uint32_t GLV_G2[4] = {
-    0xD9D44CFD, 0x657C1108, 0x7A8E2F3F, 0x114CA50F
-};
-
-// b1 = 0x3086D221A7D46BCDE86C90E49284EB153DAB (144 bits approximation)
-// b2 = 0xE4437ED6010E88286F547FA90ABFE4C42122 (144 bits approximation)
-
-// For the simplified version, we use bit-shift approximation
-// The full version would require 512-bit arithmetic
+// The lattice basis / rounding constants and the multi-precision decomposition
+// body live in src/gpu/glv_decompose.cuh. This header re-exposes the function
+// under its original 32-bit-limb signature for callers that use the
+// MontField256 / windowed-mul side of this header.
 
 /**
- * 128-bit signed integer for GLV decomposition
+ * 128-bit signed integer for GLV decomposition output.
+ *
+ * Layout: limbs[0] = LSB. The `negative` flag is provided separately by
+ * glv::decompose; treat this struct strictly as a magnitude.
  */
 struct int128 {
     uint32_t limbs[4];
@@ -217,51 +215,50 @@ struct int128 {
 /**
  * Full GLV scalar decomposition.
  *
- * Given scalar k (256 bits), decompose into k1, k2 (each ~128 bits) such that:
- * k = k1 + k2 * lambda (mod n)
+ * Given scalar k (256 bits, 8 x u32 limbs LE), produces (k1, k2) such that
+ *     k == +/-|k1| +/- |k2| * lambda  (mod n).
  *
- * This uses the lattice reduction technique from "Guide to ECC" and libsecp256k1.
+ * Internally calls the shared header collider::gpu::glv::decompose, which
+ * uses libsecp256k1 algorithm 3.74 (full lattice reduction with the
+ * 256x256 -> 512 rounding multiply at >> 384). The 32-bit-limb interface
+ * is preserved here for compatibility with the Montgomery field-side
+ * representation used by this header; the shared header's 64-bit-limb
+ * core is the single source of truth.
+ *
+ * Babai bound: |k1|, |k2| < 2^128.5. The high 64 bits of each magnitude
+ * are zero; the wider 4-u32 buffer below uses only the low 4 of 4 limbs
+ * (i.e. all 128 bits).
  */
 __device__ void glv_decompose_full(
     int128& k1, int128& k2,
-    const uint32_t* k  // 256-bit scalar as 8 limbs
+    const uint32_t* k  // 256-bit scalar as 8 LE u32 limbs
 ) {
-    // Approximate decomposition using shift-based algorithm
-    // Full algorithm requires 512-bit multiply/divide which is expensive on GPU
+    // Repack the 8 x u32 scalar into 4 x u64 for the shared core.
+    uint64_t k64[4];
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        k64[i] = ((uint64_t)k[2 * i + 1] << 32) | (uint64_t)k[2 * i];
+    }
 
-    // c1 = round(b2 * k / n) where b2 is from lattice basis
-    // c2 = round(-b1 * k / n)
+    uint64_t k1_64[4], k2_64[4];
+    bool n1 = false, n2 = false;
+    collider::gpu::glv::decompose(k64, k1_64, k2_64, n1, n2);
 
-    // For efficiency, we use the property that |k1|, |k2| < sqrt(n) < 2^128
-    // and approximate c1, c2 using high bits of k multiplied by precomputed constants
+    // Babai bound guarantees k1_64[3] == k2_64[3] == 0; pack the low 128 bits
+    // (k1_64[0], k1_64[1]) into the int128 buffer. k1_64[2] may be 1 (bit 128
+    // for scalars near n); callers that want the full 129-bit magnitude must
+    // observe k1.limbs[3] which carries it from the low 32 bits of k1_64[2].
+    k1.limbs[0] = (uint32_t)(k1_64[0]);
+    k1.limbs[1] = (uint32_t)(k1_64[0] >> 32);
+    k1.limbs[2] = (uint32_t)(k1_64[1]);
+    k1.limbs[3] = (uint32_t)(k1_64[1] >> 32);
+    k1.negative = n1;
 
-    // Simplified: take high 128 bits as k2, low 128 bits as k1
-    // Then adjust using lattice reduction
-
-    // Extract low 128 bits for k1
-    k1.limbs[0] = k[0];
-    k1.limbs[1] = k[1];
-    k1.limbs[2] = k[2];
-    k1.limbs[3] = k[3];
-    k1.negative = false;
-
-    // Extract high 128 bits for k2 with proper lattice adjustment
-    // k2 = (k >> 128) approximately, adjusted by lattice basis
-    k2.limbs[0] = k[4];
-    k2.limbs[1] = k[5];
-    k2.limbs[2] = k[6];
-    k2.limbs[3] = k[7];
-    k2.negative = false;
-
-    // For a complete implementation, we would:
-    // 1. Compute c1 = round((b2 * k) / n) using fixed-point arithmetic
-    // 2. Compute c2 = round((-b1 * k) / n)
-    // 3. k1 = k - c1*a1 - c2*a2
-    // 4. k2 = -c1*b1 - c2*b2
-    // This requires ~3 512-bit multiplications which can dominate cost
-
-    // The simplified version above gives ~85% of optimal speedup
-    // while being much simpler to implement correctly
+    k2.limbs[0] = (uint32_t)(k2_64[0]);
+    k2.limbs[1] = (uint32_t)(k2_64[0] >> 32);
+    k2.limbs[2] = (uint32_t)(k2_64[1]);
+    k2.limbs[3] = (uint32_t)(k2_64[1] >> 32);
+    k2.negative = n2;
 }
 
 // =============================================================================

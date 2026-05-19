@@ -348,6 +348,9 @@ public:
     // Configuration
     uint32_t dp_bits = 20;  // Distinguished point: trailing zeros in X coordinate
     uint64_t max_steps = 0;  // 0 = no limit (use expected steps)
+    // Per-instance stop flag. v1.4.2 R-B12 audit confirmed this is NOT
+    // a global. Two solver instances do not share state and a stop on
+    // one does not poison the other.
     std::atomic<bool> stop_flag{false};
 
     // Progress callback: (tame_steps, wild_steps, dp_count, keys_per_sec) -> continue?
@@ -355,6 +358,15 @@ public:
         std::function<bool(uint64_t, uint64_t, uint64_t, double)>;
     using DpCallback =
         std::function<void(const cpu::uint256_t&, const cpu::uint256_t&, bool)>;
+    // Fast-path "should I keep going?" hook polled by the worker
+    // threads every kShouldContinuePollInterval steps. v1.4.2 R-B11:
+    // the only pre-existing shutdown signal was the progress callback
+    // returning false, which only runs from the monitor thread at 1 Hz.
+    // That left a worker thread mid-loop for up to ~1s after a Ctrl+C,
+    // wasting tens of millions of EC ops per worker per shutdown. This
+    // hook is the per-thread escape hatch. Returning false sets
+    // stop_flag and exits the worker loop on the next poll.
+    using ShouldContinueCallback = std::function<bool()>;
 
     // Set the progress callback. Stored under callback_mutex_; safe to
     // change between solve() invocations. Setting during a live solve()
@@ -372,6 +384,14 @@ public:
     void set_dp_callback(DpCallback cb) {
         std::lock_guard<std::mutex> lk(callback_mutex_);
         dp_callback_ = std::move(cb);
+    }
+
+    // Set the should-continue callback (R-B11). Workers poll this every
+    // kShouldContinuePollInterval steps; returning false trips stop_flag
+    // and exits the loop within ~10ms instead of ~1s (monitor cadence).
+    void set_should_continue_callback(ShouldContinueCallback cb) {
+        std::lock_guard<std::mutex> lk(callback_mutex_);
+        should_continue_callback_ = std::move(cb);
     }
 
     /**
@@ -578,9 +598,16 @@ private:
     // mutex so an in-flight callback isn't replaced mid-call. The
     // mutex is mutable so the snapshot helpers can lock it from const
     // context if needed.
-    mutable std::mutex callback_mutex_;
-    ProgressCallback   progress_callback_;
-    DpCallback         dp_callback_;
+    mutable std::mutex     callback_mutex_;
+    ProgressCallback       progress_callback_;
+    DpCallback             dp_callback_;
+    ShouldContinueCallback should_continue_callback_;
+
+    // Poll interval (in kangaroo steps) for the should-continue hook.
+    // 10k steps is ~10ms of CPU kangaroo on a modern core, which keeps
+    // shutdown latency low without measurably perturbing throughput
+    // (the callback is one atomic-bool load when nothing's pending).
+    static constexpr uint64_t kShouldContinuePollInterval = 10000;
 
     // Snapshot helpers used by the worker hot paths. Returning the
     // function by value (cheap empty-or-target std::function) is fine
@@ -595,6 +622,10 @@ private:
     DpCallback snapshot_dp_callback() const {
         std::lock_guard<std::mutex> lk(callback_mutex_);
         return dp_callback_;
+    }
+    ShouldContinueCallback snapshot_should_continue_callback() const {
+        std::lock_guard<std::mutex> lk(callback_mutex_);
+        return should_continue_callback_;
     }
 
     /**
@@ -722,6 +753,13 @@ private:
         // only want to take it once per thread, not per DP -- the hot
         // path runs millions of iterations per second.
         const DpCallback dp_cb = snapshot_dp_callback();
+        // per-thread should-continue probe. Polled every
+        // kShouldContinuePollInterval steps so a Ctrl+C / pool
+        // disconnect propagates to the worker within ~10ms instead of
+        // waiting for the next 1Hz progress callback to flip stop_flag.
+        const ShouldContinueCallback should_continue_cb =
+            snapshot_should_continue_callback();
+        uint64_t steps_since_poll = 0;
 
         // Initialize tame kangaroo at range midpoint + small offset for this thread
         Kangaroo tame;
@@ -768,6 +806,21 @@ private:
 
         // Main loop
         while (!stop_flag.load() && !solution_found_.load()) {
+            // cheap shutdown probe. The atomic stop_flag
+            // is checked every iteration already; this extra hook lets
+            // the host (pool driver / SIGINT handler) signal stop
+            // without having to take the callback mutex from the
+            // monitor at 1Hz. Two-deep cost: a counter increment and
+            // (every 10k steps) one std::function call returning a
+            // bool. Negligible against the EC-multiply hot path.
+            if (++steps_since_poll >= kShouldContinuePollInterval) {
+                steps_since_poll = 0;
+                if (should_continue_cb && !should_continue_cb()) {
+                    stop_flag.store(true);
+                    return;
+                }
+            }
+
             // Step tame kangaroo
             step_kangaroo(tame);
             total_steps_.fetch_add(1);
@@ -883,6 +936,18 @@ private:
         std::random_device rd;
         std::mt19937_64 rng(rd() + thread_id);
 
+        // snapshot the DP callback once per thread, same
+        // pattern as thread_worker_standard. Pre-1.4.2 this worker
+        // never emitted DPs at all, which made the H160-target path
+        // unusable in pool mode (no DPs flowed back to the server) and
+        // also blocked solo H160 puzzles from contributing to the
+        // local dp_table_'s collision check. Mirrors line ~724.
+        const DpCallback dp_cb = snapshot_dp_callback();
+        // same fast-shutdown hook as the standard worker.
+        const ShouldContinueCallback should_continue_cb =
+            snapshot_should_continue_callback();
+        uint64_t steps_since_poll = 0;
+
         // Start at random position in range
         cpu::uint256_t position;
         for (int j = 0; j < 4; j++) {
@@ -912,6 +977,16 @@ private:
         uint8_t privkey_bytes[32];
 
         while (!stop_flag.load() && !solution_found_.load()) {
+            // fast-shutdown probe. See standard worker
+            // for rationale.
+            if (++steps_since_poll >= kShouldContinuePollInterval) {
+                steps_since_poll = 0;
+                if (should_continue_cb && !should_continue_cb()) {
+                    stop_flag.store(true);
+                    return;
+                }
+            }
+
             // Convert position to bytes
             for (int j = 0; j < 4; j++) {
                 uint64_t val = position.d[3 - j];
@@ -928,6 +1003,21 @@ private:
             // Compute hash160
             auto h160 = cpu::compute_hash160(privkey_bytes);
             total_steps_.fetch_add(1);
+
+            // H160-mode DP emission. The H160 worker does
+            // not have a pubkey X coordinate to test (no EC mul), so
+            // the DP signal is taken on `position` itself. The
+            // distinguishing trailing-zero predicate on the candidate
+            // privkey. The standard worker emits DPs on every DP-of-X
+            // hit (line ~785); we mirror that with `position` standing
+            // in for both x and distance, and flag as tame (the H160
+            // path has no tame/wild distinction). Latent until the
+            // pool grows H160-target work types, but pinned here so a
+            // future pool wire change does not silently produce zero
+            // DPs from the CPU H160 worker.
+            if (dp_cb && is_distinguished(position)) {
+                dp_cb(position, position, /*is_tame=*/true);
+            }
 
             // Check for match
             if (h160 == target_h160_) {

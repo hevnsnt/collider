@@ -1,5 +1,5 @@
 /**
- * Brain Wallet v2 — unit tests.
+ * Brain Wallet v2: unit tests.
  *
  * Plain-assert style to match the rest of tests/ (test_rule_engine,
  * test_priority_queue, etc.). No external test framework required.
@@ -34,7 +34,7 @@
 using namespace collider::gpu::v2;
 
 // ---------------------------------------------------------------------------
-// CPU SHA-256 reference (self-contained -- avoid forcing the test to depend
+// CPU SHA-256 reference (self-contained; avoid forcing the test to depend
 // on OpenSSL build-time availability).
 // ---------------------------------------------------------------------------
 namespace cpu_sha256_ref {
@@ -223,17 +223,25 @@ static int test_make_puzzle_target_n160() {
 }
 
 static int test_scheme_bit_constants() {
+    // SCHEME_MASK_ALL derived from SCHEME_COUNT in the header so this test
+    // survives future scheme additions (this work expanded the enum from 8 to
+    // 16 entries and a hardcoded 0xFFu broke this assertion).
+    const uint32_t expected_all =
+        (1u << static_cast<uint8_t>(DerivationScheme::SCHEME_COUNT)) - 1u;
     bool ok = (scheme_bit(DerivationScheme::SHA256_PW) == 1u)
            && (scheme_bit(DerivationScheme::SHA256_SHA256_PW) == 2u)
            && (SCHEME_MASK_STOCK == 1u)
-           && (SCHEME_MASK_ALL == 0xFFu);
+           && (SCHEME_MASK_ALL == expected_all);
     return report_status("scheme_bit and SCHEME_MASK_* constants", ok);
 }
 
 static int test_addr_bit_constants() {
+    // ADDR_COUNT grew from 5 to 6 in task F (added
+    // AddressType::ETHEREUM = 5), so ADDR_MASK_ALL is now (1<<6)-1.
     bool ok = (addr_bit(AddressType::P2PKH_UNCOMPRESSED) == 1u)
            && (addr_bit(AddressType::P2TR_BIP86) == (1u << 4))
-           && (ADDR_MASK_ALL == 0x1Fu);
+           && (addr_bit(AddressType::ETHEREUM)   == (1u << 5))
+           && (ADDR_MASK_ALL == 0x3Fu);
     return report_status("addr_bit and ADDR_MASK_* constants", ok);
 }
 

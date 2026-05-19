@@ -172,12 +172,9 @@ struct PuzzleInfo {
     }
 
     // Total keys in range: 2^(N-1).
-    //
     // Algebraic identity: for puzzle N the range is the inclusive
     // interval [2^(N-1), 2^N - 1], whose size is
-    //
     //     2^N - 1 - 2^(N-1) + 1 = 2^(N-1)
-    //
     // which is exactly range_start(). So returning range_start() is
     // correct for ALL canonical Bitcoin puzzles -- it is NOT a bug.
     // (Audited 2026-05-09: confirmed alongside the related

@@ -14,6 +14,9 @@
 #include <functional>
 #include <mutex>
 #include <condition_variable>
+#include <unordered_map>
+#include <string>
+#include <limits>
 
 namespace collider {
 namespace pool {
@@ -66,8 +69,25 @@ public:
     void submit_dp(const DistinguishedPoint& dp);
 
     // Statistics
-    PoolStats get_stats() const;
-    uint64_t get_submitted_count() const { return submitted_count_.load(); }
+    PoolStatsLocal get_stats() const;
+
+    // pre-fix `submitted_count_` was bumped on enqueue,
+    // not on actual wire send. DPs enqueued before AUTH_OK or refused
+    // by the JLP client's queue-full backpressure were counted as
+    // "submitted" even though they never hit the network. We now keep
+    // two counters and expose both:
+    //   enqueued_count_ = DPs accepted by submit_dp() and pushed into
+    //                     the JLP client's bounded queue.
+    //   sent_count_     = DPs that left the wire as part of a
+    //                     DP_BATCH_V2 the server acknowledged with
+    //                     a successful send.
+    // Pre-v1.4.2-quality there was a third method, get_submitted_count(),
+    // that aliased get_enqueued_count() for backward compatibility. It
+    // was deleted in R-Q3c because the name kept misleading callers into
+    // using it for "sent on wire" metrics; the two existing meaningful
+    // counters (enqueued, sent) are the only API.
+    uint64_t get_enqueued_count() const { return enqueued_count_.load(); }
+    uint64_t get_sent_count() const { return sent_count_.load(); }
 
     // Returns the count of DPs the manager refused to forward to the
     // pool: queue-full backpressure from the JLP client or attempts to
@@ -100,10 +120,36 @@ private:
     PoolConfig config_;
     std::unique_ptr<PoolClient> client_;
     std::atomic<bool> connected_;
-    std::atomic<uint64_t> submitted_count_;
+    // split counters.
+    std::atomic<uint64_t> enqueued_count_{0};
+    std::atomic<uint64_t> sent_count_{0};
     std::atomic<uint64_t> dropped_count_{0};
     std::chrono::steady_clock::time_point start_time_;
     SolutionFoundCallback solution_callback_;
+
+    // PoolManager owns the per-(worker, work_id) DP
+    // sequence counter so a supervisor-driven reconnect that recreates
+    // the JLPPoolClient does NOT reset the counter to 0 and trip the
+    // server's _dp_seq_high replay-defence watermark. Key format is
+    // "worker_name|work_id" so a different worker (e.g. an operator
+    // switches payout addresses mid-session) gets a fresh counter.
+    // Persisted to ~/.collider/pool_dp_seq.dat on disconnect; loaded
+    // on construction.
+    mutable std::mutex dp_seq_mutex_;
+    std::unordered_map<std::string, uint32_t> dp_seq_map_;
+    void load_dp_seq_map();
+    void persist_dp_seq_map() const;
+    std::string dp_seq_key(uint64_t work_id) const;  // uses config_.worker_name
+    uint32_t get_or_create_dp_seq(uint64_t work_id);
+    void update_dp_seq(uint64_t work_id, uint32_t next_seq);
+    void reset_dp_seq(uint64_t work_id);
+    void wire_client_callbacks(JLPPoolClient* jlp);  // helper for connect / reconnect
+
+    // WORK_ASN dedup state lives at the manager level
+    // because it survives client recreation across reconnects. The
+    // wire-level callback always fires; the manager filters duplicates
+    // before surfacing to the host.
+    std::atomic<uint64_t> last_work_id_seen_{std::numeric_limits<uint64_t>::max()};
 
     // Current work. dp_bits is also exposed via an atomic snapshot
     // (current_dp_bits_) so dp_callback_hook can read it without

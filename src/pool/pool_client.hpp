@@ -35,15 +35,28 @@ struct WorkAssignment {
     std::string puzzle_name; // e.g., "Puzzle #135"
 };
 
-// Pool statistics. Wire format from server STATS_RSP (36 bytes, '<QIIffQI'):
+// In-process pool statistics surfaced to the host (UI, progress display,
+// session summary). Field layout matches the wire format from server
+// STATS_RSP (36 bytes, '<QIIffQI':
 //   total_dps:u64, total_workers:u32, active_workers:u32,
-//   dps_per_second:f32, your_share:f32, your_dps:u64, uptime_seconds:u32
+//   dps_per_second:f32, your_share:f32, your_dps:u64, uptime_seconds:u32)
+// plus three host-only legacy alias fields that the wire struct never
+// carries.
+//
+// IMPORTANT: this is NOT the wire type. The strictly-packed 36-byte wire
+// struct is collider::pool::jlp_wire::PoolStats (jlp_wire_generated.hpp,
+// auto-generated from protocol/jlp.yaml; the codegen owns its identifier).
+// Two structs with the same simple name living in different namespaces was a
+// known foot-gun (R-Q3b audit); this one is renamed to PoolStatsLocal to
+// make the local-vs-wire distinction explicit in every reference, even when
+// the surrounding code already had `using namespace collider::pool;`
+// pulled in.
 //
 // `your_dps` is server-aggregated across ALL connections sharing the same
 // worker name (= Bitcoin payout address) -- so a user running on Mac +
 // Windows + Linux with the same address sees a unified per-worker total
 // rather than per-machine subtotals.
-struct PoolStats {
+struct PoolStatsLocal {
     uint64_t total_dps;           // Total DPs in pool (all workers, all time)
     uint32_t total_workers;       // Total registered workers (all-time)
     uint32_t active_workers;      // Currently connected workers
@@ -78,7 +91,7 @@ public:
     virtual bool submit_dps(const std::vector<DistinguishedPoint>& dps) = 0;
 
     // Statistics
-    virtual PoolStats get_stats() = 0;
+    virtual PoolStatsLocal get_stats() = 0;
 
     // Solution notification (called when key is found)
     virtual bool report_solution(const uint8_t* private_key) = 0;

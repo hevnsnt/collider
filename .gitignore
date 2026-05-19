@@ -8,6 +8,12 @@ out/
 # Local build helper output and ad-hoc batch files
 build_*_out.txt
 do_build_*.bat
+# Underscore-prefixed scratch helpers + logs at repo root.
+# These are throwaway scripts used during iterative development and
+# must never reach the public Free repo.
+/_*.bat
+/_*.log
+/*.pot
 
 # IDE files
 .idea/
@@ -121,3 +127,39 @@ run_ksp_direct.bat
 brainwallet.pot
 brainwallet_hits.txt
 utxodump.csv
+
+# v1.4.2: local build helper batch files (not for repo)
+/_*.bat
+/_rc.log
+/_v142_*.log
+/build_log.txt
+/build2/
+/keys/
+/.review_tmp/
+
+# v1.4.2-quality: throwaway scratchpads must be ignored at ANY depth, not
+# only the repo root. The root-only patterns above miss helpers dropped
+# into scripts/ or tools/ during iterative review work. These any-depth
+# patterns catch them everywhere.
+_*.bat
+_*.txt
+_*.py
+_*.log
+
+# Review-process artifacts (free-form report files dropped at repo root
+# or under any subdir during a review pass).
+findings.txt
+findings*.txt
+found-empty.txt
+
+# Throwaway build wrappers used during iterative builds. Distinct from
+# the build_*_out.txt logs above (those are output captures); these are
+# the wrapper scripts themselves.
+build_repair.bat
+build_runner_only.bat
+
+# Per-tier review build wrappers (scripts/tier3_*.bat etc). The free
+# repo never sees these; they exist only on the pro side for batched
+# review reruns.
+scripts/tier*_*.bat
+scripts/tier*_*_*.bat

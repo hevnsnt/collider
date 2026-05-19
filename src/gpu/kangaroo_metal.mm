@@ -98,7 +98,7 @@ struct KangarooMetalSolver::Impl {
         [enc setBuffer:b_dp_count[slot] offset:0 atIndex:13];
         [enc setBytes:&dpmax length:sizeof(dpmax) atIndex:14];
 
-        // v1.4.1 Jacobian rewrite REQUIRES threadsPerThreadgroup == 32:
+        // Jacobian rewrite REQUIRES threadsPerThreadgroup == 32:
         // the Montgomery batch inversion is a threadgroup-cooperative
         // operation with KANGAROO_BATCH_SIZE = 32 baked into the kernel
         // (threadgroup memory arrays are sized at compile time). The
@@ -142,7 +142,7 @@ bool KangarooMetalSolver::init(const KangarooMetalConfig& cfg) {
         impl_->cfg = cfg;
         impl_->work_id_current = cfg.work_id;
 
-        // v1.4.1 Jacobian rewrite contract: num_kangaroos must be a
+        // Jacobian rewrite contract: num_kangaroos must be a
         // multiple of the threadgroup batch size (32). The kernel uses
         // a threadgroup-cooperative Montgomery batch inversion that
         // requires every thread in the threadgroup to participate in
@@ -244,7 +244,7 @@ bool KangarooMetalSolver::init(const KangarooMetalConfig& cfg) {
                                                         options:MTLResourceStorageModeShared];
         impl_->b_y        = [impl_->device newBufferWithLength:N * kLimbBytes
                                                         options:MTLResourceStorageModeShared];
-        // v1.4.1: Jacobian Z coordinate buffer. Initialized below in
+        // Jacobian Z coordinate buffer. Initialized below in
         // seed_kangaroos / replace_seed (Z = 1 = affine seed); the kernel
         // updates it across rounds.
         impl_->b_z        = [impl_->device newBufferWithLength:N * kLimbBytes
@@ -343,7 +343,7 @@ bool KangarooMetalSolver::find_dead_kangaroos(std::vector<uint32_t>& out_dead) {
     const uint64_t* y = (const uint64_t*)[impl_->b_y contents];
     const uint64_t* z = (const uint64_t*)[impl_->b_z contents];
     const uint32_t n = impl_->cfg.num_kangaroos;
-    // v1.4.1 Jacobian rewrite: a kangaroo is "dead" if its Jacobian Z
+    // Jacobian rewrite: a kangaroo is "dead" if its Jacobian Z
     // is entirely zero (the canonical encoding of the point at
     // infinity), OR if its (X, Y) are both zero (legacy sentinel that
     // shouldn't fire under the new kernel since the in-kernel infinity

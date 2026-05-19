@@ -15,6 +15,7 @@
 
 #include "types.hpp"
 #include "byte_codec.hpp"
+#include "bech32.hpp"     // BIP-173 checksum-verifying decoder
 #include "../tools/utxo_bloom_builder.hpp"
 #include <cstring>   // std::memcpy used below; MSVC pulls it transitively
                      // via <string>, strict GCC/Clang do not.
@@ -24,6 +25,7 @@
 #include <unordered_map>
 #include <fstream>
 #include <mutex>
+#include <shared_mutex>   // read-most verify hot path
 #include <atomic>
 #include <chrono>
 
@@ -74,6 +76,14 @@ public:
      * Load UTXO data from CSV file.
      * @param path Path to utxo-dump CSV
      * @param min_satoshis Minimum balance filter
+     *
+     * previously this function silently swallowed every
+     * parse / decode exception, so a CSV in bitcoin-utxo-dump's 6-field
+     * format (count,txid,vout,amount,type,address) was misread (vout was
+     * taken as the address) and the resulting "decode failure" dropped
+     * every line on the floor -- the UVRF ended up with 0 entries. Now
+     * we categorize skips and log a summary so the same bug can't go
+     * unnoticed again.
      */
     void load_from_csv(const std::string& path, uint64_t min_satoshis = 100000) {
         std::ifstream file(path);
@@ -83,6 +93,13 @@ public:
 
         std::string line;
         bool first_line = true;
+
+        // Categorized skip counters -- summary printed at end so a silent
+        // mass-drop is impossible to miss.
+        uint64_t kept              = 0;
+        uint64_t skipped_below_min = 0;
+        uint64_t skipped_format    = 0;  // P2WSH / P2TR / testnet / unknown
+        uint64_t skipped_parse     = 0;  // bad CSV fields, malformed numbers
 
         while (std::getline(file, line)) {
             if (line.empty() || line[0] == '#') continue;
@@ -95,22 +112,51 @@ public:
             }
             first_line = false;
 
+            UTXOEntry entry;
             try {
-                auto entry = parse_csv_line(line, min_satoshis);
-                if (entry.satoshis >= min_satoshis) {
-                    add_entry(entry);
-                }
+                entry = parse_csv_line(line, min_satoshis);
+            } catch (const std::invalid_argument&) {
+                // decode_address threw -- P2WSH (bc1q with 32-byte witness),
+                // P2TR (bc1p...), testnet (tb1/bcrt1...), or anything else
+                // that doesn't yield a 20-byte H160. Brain-wallet probes
+                // produce 20-byte H160s only, so these can never be hits
+                // from a brainwallet -- skip with a category bump.
+                skipped_format++;
+                continue;
             } catch (const std::exception&) {
-                // Skip invalid lines
+                // std::stoull failure, missing fields, etc.
+                skipped_parse++;
+                continue;
             }
+            if (entry.satoshis < min_satoshis) {
+                skipped_below_min++;
+                continue;
+            }
+            add_entry(entry);
+            kept++;
+        }
+
+        std::cout << "[UVRF] CSV load summary:\n"
+                  << "  kept (P2PKH/P2SH/P2WPKH >= min_sat): " << kept << "\n"
+                  << "  skipped (below min_satoshis="
+                  << min_satoshis << "): " << skipped_below_min << "\n"
+                  << "  skipped (unsupported format -- P2WSH/P2TR/testnet/etc): " << skipped_format << "\n"
+                  << "  skipped (CSV parse error): " << skipped_parse << "\n";
+        if (kept == 0) {
+            std::cerr << "[UVRF] WARNING: 0 entries kept. Likely causes:\n"
+                      << "  1) CSV layout is not the 6-field bitcoin-utxo-dump format "
+                      << "(count,txid,vout,amount,type,address) -- check the source.\n"
+                      << "  2) min_satoshis filter rejected every row -- try -m 0.\n"
+                      << "  3) Every row is P2WSH/P2TR -- check parse_csv_line output.\n";
         }
     }
 
     /**
      * Add a single UTXO entry.
+     * writer holds exclusive (unique) lock against any reader.
      */
     void add_entry(const UTXOEntry& entry) {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::unique_lock<std::shared_mutex> lock(mutex_);
 
         // Store in hash set for O(1) lookup
         H160Key key;
@@ -124,20 +170,24 @@ public:
      * Verify a bloom filter hit.
      * @param h160 The H160 hash to verify
      * @return Entry if verified, nullopt if false positive
+     *
+     * shared_lock so concurrent verify() calls don't serialize
+     * each other. Once UVRF live-reload lands the writer will take
+     * unique_lock and naturally block readers for the brief reload window.
      */
     std::optional<UTXOEntry> verify(const utxo::H160& h160) const {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::shared_lock<std::shared_mutex> lock(mutex_);
 
         H160Key key;
         std::memcpy(key.data, h160.data, 20);
 
         auto it = entries_.find(key);
         if (it != entries_.end()) {
-            verified_hits_++;
+            verified_hits_.fetch_add(1, std::memory_order_relaxed);
             return it->second;
         }
 
-        false_positives_++;
+        false_positives_.fetch_add(1, std::memory_order_relaxed);
         return std::nullopt;
     }
 
@@ -154,7 +204,7 @@ public:
         std::vector<UTXOEntry> results;
         results.reserve(count / 100);  // Expect ~1% hits at most
 
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::shared_lock<std::shared_mutex> lock(mutex_);  // B
 
         for (size_t i = 0; i < count; i++) {
             H160Key key;
@@ -163,9 +213,9 @@ public:
             auto it = entries_.find(key);
             if (it != entries_.end()) {
                 results.push_back(it->second);
-                verified_hits_++;
+                verified_hits_.fetch_add(1, std::memory_order_relaxed);
             } else {
-                false_positives_++;
+                false_positives_.fetch_add(1, std::memory_order_relaxed);
             }
         }
 
@@ -199,7 +249,7 @@ public:
      * Check if an H160 is in the verification set.
      */
     bool contains(const utxo::H160& h160) const {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::shared_lock<std::shared_mutex> lock(mutex_);  // B
 
         H160Key key;
         std::memcpy(key.data, h160.data, 20);
@@ -211,7 +261,7 @@ public:
      * Get total value of all tracked UTXOs.
      */
     uint64_t total_satoshis() const {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::shared_lock<std::shared_mutex> lock(mutex_);  // B
 
         uint64_t total = 0;
         for (const auto& [key, entry] : entries_) {
@@ -224,7 +274,7 @@ public:
      * Get entries sorted by balance (highest first).
      */
     std::vector<UTXOEntry> get_top_entries(size_t n) const {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::shared_lock<std::shared_mutex> lock(mutex_);  // B
 
         std::vector<UTXOEntry> all;
         all.reserve(entries_.size());
@@ -253,7 +303,7 @@ public:
      * Save verification set to binary file.
      */
     void save(const std::string& path) const {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::shared_lock<std::shared_mutex> lock(mutex_);  // B (read-only)
 
         std::ofstream file(path, std::ios::binary);
         if (!file) {
@@ -283,7 +333,7 @@ public:
      * Load verification set from binary file.
      */
     void load(const std::string& path) {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::unique_lock<std::shared_mutex> lock(mutex_);  // B (writer)
 
         std::ifstream file(path, std::ios::binary);
         if (!file) {
@@ -343,19 +393,29 @@ private:
 
     struct H160Hash {
         size_t operator()(const H160Key& key) const {
-            // Use first 8 bytes as hash (H160 is already a hash)
-            return *reinterpret_cast<const uint64_t*>(key.data);
+            // use memcpy to read the leading 8 bytes rather
+            // than reinterpret_cast<const uint64_t*> -- H160Key has no
+            // alignas(8) guarantee and the prior implementation tripped
+            // -fsanitize=alignment under both GCC and MSVC. H160 is itself
+            // a cryptographic hash so any 8-byte window is a fine hash key.
+            uint64_t v;
+            std::memcpy(&v, key.data, sizeof(uint64_t));
+            return static_cast<size_t>(v);
         }
     };
 
     std::unordered_map<H160Key, UTXOEntry, H160Hash> entries_;
-    mutable std::mutex mutex_;
+    // shared_mutex (rw-lock) so the read-most verify() and
+    // verify_batch() paths don't serialize each other. Writers (load,
+    // add_entry) take unique_lock and naturally block readers for the
+    // brief load window.
+    mutable std::shared_mutex mutex_;
 
     std::atomic<uint64_t> total_entries_{0};
     mutable std::atomic<uint64_t> verified_hits_{0};
     mutable std::atomic<uint64_t> false_positives_{0};
 
-    UTXOEntry parse_csv_line(const std::string& line, uint64_t min_satoshis) const {
+    UTXOEntry parse_csv_line(const std::string& line, uint64_t /*min_satoshis*/) const {
         UTXOEntry entry;
 
         std::vector<std::string> fields;
@@ -369,8 +429,17 @@ private:
             fields.push_back(field);
         }
 
-        if (fields.size() >= 4) {
-            // Full format: txid,vout,address,amount
+        // mirror the same format detection as
+        // utxo_bloom_builder.hpp::process_line so the verifier reads the
+        // SAME column as the bloom. Pre-fix, the 6-field bitcoin-utxo-dump
+        // layout fell through to the "fields.size() >= 4" branch which
+        // read vout as the address -- decode failed for every row.
+        if (fields.size() >= 6) {
+            // bitcoin-utxo-dump format: count,txid,vout,amount,type,address
+            entry.address = fields[5];
+            entry.satoshis = std::stoull(fields[3]);
+        } else if (fields.size() >= 4) {
+            // Alternative format: txid,vout,address,amount
             entry.address = fields[2];
             entry.satoshis = std::stoull(fields[3]);
         } else if (fields.size() >= 2) {
@@ -381,7 +450,8 @@ private:
             throw std::invalid_argument("Invalid CSV format");
         }
 
-        // Decode address to H160
+        // Decode address to H160 (throws std::invalid_argument for
+        // P2WSH/P2TR/testnet/unknown so the caller's catch can categorize).
         entry.h160 = decode_address(entry.address);
 
         return entry;
@@ -396,8 +466,12 @@ private:
             throw std::invalid_argument("Empty address");
         }
 
-        // Raw H160 hex
-        if (address.size() == 40) {
+        // Raw H160 hex (v1.4.2 F.3: gate on character class so a
+        // 40-char bech32-without-prefix or P2SH-stripped string can't
+        // be silently mis-parsed as an h160).
+        if (address.size() == 40 &&
+            std::all_of(address.begin(), address.end(),
+                        [](unsigned char c) { return std::isxdigit(c); })) {
             return utxo::H160::from_hex(address);
         }
 
@@ -460,43 +534,18 @@ private:
     }
 
     utxo::H160 bech32_decode(const std::string& address) const {
-        // Simplified bech32 decode for bc1q addresses
-        if (address.size() < 14 || address.substr(0, 4) != "bc1q") {
-            throw std::invalid_argument("Invalid bech32 address");
-        }
-
-        static const char* BECH32_ALPHABET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
-
-        // Decode data part (skip "bc1")
-        std::vector<uint8_t> data;
-        for (size_t i = 3; i < address.size(); i++) {
-            const char* pos = std::strchr(BECH32_ALPHABET, std::tolower(address[i]));
-            if (!pos) {
-                throw std::invalid_argument("Invalid bech32 character");
-            }
-            data.push_back(static_cast<uint8_t>(pos - BECH32_ALPHABET));
-        }
-
-        // Convert from 5-bit to 8-bit groups
-        std::vector<uint8_t> converted;
-        uint32_t acc = 0;
-        int bits = 0;
-
-        for (size_t i = 1; i < data.size() - 6; i++) {  // Skip version and checksum
-            acc = (acc << 5) | data[i];
-            bits += 5;
-            if (bits >= 8) {
-                bits -= 8;
-                converted.push_back((acc >> bits) & 0xff);
-            }
-        }
-
-        if (converted.size() != 20) {
-            throw std::invalid_argument("Invalid witness program length");
+        // full BIP-173 checksum verification via collider::bech32.
+        // Pre-fix this was a hand-rolled decoder that SKIPPED the checksum,
+        // so a typo'd address would parse to a deterministic-but-wrong H160
+        // and be silently added to the UVRF. The shared decoder returns
+        // nullopt on any failure (length / HRP / checksum / version / case).
+        auto decoded = ::collider::bech32::decode_p2wpkh(address, "bc");
+        if (!decoded.has_value()) {
+            throw std::invalid_argument("Invalid bech32 address (checksum/format)");
         }
 
         utxo::H160 result;
-        std::memcpy(result.data, converted.data(), 20);
+        std::memcpy(result.data, decoded->data(), 20);
         return result;
     }
 };

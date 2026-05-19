@@ -64,6 +64,21 @@ public:
 	bool Failed;
 	bool IsOldGpu;
 
+	// theCollider v1.4.2 patch: herd save/load hooks (see
+	// third_party/RCKangaroo/.patches/save-load-state.patch for the
+	// rationale and on-disk format). When InitKangsHost is non-null at
+	// Start() time, the GPU's per-kangaroo buffer is seeded directly
+	// from it instead of randomly generated. When SaveKangsHost is
+	// non-null, the buffer is downloaded to it AFTER the Execute loop
+	// stops but BEFORE Release() frees the device memory. Both pointers
+	// are owned by the caller (RCKangarooManager); the patch only reads
+	// the InitKangs buffer and writes the SaveKangs buffer.
+	//
+	// Buffer size in bytes: KangCnt * 96 (24 u64 per kangaroo: x[4],
+	// y[4], priv[4]). Matches the cudaMalloc size at GpuKang.cpp Prepare.
+	const unsigned char* InitKangsHost = nullptr;
+	unsigned char*       SaveKangsHost = nullptr;
+
 	int CalcKangCnt();
 	bool Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP* _EcJumps1, EcJMP* _EcJumps2, EcJMP* _EcJumps3);
 	void Stop();

@@ -19,7 +19,15 @@ typedef char i8;
 
 
 
-#define MAX_GPU_CNT			32
+// Aligned with collider::runtime::RuntimeControlState::kMaxGpus (8) to
+// remove a long-standing contradiction between the RCKangaroo upper
+// bound and the runtime's per-GPU phase array. Every realistic
+// mixed-GPU rig fits inside 8; the lower bound is the canonical value
+// (see src/runtime/runtime_control.hpp). Reducing this also shrinks
+// the small static arrays sized by MAX_GPU_CNT (GpuKangs[],
+// gGPUs_Mask[], thr_handles[]). The original RCKangaroo upstream
+// value of 32 is preserved in the comment for provenance.
+#define MAX_GPU_CNT			8   // canonical: kMaxGpus in src/runtime/runtime_control.hpp; was 32 upstream
 
 //must be divisible by MD_LEN
 #define STEP_CNT			1000

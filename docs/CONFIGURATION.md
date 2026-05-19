@@ -185,9 +185,8 @@ The following flags are accepted by the parser but not listed in `--help`. They 
 | `--puzzle-only-v2`     | Enable the v2 puzzle-mode kernel plus multi-scheme dispatch.         |
 | `--puzzle-keys <file>` | Path to the puzzle keys file (typically `data/puzzle_history.json`). |
 | `--schemes <csv>`      | Comma-separated scheme list (e.g. `all`, or specific names).         |
-| `--addr-types <csv>`   | Comma-separated address types (e.g. `puzzle_only`).                  |
 
-These flags imply `--brainwallet` (they go through the brain-wallet pipeline). Free builds reject them at the CLI with a Pro-feature message.
+These flags imply `--brainwallet` (they go through the brain-wallet pipeline). Free builds reject them at the CLI with a Pro-feature message. Multi-address scanning (the prior `--addr-types` flag) is currently only available through the legacy `--brainwallet --bloom` path; v2 multi-address support is deferred to a later release.
 
 ---
 

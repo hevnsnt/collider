@@ -373,7 +373,28 @@ bool RCGpuKang::Start()
 		printf("GPU %d, cudaMemcpy failed: %s\n", CudaIndex, cudaGetErrorString(err));
 		return false;
 	}
-	CallGpuKernelGen(Kparams);
+	// theCollider v1.4.2 patch: herd-resume hook. When InitKangsHost is
+	// non-null, overwrite Kparams.Kangs with the saved (x, y, priv) for
+	// every kangaroo and SKIP CallGpuKernelGen. The saved buffer already
+	// contains points produced by a prior Generate-then-CallGpuKernelGen
+	// sequence on a compatible target; rerunning the gen kernel would
+	// stomp them. The kernel will pick up walking from the loaded
+	// positions on its next iteration.
+	if (InitKangsHost != nullptr)
+	{
+		err = cudaMemcpy(Kparams.Kangs, InitKangsHost,
+		                 (size_t)KangCnt * 96, cudaMemcpyHostToDevice);
+		if (err != cudaSuccess)
+		{
+			printf("GPU %d, cudaMemcpy(InitKangsHost) failed: %s\n",
+			       CudaIndex, cudaGetErrorString(err));
+			return false;
+		}
+	}
+	else
+	{
+		CallGpuKernelGen(Kparams);
+	}
 
 	err = cudaMemset(Kparams.L1S2, 0, mpCnt * Kparams.BlockSize * 8);
 	if (err != cudaSuccess)
@@ -503,6 +524,27 @@ void RCGpuKang::Execute()
 		}
 		iter++;
 #endif
+	}
+
+	// theCollider v1.4.2 patch: herd-save hook. When SaveKangsHost is
+	// non-null, dump the current device-side Kangs buffer to it BEFORE
+	// Release() frees Kparams.Kangs. The kernel has just finished a
+	// step batch and the buffer is coherent. The caller (the
+	// RCKangarooManager wrapper) owns the host buffer and serializes it
+	// to disk after solve() returns.
+	if (SaveKangsHost != nullptr)
+	{
+		cudaError_t err_save = cudaMemcpy(SaveKangsHost, Kparams.Kangs,
+		                                  (size_t)KangCnt * 96,
+		                                  cudaMemcpyDeviceToHost);
+		if (err_save != cudaSuccess)
+		{
+			printf("GPU %d, cudaMemcpy(SaveKangsHost) failed: %s\n",
+			       CudaIndex, cudaGetErrorString(err_save));
+			// Leave SaveKangsHost contents unspecified on failure; the
+			// wrapper checks the cudaError chain via a flag it sets
+			// alongside (see RCKangarooManager::save_herd_state).
+		}
 	}
 
 	Release();

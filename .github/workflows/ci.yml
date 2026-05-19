@@ -34,10 +34,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build
 
-      - name: Install CUDA Toolkit 12.6
-        uses: Jimver/cuda-toolkit@v0.2.19
+      - name: Install CUDA Toolkit 12.8
+        uses: Jimver/cuda-toolkit@v0.2.22
         with:
-          cuda: "12.6.0"
+          cuda: "12.8.0"
           method: "network"
           sub-packages: '["nvcc", "cudart"]'
 
@@ -49,7 +49,7 @@ jobs:
             -DCOLLIDER_USE_CUDA=ON \
             -DCOLLIDER_BUILD_TESTS=OFF \
             -DCOLLIDER_BUILD_BENCHMARKS=OFF \
-            -DCMAKE_CUDA_ARCHITECTURES="75;80;86;89"
+            -DCMAKE_CUDA_ARCHITECTURES="75;86;89;120"
 
       - name: Build
         run: cmake --build build --config ${{ env.BUILD_TYPE }} -j4
@@ -63,10 +63,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install CUDA Toolkit 12.6
-        uses: Jimver/cuda-toolkit@v0.2.19
+      - name: Install CUDA Toolkit 12.8
+        uses: Jimver/cuda-toolkit@v0.2.22
         with:
-          cuda: "12.6.0"
+          cuda: "12.8.0"
           method: "network"
           sub-packages: '["nvcc", "cudart", "visual_studio_integration"]'
 
@@ -88,7 +88,7 @@ jobs:
             -DCOLLIDER_USE_CUDA=ON `
             -DCOLLIDER_BUILD_TESTS=OFF `
             -DCOLLIDER_BUILD_BENCHMARKS=OFF `
-            -DCMAKE_CUDA_ARCHITECTURES="75;80;86;89"
+            -DCMAKE_CUDA_ARCHITECTURES="75;86;89;120"
 
       - name: Build
         run: cmake --build build --config ${{ env.BUILD_TYPE }} -j4
@@ -98,7 +98,7 @@ jobs:
   # ---------------------------------------------------------------------------
   macos-metal:
     name: macOS arm64 (Metal)
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
 

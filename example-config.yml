@@ -60,9 +60,18 @@ puzzle:
 
 # ---------------------------------------------------------------------------
 # Bloom filter (Pro feature; .blf file with funded addresses).
+#
+# v1.4.2: companion `verify_set` (UVRF file) eliminates pure bloom
+# false positives before they reach the user. Strongly recommended;
+# without it you'll see one "BLOOM HIT FOUND" box every ~few seconds
+# of GPU time, none of which are real matches. Build via:
+#   build_bloom -i utxo.csv -o funded_addresses.blf -v funded_addresses.uvrf
+# The runtime auto-detects funded_addresses.uvrf next to the .blf,
+# so only set verify_set explicitly if the path differs.
 # ---------------------------------------------------------------------------
 # bloom:
 #   file: "./funded_addresses.blf"
+#   verify_set: "./funded_addresses.uvrf"
 
 # ---------------------------------------------------------------------------
 # GPU configuration.

@@ -15,6 +15,7 @@
 #include "pool/jlp_wire_generated.hpp"
 
 #include <cassert>
+#include <cstddef>   // offsetof
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -45,6 +46,31 @@ static_assert(sizeof(JLPServerConfig) == sizeof(jlp_wire::WorkAssignment),
               "WorkAssignment layout has diverged");
 static_assert(sizeof(jlp_wire::WorkAssignment) == 109,
               "WorkAssignment wire size is 109 by spec");
+
+// v1.4.2 B.3: AUTH drift detector. Pre-fix this was missing entirely, so
+// the handwritten JLPClientHelloV2 (120 bytes) had drifted from the IDL
+// (which still said AuthPayload was 96 bytes). With AuthPayloadV2 now in
+// the IDL, any future drift between the handwritten struct and the
+// codegen-emitted one will break the build.
+static_assert(sizeof(JLPClientHelloV2) == sizeof(jlp_wire::AuthPayloadV2),
+              "JLPClientHelloV2 and jlp_wire::AuthPayloadV2 have diverged");
+static_assert(sizeof(jlp_wire::AuthPayloadV2) == 120,
+              "AuthPayloadV2 wire size is 120 by spec");
+// Field-by-field offset checks so a future reorder is caught by sizeof
+// equality + member-position equality (sizeof alone misses same-total
+// reorderings).
+static_assert(offsetof(JLPClientHelloV2, worker_name) ==
+              offsetof(jlp_wire::AuthPayloadV2, worker_name),
+              "AuthPayloadV2.worker_name offset drifted");
+static_assert(offsetof(JLPClientHelloV2, password) ==
+              offsetof(jlp_wire::AuthPayloadV2, password),
+              "AuthPayloadV2.password offset drifted");
+static_assert(offsetof(JLPClientHelloV2, timestamp_ms) ==
+              offsetof(jlp_wire::AuthPayloadV2, timestamp_ms),
+              "AuthPayloadV2.timestamp_ms offset drifted");
+static_assert(offsetof(JLPClientHelloV2, nonce) ==
+              offsetof(jlp_wire::AuthPayloadV2, nonce),
+              "AuthPayloadV2.nonce offset drifted");
 
 // ---- compile-time: message-type values match ------------------------------
 
@@ -141,6 +167,36 @@ void test_dp_v2_layout() {
     CHECK(buf[77] == 24, "dp_v2 dp_bits at offset 77");
 }
 
+void test_auth_payload_v2_layout() {
+    // v1.4.2 B.3: verify the byte layout that the Python pool server
+    // actually decodes. struct format '<64s32sQ16s' means worker_name +
+    // password + timestamp_ms LE + nonce.
+    jlp_wire::AuthPayloadV2 ap{};
+    for (int i = 0; i < 64; ++i) ap.worker_name[i] = (uint8_t)('A' + (i % 26));
+    for (int i = 0; i < 32; ++i) ap.password[i] = (uint8_t)('a' + (i % 26));
+    ap.timestamp_ms = 0x0123456789ABCDEFULL;
+    for (int i = 0; i < 16; ++i) ap.nonce[i] = (uint8_t)(0xF0 | (i & 0x0F));
+
+    uint8_t buf[sizeof(jlp_wire::AuthPayloadV2)];
+    std::memcpy(buf, &ap, sizeof(buf));
+
+    // worker_name at offset 0..63
+    CHECK(buf[0] == 'A' && buf[25] == 'Z' && buf[26] == 'A',
+          "AuthPayloadV2.worker_name at offset 0");
+    // password at offset 64..95
+    CHECK(buf[64] == 'a' && buf[89] == 'z',
+          "AuthPayloadV2.password at offset 64");
+    // timestamp_ms LE at offset 96..103
+    CHECK(buf[96]  == 0xEF && buf[97]  == 0xCD &&
+          buf[98]  == 0xAB && buf[99]  == 0x89 &&
+          buf[100] == 0x67 && buf[101] == 0x45 &&
+          buf[102] == 0x23 && buf[103] == 0x01,
+          "AuthPayloadV2.timestamp_ms LE at offset 96");
+    // nonce at offset 104..119
+    CHECK(buf[104] == 0xF0 && buf[119] == 0xFF,
+          "AuthPayloadV2.nonce at offset 104");
+}
+
 void test_legacy_to_generated_memcpy() {
     // A legacy JLPDistinguishedPointV2 must be byte-equivalent to the
     // codegen one. v1.4.1 B.1 added a sequence field on both sides
@@ -169,6 +225,7 @@ void test_legacy_to_generated_memcpy() {
 int main() {
     test_header_layout();
     test_dp_v2_layout();
+    test_auth_payload_v2_layout();
     test_legacy_to_generated_memcpy();
 
     if (failures != 0) {

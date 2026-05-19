@@ -50,6 +50,14 @@ endif()
 
 # Detect platform before project declaration
 if(APPLE)
+    # std::jthread / std::stop_token are availability-gated in Apple's libc++.
+    # macOS 15.0 (Sequoia) is the first release where the gate opens; 14.0
+    # (Sonoma) still lacks the _LIBCPP_AVAILABILITY_HAS_JTHREAD attribute.
+    # Setting this before the project() declaration ensures the Xcode toolchain
+    # picks it up for all targets, including the SDK sysroot selection.
+    if(NOT CMAKE_OSX_DEPLOYMENT_TARGET)
+        set(CMAKE_OSX_DEPLOYMENT_TARGET "15.0" CACHE STRING "Minimum macOS version" FORCE)
+    endif()
     set(COLLIDER_PLATFORM_MACOS TRUE)
     project(collider LANGUAGES CXX OBJCXX)
 elseif(WIN32)
@@ -99,6 +107,22 @@ else()
     message(STATUS "Building theCollider FREE (brain wallet disabled)")
 endif()
 
+# Opt-in diagnostic: device-side printf bounds-check at every bloom probe
+# in the fused brain-wallet kernel. Used to narrow down an intermittent
+# cudaErrorIllegalAddress on the V2 multi_addr path that does not
+# reproduce in the existing ctest harness. The check is OFF by default
+# because printf in a hot kernel costs ~20-30% throughput and the test
+# is only useful while diagnosing. Enable per-build with
+# `-DCOLLIDER_DEBUG_FUSED_BOUNDS=ON`. The macro is consumed by
+# src/gpu/fused_pipeline.cu::bloom_check_inline.
+option(COLLIDER_DEBUG_FUSED_BOUNDS
+       "Enable device-side bloom-probe bounds check in fused kernel (diagnostic)"
+       OFF)
+if(COLLIDER_DEBUG_FUSED_BOUNDS)
+    add_compile_definitions(COLLIDER_DEBUG_FUSED_BOUNDS=1)
+    message(STATUS "Fused kernel bounds-check instrumentation ENABLED (diagnostic build)")
+endif()
+
 # ============================================================================
 # Backend Detection
 # ============================================================================
@@ -133,15 +157,37 @@ elseif(COLLIDER_USE_CUDA)
         set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
         # Detect GPU architecture
-        # RTX 5090 (Blackwell): SM 10.0
-        # RTX 4090 (Ada): SM 8.9
+        # RTX 2060/2070/2080 (Turing): SM 7.5
         # RTX 3060/3070/3080/3090 (Ampere): SM 8.6
-        # We compile for all to support various cards
+        # RTX 4090 (Ada Lovelace): SM 8.9
+        # RTX 5090 / RTX PRO 6000 (Blackwell Desktop): SM 12.0
+        # NOTE: SM 10.0 is datacenter Blackwell (B100/B200), not desktop.
         if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-            # Check if we can detect the GPU
-            set(CMAKE_CUDA_ARCHITECTURES "86;89;100")
+            set(CMAKE_CUDA_ARCHITECTURES "75;86;89;120")
             message(STATUS "Compiling for CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
         endif()
+
+        # T4.2: surface the compiled-in CUDA architecture list to runtime so
+        # gpu_detection.cpp can warn when the active device's SM is missing
+        # from the binary. The list flows through as a comma-separated string
+        # of "X.Y" tokens (e.g. "7.5,8.6,8.9,12.0") so the C++ side can
+        # tokenize without parsing the raw "75;86;89;120" format. Building
+        # the formatted string here keeps the parsing burden off the runtime.
+        set(_collider_cuda_arch_csv "")
+        foreach(_arch IN LISTS CMAKE_CUDA_ARCHITECTURES)
+            string(LENGTH "${_arch}" _arch_len)
+            if(_arch_len GREATER_EQUAL 2)
+                math(EXPR _minor_pos "${_arch_len} - 1")
+                string(SUBSTRING "${_arch}" 0 ${_minor_pos} _major)
+                string(SUBSTRING "${_arch}" ${_minor_pos} 1 _minor)
+                if(_collider_cuda_arch_csv STREQUAL "")
+                    set(_collider_cuda_arch_csv "${_major}.${_minor}")
+                else()
+                    set(_collider_cuda_arch_csv "${_collider_cuda_arch_csv},${_major}.${_minor}")
+                endif()
+            endif()
+        endforeach()
+        add_compile_definitions(COLLIDER_CUDA_ARCH_LIST="${_collider_cuda_arch_csv}")
 
         # Force consistent CUDA runtime library (avoid mixing static/dynamic)
         # Use Shared (cudart.lib) to avoid duplicate symbol errors on Windows
@@ -191,8 +237,8 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release")
             set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -mcpu=apple-m1")
         endif()
     elseif(MSVC)
-        set(CMAKE_CXX_FLAGS_RELEASE "/O2 /DNDEBUG /arch:AVX2 /GL /EHsc")
-        set(CMAKE_EXE_LINKER_FLAGS_RELEASE "/LTCG")
+        set(CMAKE_CXX_FLAGS_RELEASE "/O2 /DNDEBUG /arch:AVX2 /GL /EHsc /Zi")
+        set(CMAKE_EXE_LINKER_FLAGS_RELEASE "/LTCG /DEBUG")
         set(CMAKE_STATIC_LINKER_FLAGS_RELEASE "/LTCG")
     else()
         set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -DNDEBUG")
@@ -281,6 +327,108 @@ FetchContent_MakeAvailable(xxhash)
 # xxHash is header-only, just need include path
 set(XXHASH_INCLUDE_DIR ${xxhash_SOURCE_DIR})
 
+# ============================================================================
+# FTXUI - C++17 functional terminal UI library for the brainwallet TUI
+# ============================================================================
+# Wired by Wave 1 builder-foundation. Pinned to v5.0.0 (the first tagged
+# release with the FTXUI_BUILD_* options that Wave 1 needs to disable
+# examples / docs / tests). Header-light enough to live under FetchContent
+# (no separate vcpkg entry). GIT_SHALLOW shaves the clone time on
+# configure since we never need history beyond the pinned tag.
+set(FTXUI_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(FTXUI_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+set(FTXUI_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+    ftxui
+    GIT_REPOSITORY https://github.com/ArthurSonzogni/FTXUI.git
+    GIT_TAG v5.0.0
+    GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(ftxui)
+
+# FTXUI's cmake/ftxui_set_options.cmake attaches `/utf-8` to every
+# library as PUBLIC under MSVC. PUBLIC means the flag propagates to
+# every consumer, including the `collider` executable, which also
+# compiles cuda_stub.cu via nvcc. nvcc on Windows interprets `/utf-8`
+# as an input-file path (leading `/`), trips its "single input file
+# for non-link phase" guard, and aborts. The fix is to rewrap the
+# PUBLIC compile options of each FTXUI target so `/utf-8` only fires
+# on CXX translation units, not CUDA.
+foreach(_ftxui_target screen dom component)
+    if(TARGET ${_ftxui_target} AND MSVC)
+        get_target_property(_opts ${_ftxui_target} INTERFACE_COMPILE_OPTIONS)
+        if(_opts)
+            set(_new_opts "")
+            foreach(_opt ${_opts})
+                if(_opt STREQUAL "/utf-8")
+                    list(APPEND _new_opts
+                        "$<$<COMPILE_LANGUAGE:CXX>:/utf-8>")
+                else()
+                    list(APPEND _new_opts ${_opt})
+                endif()
+            endforeach()
+            set_target_properties(${_ftxui_target} PROPERTIES
+                INTERFACE_COMPILE_OPTIONS "${_new_opts}")
+        endif()
+    endif()
+endforeach()
+
+# Interface library that the collider binary will link against. Bundles
+# the three FTXUI sub-targets (screen / dom / component) so downstream
+# consumers list one name instead of three.
+add_library(collider_tui INTERFACE)
+target_link_libraries(collider_tui INTERFACE
+    ftxui::screen
+    ftxui::dom
+    ftxui::component
+)
+
+# ============================================================================
+# NVML - NVIDIA Management Library for GPU telemetry
+# ============================================================================
+# NVML is loaded at runtime via dlopen / GetProcAddress in
+# src/platform/nvml_query.cpp, so we don't strictly need to link the
+# library here. What we DO need is the include directory (for nvml.h)
+# and the COLLIDER_HAS_NVML compile definition so #ifdef gating in the
+# wrapper compiles. Mac builds skip NVML entirely.
+set(NVML_LIB NOTFOUND)
+set(NVML_INCLUDE_DIR NOTFOUND)
+if(NOT APPLE)
+    if(WIN32 AND CUDAToolkit_FOUND)
+        # On Windows the NVIDIA driver ships nvml.dll in System32 and the
+        # CUDA Toolkit ships nvml.lib + nvml.h. Look in CUDAToolkit's
+        # library / include dirs first, fall back to CUDA_PATH env var.
+        find_library(NVML_LIB nvml
+            HINTS
+                "${CUDAToolkit_LIBRARY_DIR}"
+                "$ENV{CUDA_PATH}/lib/x64"
+        )
+        find_path(NVML_INCLUDE_DIR nvml.h
+            HINTS
+                "${CUDAToolkit_INCLUDE_DIRS}"
+                "$ENV{CUDA_PATH}/include"
+        )
+    elseif(UNIX AND CUDAToolkit_FOUND)
+        # Linux: libnvidia-ml is shipped by the NVIDIA driver, not the
+        # toolkit. The toolkit ships nvml.h.
+        find_library(NVML_LIB nvidia-ml)
+        find_path(NVML_INCLUDE_DIR nvml.h
+            HINTS "${CUDAToolkit_INCLUDE_DIRS}"
+        )
+    endif()
+endif()
+
+if(NVML_INCLUDE_DIR)
+    message(STATUS "NVML support enabled (include: ${NVML_INCLUDE_DIR})")
+    if(NVML_LIB)
+        message(STATUS "  NVML library: ${NVML_LIB}")
+    else()
+        message(STATUS "  NVML library: not found (loaded at runtime via dlopen / LoadLibrary)")
+    endif()
+else()
+    message(STATUS "NVML support disabled (nvml.h not found)")
+endif()
+
 if(APPLE AND COLLIDER_BACKEND STREQUAL "METAL")
     find_library(METAL_LIBRARY Metal REQUIRED)
     find_library(FOUNDATION_LIBRARY Foundation REQUIRED)
@@ -343,9 +491,13 @@ set(CORE_SOURCES
     src/core/rule_engine.cpp
     src/core/cpu_kangaroo_backend.cpp
     src/core/kangaroo_backend_factory.cpp
-    src/generators/passphrase_generator.cpp
-    src/generators/priority_queue.cpp
-    # v1.4.1 A.3: CLI argument parsing extracted from main.cpp so the
+    # v1.4.2 quality: per-session log + atomic session_state.json + OS
+    # crash handler. Extends core/logger.hpp's rotating singleton with
+    # a one-file-per-invocation log, a structured JSON snapshot a
+    # recovery tool can read, and a SetUnhandledExceptionFilter /
+    # sigaction handler that dumps the snapshot on SEGV/SEH.
+    src/core/session_log.cpp
+    # CLI argument parsing extracted from main.cpp so the
     # runtime drivers and the tests/test_cli_parser target can share a
     # single source of truth for Arguments / parse_args / print_usage.
     src/cli/cli_parser.cpp
@@ -363,12 +515,35 @@ set(CORE_SOURCES
     # site (Pro-only includes from gpu/brain_wallet_gpu.hpp). The Free path
     # uses the CPU + Metal/CUDA SHA-256 benchmark with no Pro symbols.
     src/runtime/puzzle_solver.cpp
-    # v1.4.1 A.3 (6/6): GPU detection helper extracted from main.cpp so
-    # the dispatcher (main.cpp) and the runtime drivers can both link
-    # against detect_gpus() without main.cpp owning the body.
+    # v1.4.2 quality: internal decomposition of the puzzle-mode runtime.
+    # Helpers extracted from the inline body of run_puzzle_mode (worklist
+    # build, GPU calibration trigger, per-puzzle target resolution,
+    # algorithm selection, search-space banner). Header is internal to
+    # the runtime layer; puzzle_solver.hpp's public surface is unchanged.
+    src/runtime/puzzle_solver_helpers.cpp
+    # v1.4.2 quality: kangaroo solve-path (RCKangaroo -> MultiGPU -> CPU
+    # fallback) extracted from run_puzzle_mode's inline KANGAROO MODE
+    # block. Preserves --resume-kangaroo, SaveKangsHost/InitKangsHost
+    # wiring, and secure_wipe on every recovered private key.
+    src/runtime/puzzle_solver_kangaroo.cpp
+    # v1.4.2 quality: brute-force solve-path (>128-bit reject, GPU brute,
+    # CPU brute, final stats) extracted from run_puzzle_mode. Preserves
+    # SearchState v4 position_full[0..3] layout and SIGINT save semantics.
+    src/runtime/puzzle_solver_bruteforce.cpp
+    # v1.4.2 quality: Free SHA-256-only benchmark path extracted from
+    # run_benchmark. The Pro --benchmark path stays inline as a thin
+    # delegation to runtime/bench_pipeline (the source of truth for
+    # the PRO docs' throughput numbers).
+    src/runtime/puzzle_solver_benchmark.cpp
+    # mempool.space balance check spawned after a true hit. Shared by
+    # puzzle_solver.cpp and brain_wallet_runner.cpp via runtime/balance.hpp.
+    src/runtime/balance.cpp
+    # GPU detection helper extracted from main.cpp so the dispatcher
+    # (main.cpp) and the runtime drivers can both link against
+    # detect_gpus() without main.cpp owning the body.
     src/runtime/gpu_detection.cpp
     # v1.4.1 UI: live BTC balance lookup against mempool.space for the
-    # solved-puzzle banner. libcurl-gated -- if CURL_FOUND was false at
+    # solved-puzzle banner. libcurl-gated; if CURL_FOUND was false at
     # configure time, the function returns nullopt and the banner shows
     # "balance unavailable (offline)".
     src/ui/btc_balance.cpp
@@ -391,8 +566,8 @@ if(APPLE AND COLLIDER_USE_METAL
     list(APPEND CORE_SOURCES src/gpu/kangaroo_metal.mm)
     set_source_files_properties(src/gpu/kangaroo_metal.mm
         PROPERTIES COMPILE_FLAGS "-fobjc-arc")
-    # Metal IKangarooBackend adapter -- gated to the same conditions as
-    # the underlying KangarooMetalSolver above.
+    # Metal IKangarooBackend adapter (gated to the same conditions as
+    # the underlying KangarooMetalSolver above).
     if(EXISTS "${CMAKE_SOURCE_DIR}/src/gpu/metal_kangaroo_backend.mm")
         list(APPEND CORE_SOURCES src/gpu/metal_kangaroo_backend.mm)
         set_source_files_properties(src/gpu/metal_kangaroo_backend.mm
@@ -484,11 +659,41 @@ if(COLLIDER_PRO)
     # block; the .cpp companions match that gating so the free build
     # never compiles them.
     list(APPEND CORE_SOURCES src/generators/streaming_brain_wallet.cpp)
-    list(APPEND CORE_SOURCES src/generators/brain_wallet_engine.cpp)
+    # --brute incremental bruteforce generator. PRO-only because the
+    # brain-wallet runtime that consumes it is PRO-only.
+    list(APPEND CORE_SOURCES src/generators/bruteforce_generator.cpp)
+    # v1.4.2 C.2: brain_wallet_engine.{hpp,cpp} deleted; it had zero callers
+    # in the codebase and its algorithmic content (PCFG, Markov, keyboard
+    # walks, combinator) was already implemented in StreamingBrainWallet.
+    # QWERTZ + AZERTY keyboard-walk seeds were merged into
+    # init_keyboard_walk_mode(); crypto-vocab tables were moved to
+    # data/wordlists/brain_wallet_terms.txt for operator use as a
+    # --wordlist alongside the rule engine.
     # v1.4.1 A.3: brain wallet runtime driver extracted from main.cpp.
     # Whole TU is COLLIDER_PRO-gated; the file itself wraps everything
     # in #ifdef COLLIDER_PRO defense-in-depth.
     list(APPEND CORE_SOURCES src/runtime/brain_wallet_runner.cpp)
+    # v1.4.2 quality: .blf bloom-filter loader extracted from
+    # brain_wallet_runner.cpp. Independent TU so the file-IO + header
+    # validation can be reviewed in isolation and reused by both the
+    # primary brain-wallet bloom load and the --bloom-tight side load
+    # without duplicating the validation sequence.
+    list(APPEND CORE_SOURCES src/runtime/bloom_loader.cpp)
+    # v1.4.2 quality: BrainWalletSearchState payload builder extracted from
+    # brain_wallet_runner.cpp. SaveStateInputs + build_brain_wallet_search_state
+    # are the single source-of-truth assembly routine consumed by all four
+    # save-state call sites (explicit / paused / periodic / final).
+    list(APPEND CORE_SOURCES src/runtime/brain_wallet_setup.cpp)
+    # T3.14 (2026-05-17): WarpWallet CPU scan path extracted from
+    # brain_wallet_runner.cpp. Independent translation unit so the CPU
+    # scrypt-based scan loop can be reviewed without GPU-pipeline
+    # context. Pro-only (same #ifdef guard as the rest of brainwallet).
+    list(APPEND CORE_SOURCES src/runtime/warpwallet_runner.cpp)
+    # Full-pipeline benchmark core. Shared between the --benchmark CLI
+    # path (puzzle_solver.cpp) and the standalone benchmarks/
+    # bench_gpu_pipeline.cu binary. Pro-only because it depends on the
+    # fused brain-wallet kernels; the Free benchmark stays SHA-256-only.
+    list(APPEND CORE_SOURCES src/runtime/bench_pipeline.cpp)
     # v1.4.1 A.3 (6/6): pre-dispatch license activation + startup
     # validation. PRO-only because the underlying license/license_check.hpp
     # is PRO-only; the .cpp wraps everything in #ifdef COLLIDER_PRO too.
@@ -515,6 +720,77 @@ if(COLLIDER_PRO)
         # Mark as Obj-C++ so CMake hands it to the right compiler.
         set_source_files_properties(src/gpu/v2/v2_metal_dispatch.mm
             PROPERTIES COMPILE_FLAGS "-fobjc-arc -fobjc-weak")
+    endif()
+
+    # Runtime support (runtime.yml writeback, perf instrumentation,
+    # empty-hit writer) and plugin runner / registry land in
+    # collider_core because brain_wallet_runner.cpp consumes them.
+    # scan_state and runtime_control are header-only (atomics + an inline
+    # singleton accessor); they have no compiled translation units.
+    list(APPEND CORE_SOURCES
+        src/runtime/runtime_config_yaml.cpp
+        src/runtime/perf_instrumentation.cpp
+        # Tier 1 perf F-log (builder-perf): background writer for
+        # --track-empty-hits, replaces the inline log_empty_hit that
+        # opened+closed found-empty.txt on the scan thread per hit.
+        src/runtime/empty_hit_writer.cpp
+        # Phase 5 (builder-plugins: plugin-protocol-registry)
+        src/plugins/plugin_protocol.cpp
+        src/plugins/plugin_registry.cpp
+        # Phase 5 (builder-threading: plugin-runner)
+        src/plugins/plugin_runner.cpp
+    )
+
+    # FTXUI panels + widgets. These translation units #include FTXUI
+    # headers, so collider_core has to PUBLIC-link collider_tui (handled
+    # in the dependency block below).
+    list(APPEND CORE_SOURCES
+        # Phase 1 (builder-foundation: tui-app-skeleton)
+        src/ui/tui/tui_app.cpp
+        src/ui/tui/theme.cpp
+        # Carbon-fiber boot banner (2026-05-16). Standalone animation
+        # printed before TuiApp::start(); not part of the FTXUI panel
+        # composition but lives alongside the TUI sources because it
+        # is the TUI mode's opening visual.
+        src/ui/tui/boot_banner.cpp
+        # Phase 1 (builder-threading: cooked-mode-guard)
+        src/ui/tui/cooked_mode_guard.cpp
+        # Phase 4 (builder-threading: runtime-control-input)
+        src/ui/tui/keybindings.cpp
+        src/ui/tui/input_handler.cpp
+        # Phase 1..6 panels (builder-panels)
+        src/ui/tui/panels/header_panel.cpp
+        src/ui/tui/panels/status_panel.cpp
+        src/ui/tui/panels/footer_panel.cpp
+        src/ui/tui/panels/gpu_panel.cpp
+        src/ui/tui/panels/performance_panel.cpp
+        src/ui/tui/panels/plugins_panel.cpp
+        src/ui/tui/panels/recent_hits_panel.cpp
+        src/ui/tui/panels/help_overlay.cpp
+        src/ui/tui/panels/wordlist_picker.cpp
+        src/ui/tui/panels/bloom_picker.cpp
+        # Phase 1..3 widgets (builder-panels)
+        src/ui/tui/widgets/sparkline.cpp
+        src/ui/tui/widgets/progress_bar.cpp
+        src/ui/tui/widgets/histogram.cpp
+        # Tier 2 D2 hero metrics (builder-panels, 2026-05-15)
+        src/ui/tui/widgets/big_digits.cpp
+    )
+
+    # Phase 2 (builder-gpu): NVML wrapper + GPU telemetry abstraction.
+    # nvml_query.cpp + gpu_telemetry_cuda.cpp on Windows + Linux; the
+    # .mm Metal variant on Mac.
+    if(NOT APPLE)
+        list(APPEND CORE_SOURCES
+            src/platform/nvml_query.cpp
+            src/platform/gpu_telemetry_cuda.cpp
+        )
+    else()
+        list(APPEND CORE_SOURCES
+            src/platform/gpu_telemetry_metal.mm
+        )
+        set_source_files_properties(src/platform/gpu_telemetry_metal.mm
+            PROPERTIES COMPILE_FLAGS "-fobjc-arc")
     endif()
 endif()
 
@@ -548,6 +824,30 @@ if(CORE_SOURCES)
         target_link_libraries(collider_core
             ${METAL_LIBRARY} ${FOUNDATION_LIBRARY}
         )
+    endif()
+    # NVML: feed the include dir + define to nvml_query.cpp. The
+    # library is loaded at runtime (dlopen / LoadLibraryA), so direct
+    # linking is unnecessary, but the header has to be on the include
+    # path or the wrapper can't see nvmlReturn_t etc.
+    if(NVML_INCLUDE_DIR AND COLLIDER_PRO)
+        target_include_directories(collider_core PRIVATE ${NVML_INCLUDE_DIR})
+        target_compile_definitions(collider_core PUBLIC COLLIDER_HAS_NVML=1)
+    endif()
+    # TUI: PUBLIC link FTXUI through collider_tui so the panel /
+    # widget translation units in collider_core can include FTXUI
+    # headers, and downstream consumers (the collider executable) get
+    # the same headers transitively without listing collider_tui again.
+    if(COLLIDER_PRO AND TARGET collider_tui)
+        target_link_libraries(collider_core collider_tui)
+    endif()
+    # session_log.cpp's Windows crash filter uses StackWalk64 + SymFromAddr
+    # from dbghelp.dll. The library is part of the Windows SDK so no
+    # find_package is needed; the link name is "dbghelp" on every MSVC
+    # toolchain. Non-Windows builds skip this branch and fall through to
+    # the POSIX backtrace() path in session_log.cpp which has no extra
+    # link requirements (glibc backtrace is in libc itself).
+    if(WIN32)
+        target_link_libraries(collider_core dbghelp)
     endif()
 else()
     # Create empty library if no sources exist yet
@@ -694,11 +994,23 @@ if(COLLIDER_BACKEND STREQUAL "CUDA")
         # algorithmic divergence; bloom impls were genuinely
         # interchangeable so consolidation made sense).
         src/gpu/h160_bloom_filter.cu
-        src/gpu/pipeline.cu
+        # T0.3.a (A-tier wave 1): src/gpu/pipeline.cu removed. It hosted
+        # the GPUPipeline + AsyncPipelineRunner orchestrator that was
+        # never instantiated in production (the brain-wallet runner uses
+        # brain_wallet_gpu.cpp + fused_pipeline.cu directly; the v2
+        # multi-address bridge was dead in v1.4.x; the bench driver
+        # calls the individual stage wrappers, not the orchestrator).
+        # The file was also a passthrough caller of the deleted
+        # secp256k1_batch_mul (windowed-mul double-shift bug); removing
+        # it was the only way to make the symbol-deletion clean.
         src/gpu/fused_pipeline.cu
         src/gpu/puzzle_gpu.cu
         src/gpu/puzzle_optimized.cu
         src/gpu/kangaroo_kernel.cu
+        # Q7: gpu-layer instrumentation callback storage. fused_pipeline.cu
+        # calls into this via the header; the runtime layer registers an
+        # adapter on top.
+        src/gpu/instrumentation_hook.cpp
     )
 
     # Pro-only GPU sources. The brain-wallet rule engine, mega-fused kernel,
@@ -710,12 +1022,17 @@ if(COLLIDER_BACKEND STREQUAL "CUDA")
             src/gpu/gpu_rule_kernel.cu
             src/gpu/gpu_rules.cu
             src/gpu/gpu_rules.cpp
-            src/gpu/mega_fused_kernel.cu
+            # Repair R5+R8: mega_fused_kernel.cu removed. The production
+            # brainwallet path runs through gpu_rules.cu's
+            # gpu_apply_rules_cross_product (rule expansion) and
+            # fused_pipeline.cu's brain_wallet_fused_kernel_fixed_stride
+            # (crypto+bloom); the mega-fused kernel was a never-invoked
+            # alternative.
         )
 
         # Brain Wallet v2 unity TU (Phase 4..9, v1.4.0). All v2 kernels
         # are consolidated into src/gpu/v2/v2_kernels_unity.cu so nvlink
-        # has a single device-symbol graph -- the alternative (one .cu
+        # has a single device-symbol graph; the alternative (one .cu
         # per kernel) overflows nvlink's default 1MB stack on Windows
         # given the cumulative collider_gpu symbol count.
         if(EXISTS "${CMAKE_SOURCE_DIR}/src/gpu/v2/v2_kernels_unity.cu" AND
@@ -731,12 +1048,18 @@ if(COLLIDER_BACKEND STREQUAL "CUDA")
     # Add RCKangaroo wrapper if enabled
     if(COLLIDER_USE_RCKANGAROO AND TARGET rckangaroo)
         list(APPEND GPU_SOURCES src/gpu/rckangaroo_wrapper.cu)
-        # CUDA IKangarooBackend adapter -- only compiled with RCKangaroo
+        # CUDA IKangarooBackend adapter; only compiled with RCKangaroo
         # active. Lives in collider_gpu (rather than collider_core)
         # because it #include's rckangaroo_wrapper.hpp; that keeps the
         # core lib free of CUDA dependencies on Free builds.
         if(EXISTS "${CMAKE_SOURCE_DIR}/src/gpu/cuda_rckangaroo_backend.cpp")
             list(APPEND GPU_SOURCES src/gpu/cuda_rckangaroo_backend.cpp)
+        endif()
+        # v1.4.2 builder-final: standalone-side RCKangaroo IKangarooBackend
+        # adapter. Lives alongside the pool-side adapter so the standalone
+        # puzzle runner gets save/load via the patched third_party hooks.
+        if(EXISTS "${CMAKE_SOURCE_DIR}/src/gpu/rc_kangaroo_backend.cpp")
+            list(APPEND GPU_SOURCES src/gpu/rc_kangaroo_backend.cpp)
         endif()
     endif()
 
@@ -827,6 +1150,23 @@ if(COLLIDER_BUILD_TOOLS)
             Threads::Threads
         )
     endif()
+
+    # v1.4.2: Bitcoin Core full-node address extractor for the
+    # --track-empty-hits workflow. Parses blk*.dat files directly; no
+    # bitcoind needed. Self-contained: just <filesystem> + the C++ stdlib.
+    if(EXISTS "${CMAKE_SOURCE_DIR}/src/tools/extract_node_addresses.cpp")
+        add_executable(extract_node_addresses
+            src/tools/extract_node_addresses.cpp
+        )
+        target_link_libraries(extract_node_addresses
+            Threads::Threads
+        )
+        # std::filesystem needs explicit linkage on older libstdc++.
+        if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND
+           CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9.1)
+            target_link_libraries(extract_node_addresses stdc++fs)
+        endif()
+    endif()
 endif()
 
 # ============================================================================
@@ -869,6 +1209,13 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/src/main.cpp")
         list(APPEND MAIN_LIBS collider_license)
     endif()
 
+    # brainwallet TUI: collider_tui is an INTERFACE library
+    # bundling ftxui::screen / dom / component. PRO-only since the TUI
+    # is wired into the brain wallet runtime.
+    if(COLLIDER_PRO AND TARGET collider_tui)
+        list(APPEND MAIN_LIBS collider_tui)
+    endif()
+
     if(COLLIDER_BACKEND STREQUAL "CUDA")
         list(APPEND MAIN_LIBS CUDA::cudart)
     elseif(COLLIDER_BACKEND STREQUAL "METAL")
@@ -884,6 +1231,19 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/src/main.cpp")
             CUDA_RESOLVE_DEVICE_SYMBOLS ON
             CUDA_RUNTIME_LIBRARY Shared
         )
+        # build fix: CMake + Ninja + nvcc on Windows generates a
+        # compile-PDB flag of the form `-Xcompiler=-FdCMakeFiles\collider.dir\,-FS`.
+        # The trailing backslash before the comma confuses nvcc's `-Xcompiler`
+        # comma-list parser ("A single input file is required for a non-link
+        # phase when an outputfile is specified"). Setting an explicit
+        # COMPILE_PDB_NAME gives the flag a real filename component so the
+        # trailing-backslash-then-comma pattern never appears.
+        if(MSVC)
+            set_target_properties(collider PROPERTIES
+                COMPILE_PDB_NAME "collider"
+                COMPILE_PDB_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
+            )
+        endif()
     endif()
 endif()
 
@@ -905,6 +1265,77 @@ if(COLLIDER_BUILD_TESTS)
         add_test(NAME PriorityQueue COMMAND test_priority_queue)
     endif()
 
+    # v1.4.2: per-GPU work balancer used by the brain wallet runtime to
+    # weight each GPU's slice by its rolling EMA throughput. Header-only
+    # (no link dependencies); exercised with synthetic samples so the
+    # test stays fast and runs on every backend.
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_work_balancer.cpp")
+        add_executable(test_work_balancer tests/test_work_balancer.cpp)
+        add_test(NAME WorkBalancer COMMAND test_work_balancer)
+    endif()
+
+    # v1.4.2 A.1: regression for Wild1-Wild2 kangaroo collision recovery.
+    # Header-only against crypto_cpu.hpp; no link dependencies.
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_mod_half.cpp")
+        add_executable(test_mod_half tests/test_mod_half.cpp)
+        add_test(NAME ModHalf COMMAND test_mod_half)
+    endif()
+
+    # T3.2 (2026-05-17): WarpWallet known-answer + property test
+    # (header-only crypto). Renamed back to test_warpwallet_kat.cpp now
+    # that real Keybase reference vectors are pinned alongside the
+    # property checks; see the test file header for the
+    # rename-and-restore rationale.
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_warpwallet_kat.cpp")
+        add_executable(test_warpwallet_kat tests/test_warpwallet_kat.cpp)
+        add_test(NAME WarpWalletKAT COMMAND test_warpwallet_kat)
+        # scrypt(N=2^18) is intentionally slow; allow a generous timeout.
+        # 3 KAT derivations + 3 property derivations = 6-18s in practice.
+        set_tests_properties(WarpWalletKAT PROPERTIES TIMEOUT 60)
+    endif()
+
+    # v1.4.2 L.2: BIP-39 mnemonic validation KAT.
+    # Run from the source tree so the test can locate the
+    # data/crypto/bip39_english.txt wordlist.
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_bip39_validate.cpp")
+        add_executable(test_bip39_validate tests/test_bip39_validate.cpp)
+        add_test(NAME Bip39Validate COMMAND test_bip39_validate
+                 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+        set_tests_properties(Bip39Validate PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+
+    # v1.4.2 A.3: regression for kangaroo Tame init range-offset reduction.
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_random_below.cpp")
+        add_executable(test_random_below tests/test_random_below.cpp)
+        add_test(NAME RandomBelow COMMAND test_random_below)
+    endif()
+
+    # v1.4.2 A.4: regression for kangaroo DP table full-256 keying.
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_dp_table_full256.cpp")
+        add_executable(test_dp_table_full256 tests/test_dp_table_full256.cpp)
+        add_test(NAME DpTableFull256 COMMAND test_dp_table_full256)
+    endif()
+
+    # v1.4.2 A.7: regression for bech32 BIP-173 checksum verification.
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_bech32_checksum.cpp")
+        add_executable(test_bech32_checksum tests/test_bech32_checksum.cpp)
+        add_test(NAME Bech32Checksum COMMAND test_bech32_checksum)
+    endif()
+
+    # v1.4.2 B.6: regression for STATS_RSP NaN/Inf clamp + UB-safe cast.
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_stats_sanitize.cpp")
+        add_executable(test_stats_sanitize tests/test_stats_sanitize.cpp)
+        add_test(NAME StatsSanitize COMMAND test_stats_sanitize)
+    endif()
+
+    # v1.4.2 Pool-B2: the dp_seq_window.hpp header and its test were deleted.
+    # The header was documented as the canonical spec both client and server
+    # must implement; in reality the C++ client never used it (the client is
+    # a sender only) and the Python server uses a different scheme
+    # (_dp_seq_high watermark + SEQ_REPLAY_WINDOW=1024 lookback). Dead code
+    # pretending to close audit finding H4 was misleading -- the actual
+    # replay-defence protocol is now documented in docs/jlp-protocol.md.
+
     # Platform tests
     if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_platform.cpp")
         add_executable(test_platform tests/test_platform.cpp)
@@ -924,13 +1355,113 @@ if(COLLIDER_BUILD_TESTS)
         add_test(NAME HashVectors COMMAND test_hash_vectors)
     endif()
 
-    # CLI parser + config-override matrix (Wave 5 / track-e, 2026-05-04).
-    # Header-only test against src/core/yaml_config.hpp; mirrors the parse_args
-    # in src/main.cpp (kept in sync; if you add a CLI flag, mirror it here).
+    # CLI parser + config-override matrix.
+    # The test links the real parser (src/cli/cli_parser.cpp) directly so
+    # parser bugs surface here. Previously the test re-implemented a
+    # parse_args mirror in-test "because parse_args lives in main.cpp"; the
+    # registry refactor (cli_parser.cpp + flag_spec.hpp) made that mirror
+    # unnecessary. We compile cli_parser.cpp into the test target rather
+    # than linking collider_core because collider_core pulls in detect_gpus,
+    # run_pool_mode, brain_wallet_runner, etc., none of which the parser
+    # needs. cli_parser.cpp itself has no library deps beyond Threads.
     if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_cli_parser.cpp")
-        add_executable(test_cli_parser tests/test_cli_parser.cpp)
+        add_executable(test_cli_parser
+            tests/test_cli_parser.cpp
+            src/cli/cli_parser.cpp
+        )
+        if(COLLIDER_PRO)
+            target_compile_definitions(test_cli_parser PRIVATE COLLIDER_PRO=1)
+        endif()
         target_link_libraries(test_cli_parser Threads::Threads)
         add_test(NAME CLIParser COMMAND test_cli_parser)
+    endif()
+
+    # v1.4.2 A-tier: generator-mode coverage. Walks StreamingBrainWallet
+    # forward through PHASE_CYCLING -> RULE_STACKING -> ... -> MARKOV ->
+    # PCFG -> KEYBOARD_WALK and asserts each new mode emits non-empty
+    # candidate batches. Locks down the Phase 4 wiring against
+    # accidental reversion to the prior stub-out.
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_generator_modes.cpp" AND COLLIDER_PRO)
+        add_executable(test_generator_modes tests/test_generator_modes.cpp)
+        target_link_libraries(test_generator_modes collider_core Threads::Threads)
+        target_include_directories(test_generator_modes PRIVATE ${CMAKE_SOURCE_DIR})
+        add_test(NAME GeneratorModes COMMAND test_generator_modes)
+    endif()
+
+    # Repair R1: regression cover for restore_state() into a non-PHASE_CYCLING
+    # iteration mode. Pre-R1 the mode-owned generator state (markov_matrix_,
+    # pcfg_grammar_, stacked_rules_, hybrid_mask_plans_, keyboard_walk_seeds_)
+    # was not re-initialized on resume, so next_candidate() returned "" until
+    # the iteration budget burned out.
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_resume_iteration_mode.cpp" AND COLLIDER_PRO)
+        add_executable(test_resume_iteration_mode tests/test_resume_iteration_mode.cpp)
+        target_link_libraries(test_resume_iteration_mode collider_core Threads::Threads)
+        target_include_directories(test_resume_iteration_mode PRIVATE ${CMAKE_SOURCE_DIR})
+        add_test(NAME ResumeIterationMode COMMAND test_resume_iteration_mode)
+    endif()
+
+    # --brute: BruteforceGenerator coverage. Charset, lex ordering,
+    # multi-length sequencing, mid-run resume, batch-boundary stability.
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_bruteforce_generator.cpp" AND COLLIDER_PRO)
+        add_executable(test_bruteforce_generator tests/test_bruteforce_generator.cpp)
+        target_link_libraries(test_bruteforce_generator collider_core)
+        target_include_directories(test_bruteforce_generator PRIVATE ${CMAKE_SOURCE_DIR})
+        add_test(NAME BruteforceGenerator COMMAND test_bruteforce_generator)
+    endif()
+
+    # task #5: brute-mode state save/load round-trip via
+    # BrainWalletSearchState. Pure CPU test, no GPU dependency.
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_brute_resume_state.cpp" AND COLLIDER_PRO)
+        add_executable(test_brute_resume_state tests/test_brute_resume_state.cpp)
+        target_include_directories(test_brute_resume_state PRIVATE ${CMAKE_SOURCE_DIR})
+        add_test(NAME BruteResumeState COMMAND test_brute_resume_state)
+    endif()
+
+    # v1.4.2 final-tier: multi-GPU concurrent dispatch regression for
+    # BW-B3. Skips with exit 77 on single-GPU rigs (covers CI Linux/Mac).
+    # The test is a .cu file and links CUDA::cudart, so it can only be
+    # built when CUDA is the active backend. The Mac / Metal build path
+    # has no equivalent test target; the Metal multi-GPU path is
+    # exercised by the bench_metal_kangaroo runner instead.
+    if(COLLIDER_PRO AND COLLIDER_USE_CUDA AND EXISTS "${CMAKE_SOURCE_DIR}/tests/test_multi_gpu_brain_wallet.cu" AND TARGET collider_core)
+        add_executable(test_multi_gpu_brain_wallet tests/test_multi_gpu_brain_wallet.cu)
+        set_target_properties(test_multi_gpu_brain_wallet PROPERTIES
+            CUDA_SEPARABLE_COMPILATION ON
+            CUDA_RUNTIME_LIBRARY Shared
+        )
+        target_link_libraries(test_multi_gpu_brain_wallet
+            collider_gpu collider_core CUDA::cudart Threads::Threads)
+        add_test(NAME MultiGpuBrainWallet COMMAND test_multi_gpu_brain_wallet)
+        # T3.15: gpu lock -- the multi-GPU dispatcher takes every visible
+        # device; running concurrent ctest jobs against the same physical
+        # GPU produces context conflicts and OOM races. RESOURCE_LOCK gpu
+        # is the canonical ctest serialisation token; every test in this
+        # file that touches a CUDA context shares the same lock so -j N
+        # can still parallelise the host-only suites.
+        set_tests_properties(MultiGpuBrainWallet PROPERTIES
+            SKIP_RETURN_CODE 77
+            RESOURCE_LOCK gpu)
+    endif()
+
+    # v1.4.2 quality: deterministic reproduction harness for the
+    # minute-47 brainwallet CUDA fault (operator-reported regression).
+    # Scenarios A/B/C exercise the large-to-small phase change, the
+    # phase change plus hit-handling file I/O delay, and the cumulative
+    # load path. RESOURCE_LOCK gpu serialises against other GPU tests;
+    # TIMEOUT 1800 leaves headroom for scenario C (cumulative cycles).
+    if(COLLIDER_PRO AND COLLIDER_USE_CUDA AND EXISTS "${CMAKE_SOURCE_DIR}/tests/test_phase_change_fault.cu" AND TARGET collider_core)
+        add_executable(test_phase_change_fault tests/test_phase_change_fault.cu)
+        set_target_properties(test_phase_change_fault PROPERTIES
+            CUDA_SEPARABLE_COMPILATION ON
+            CUDA_RUNTIME_LIBRARY Shared
+        )
+        target_link_libraries(test_phase_change_fault
+            collider_gpu collider_core CUDA::cudart Threads::Threads)
+        add_test(NAME PhaseChangeFault COMMAND test_phase_change_fault)
+        set_tests_properties(PhaseChangeFault PROPERTIES
+            SKIP_RETURN_CODE 77
+            RESOURCE_LOCK gpu
+            TIMEOUT 1800)
     endif()
 
     # KAT for range_bits_from_be in src/core/byte_codec.hpp. Pins the
@@ -940,7 +1471,7 @@ if(COLLIDER_BUILD_TESTS)
     # CudaRCKangarooBackend::initialize() to size the kangaroo solver.
     if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_range_bits.cpp")
         add_executable(test_range_bits tests/test_range_bits.cpp)
-        # Header-only target -- byte_codec.hpp is inline-only.
+        # Header-only target; byte_codec.hpp is inline-only.
         add_test(NAME RangeBitsKAT COMMAND test_range_bits)
     endif()
 
@@ -971,6 +1502,42 @@ if(COLLIDER_BUILD_TESTS)
     if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_kangaroo_work_file.cpp")
         add_executable(test_kangaroo_work_file tests/test_kangaroo_work_file.cpp)
         add_test(NAME KangarooWorkFileKAT COMMAND test_kangaroo_work_file)
+    endif()
+
+    # P-B1 dx==0 SIMT guard fuzz test (test-quality T5). Pins the
+    # algebraic correctness of the batch-inversion pre-process from
+    # kangaroo_step_kernel_jlp / kangaroo_step_kernel_sota. Host-only:
+    # mirrors the kernel's product-chain math against
+    # collider::cpu::mod_mul / mod_inv. The kernel-driver complement
+    # is test_kangaroo_dxz_kernel (T3.3, 2026-05-17) which exercises
+    # the same guard via the actual CUDA dispatch path.
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_kangaroo_dxz_fuzz.cpp")
+        add_executable(test_kangaroo_dxz_fuzz tests/test_kangaroo_dxz_fuzz.cpp)
+        add_test(NAME KangarooDxzFuzz COMMAND test_kangaroo_dxz_fuzz)
+    endif()
+
+    # T3.3 (2026-05-17). Kernel-driver complement to KangarooDxzFuzz.
+    # Launches test_only_kangaroo_dxz_guard_kernel (defined in
+    # src/gpu/kangaroo_kernel.cu) with crafted dx==0 inputs and
+    # verifies the SIMT guard fires in the actual CUDA kernel binary
+    # (the CPU mirror covers algebra; this covers the kernel path).
+    # Skips via SKIP_RETURN_CODE 77 when no CUDA device is available.
+    if(COLLIDER_USE_CUDA AND
+       EXISTS "${CMAKE_SOURCE_DIR}/tests/test_kangaroo_dxz_kernel.cu" AND
+       TARGET collider_core AND TARGET collider_gpu)
+        add_executable(test_kangaroo_dxz_kernel tests/test_kangaroo_dxz_kernel.cu)
+        set_target_properties(test_kangaroo_dxz_kernel PROPERTIES
+            CUDA_SEPARABLE_COMPILATION ON
+            CUDA_RUNTIME_LIBRARY Shared
+        )
+        target_link_libraries(test_kangaroo_dxz_kernel
+            collider_gpu collider_core CUDA::cudart)
+        add_test(NAME KangarooDxzKernel COMMAND test_kangaroo_dxz_kernel)
+        # gpu resource lock + skip code: same pattern as the
+        # MultiGpuBrainWallet / PuzzleOptimizedInv tests above.
+        set_tests_properties(KangarooDxzKernel PROPERTIES
+            SKIP_RETURN_CODE 77
+            RESOURCE_LOCK gpu)
     endif()
 
     # Metal kangaroo throughput benchmark. Production-shaped config
@@ -1015,7 +1582,11 @@ if(COLLIDER_BUILD_TESTS)
         )
         add_test(NAME BrainWalletV2 COMMAND test_brain_wallet_v2)
         # Skip exit code 77 if no CUDA device available at runtime.
-        set_tests_properties(BrainWalletV2 PROPERTIES SKIP_RETURN_CODE 77)
+        # T3.15: gpu lock -- this test runs CUDA kernels when a device
+        # is present. See MultiGpuBrainWallet for the lock rationale.
+        set_tests_properties(BrainWalletV2 PROPERTIES
+            SKIP_RETURN_CODE 77
+            RESOURCE_LOCK gpu)
     endif()
 
     # Metal secp256k1 known-answer test (Mac only). Validates the field
@@ -1083,7 +1654,7 @@ if(COLLIDER_BUILD_TESTS)
     # Brain Wallet v2 host-side orchestrator test (Phase 9 follow-up).
     # Pure C++ test; we link collider_gpu too because v2_orchestrator.cpp
     # (compiled into collider_core) references kernels from collider_gpu
-    # under #if COLLIDER_USE_CUDA -- the host code paths are dead in the
+    # under #if COLLIDER_USE_CUDA; the host code paths are dead in the
     # dry-run test, but the linker still needs the symbols.
     if(EXISTS "${CMAKE_SOURCE_DIR}/tests/v2/test_v2_orchestrator.cpp" AND COLLIDER_PRO)
         add_executable(test_v2_orchestrator tests/v2/test_v2_orchestrator.cpp)
@@ -1098,7 +1669,7 @@ if(COLLIDER_BUILD_TESTS)
     endif()
 
     # Phase 4: address-derivation CPU reference KATs.
-    # Pure C++ -- header-only SHA-256 + RIPEMD-160 + hash160 reference,
+    # Pure C++. Header-only SHA-256 + RIPEMD-160 + hash160 reference,
     # plus the five address-type derivations. Validated against published
     # test vectors (BIP-49 / BIP-84 / BIP-86 / Bitcoin Core).
     if(EXISTS "${CMAKE_SOURCE_DIR}/tests/v2/test_address_derive_cpu.cpp" AND COLLIDER_PRO)
@@ -1147,6 +1718,30 @@ if(COLLIDER_BUILD_TESTS)
         add_test(NAME Pbkdf2CPU COMMAND test_pbkdf2_cpu)
     endif()
 
+    # task F: Keccak-256 CPU reference KATs. Ethereum-flavor (0x01
+    # padding byte, NOT FIPS-202 SHA-3-256's 0x06). Validates the host-side
+    # reference that the device kernel mirrors.
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/v2/test_keccak256_cpu.cpp" AND COLLIDER_PRO)
+        add_executable(test_keccak256_cpu tests/v2/test_keccak256_cpu.cpp)
+        target_include_directories(test_keccak256_cpu PRIVATE
+            ${CMAKE_SOURCE_DIR}
+        )
+        add_test(NAME Keccak256Cpu COMMAND test_keccak256_cpu)
+    endif()
+
+    # task F stage 2: device Keccak-256 vs CPU reference parity.
+    if(COLLIDER_BACKEND STREQUAL "CUDA" AND COLLIDER_PRO
+       AND EXISTS "${CMAKE_SOURCE_DIR}/tests/v2/test_keccak256_device.cu")
+        add_executable(test_keccak256_device tests/v2/test_keccak256_device.cu)
+        set_target_properties(test_keccak256_device PROPERTIES
+            CUDA_SEPARABLE_COMPILATION ON
+        )
+        target_include_directories(test_keccak256_device PRIVATE
+            ${CMAKE_SOURCE_DIR}
+        )
+        add_test(NAME Keccak256Device COMMAND test_keccak256_device)
+    endif()
+
     # Phase 8: Electrum v1 + v2 mnemonic CPU reference KATs.
     if(EXISTS "${CMAKE_SOURCE_DIR}/tests/v2/test_electrum_cpu.cpp" AND COLLIDER_PRO)
         add_executable(test_electrum_cpu tests/v2/test_electrum_cpu.cpp)
@@ -1158,7 +1753,7 @@ if(COLLIDER_BUILD_TESTS)
 
     # Phase 10: license cache lifecycle tests.
     # Validates the HMAC-bound cache that gates Pro features after a
-    # successful remote validation. No filesystem / network -- the test
+    # successful remote validation. No filesystem / network; the test
     # surface (make_cache_payload / compute_cache_hmac / verify_cache_entry)
     # is the algorithm under test.
     if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_license_cache.cpp"
@@ -1193,10 +1788,19 @@ if(COLLIDER_BUILD_TESTS)
     endif()
 
     # JLP pool URL parser + DistinguishedPoint serialization unit tests.
-    # No sockets, no threads -- pure logic against the collider_pool library.
+    # No sockets, no threads; pure logic against the collider_pool library.
     if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_jlp_pool_manager.cpp" AND TARGET collider_pool)
         add_executable(test_jlp_pool_manager tests/test_jlp_pool_manager.cpp)
-        target_link_libraries(test_jlp_pool_manager collider_pool Threads::Threads)
+        # v1.4.2 quality: collider_pool now depends on the session_log
+        # symbols in collider_core (milestone/update_session_state/
+        # flush_session_state -- wired into the connect / AUTH / WORK_ASN
+        # / DP submit / disconnect paths in jlp_pool_client.cpp). The pool
+        # tests must therefore link collider_core too. Listing it AFTER
+        # collider_pool keeps the dependency-flow linker happy (consumers
+        # before producers on the gcc/clang link line; MSVC ignores the
+        # order).
+        target_link_libraries(test_jlp_pool_manager
+            collider_pool collider_core Threads::Threads)
         add_test(NAME JLPPoolManager COMMAND test_jlp_pool_manager)
     endif()
 
@@ -1216,7 +1820,10 @@ if(COLLIDER_BUILD_TESTS)
     # assignment, stats, DP submission, ping/pong, and pre-auth gating.
     if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_jlp_pool_protocol.cpp" AND TARGET collider_pool)
         add_executable(test_jlp_pool_protocol tests/test_jlp_pool_protocol.cpp)
-        target_link_libraries(test_jlp_pool_protocol collider_pool Threads::Threads)
+        # See JLPPoolManager above: collider_core supplies the
+        # session_log symbols collider_pool now references.
+        target_link_libraries(test_jlp_pool_protocol
+            collider_pool collider_core Threads::Threads)
         if(WIN32)
             # ws2_32 for the test's own mock-server WinSock calls (the
             # collider_pool library transitively links it too, but listing it
@@ -1225,18 +1832,53 @@ if(COLLIDER_BUILD_TESTS)
         endif()
         add_test(NAME JLPPoolProtocol COMMAND test_jlp_pool_protocol)
         # The protocol suite uses real threads + sockets; give it room.
-        set_tests_properties(JLPPoolProtocol PROPERTIES TIMEOUT 60)
+        # T3.15: RESOURCE_LOCK pool_port serialises this with the other
+        # JLP mock-server suites. Each one stands up an in-process listener
+        # on a fixed 127.0.0.1 port; parallel ctest invocations would race
+        # on the same port and fail with "address in use".
+        set_tests_properties(JLPPoolProtocol PROPERTIES
+            TIMEOUT 60
+            RESOURCE_LOCK pool_port)
     endif()
 
     # JLP pool reconnect / disconnect handling tests. Mock TCP server, no TLS.
     if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_jlp_pool_reconnect.cpp" AND TARGET collider_pool)
         add_executable(test_jlp_pool_reconnect tests/test_jlp_pool_reconnect.cpp)
-        target_link_libraries(test_jlp_pool_reconnect collider_pool Threads::Threads)
+        # See JLPPoolManager above: collider_core supplies the
+        # session_log symbols collider_pool now references.
+        target_link_libraries(test_jlp_pool_reconnect
+            collider_pool collider_core Threads::Threads)
         if(WIN32)
             target_link_libraries(test_jlp_pool_reconnect ws2_32)
         endif()
         add_test(NAME JLPPoolReconnect COMMAND test_jlp_pool_reconnect)
-        set_tests_properties(JLPPoolReconnect PROPERTIES TIMEOUT 60)
+        # T3.15: pool_port lock -- see JLPPoolProtocol above.
+        set_tests_properties(JLPPoolReconnect PROPERTIES
+            TIMEOUT 60
+            RESOURCE_LOCK pool_port)
+    endif()
+
+    # S1 regression: WORK_ASN dp_bits validation. Drives a mock server that
+    # sends out-of-range dp_bits values (255, 7, 33) and asserts the client
+    # rejects the assignment + disconnects without ever firing the work
+    # callback. Boundary values 8 and 32 must still pass.
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_jlp_pool_dp_bits_validation.cpp"
+       AND TARGET collider_pool)
+        add_executable(test_jlp_pool_dp_bits_validation
+            tests/test_jlp_pool_dp_bits_validation.cpp)
+        # See JLPPoolManager above: collider_core supplies the
+        # session_log symbols collider_pool now references.
+        target_link_libraries(test_jlp_pool_dp_bits_validation
+            collider_pool collider_core Threads::Threads)
+        if(WIN32)
+            target_link_libraries(test_jlp_pool_dp_bits_validation ws2_32)
+        endif()
+        add_test(NAME JLPPoolDpBitsValidation
+                 COMMAND test_jlp_pool_dp_bits_validation)
+        # T3.15: pool_port lock -- see JLPPoolProtocol above.
+        set_tests_properties(JLPPoolDpBitsValidation PROPERTIES
+            TIMEOUT 60
+            RESOURCE_LOCK pool_port)
     endif()
 
     # CUDA-only GPU correctness tests (Wave 0, 2026-05-04 review).
@@ -1249,14 +1891,17 @@ if(COLLIDER_BUILD_TESTS)
                 CUDA_SEPARABLE_COMPILATION ON
                 CUDA_RUNTIME_LIBRARY Shared
             )
-            target_link_libraries(test_secp256k1_inv collider_gpu CUDA::cudart)
+            target_link_libraries(test_secp256k1_inv collider_gpu collider_core CUDA::cudart)
             add_test(NAME Secp256k1Inv COMMAND test_secp256k1_inv)
-            set_tests_properties(Secp256k1Inv PROPERTIES SKIP_RETURN_CODE 77)
+            # T3.15: gpu lock -- see MultiGpuBrainWallet.
+            set_tests_properties(Secp256k1Inv PROPERTIES
+                SKIP_RETURN_CODE 77
+                RESOURCE_LOCK gpu)
         endif()
 
         # Device HMAC-SHA512 KAT (RFC 4231 TC1/TC2/TC4/TC6). Pins the
         # output of device::hmac_sha512 in src/gpu/v2/device_hashes.cuh
-        # against the published vectors -- catches regressions in the
+        # against the published vectors; catches regressions in the
         # streaming-rewrite stack-reduction refactor.
         if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_device_hmac_sha512.cu")
             add_executable(test_device_hmac_sha512 tests/test_device_hmac_sha512.cu)
@@ -1268,7 +1913,10 @@ if(COLLIDER_BUILD_TESTS)
                 PRIVATE ${CMAKE_SOURCE_DIR}/src)
             target_link_libraries(test_device_hmac_sha512 CUDA::cudart)
             add_test(NAME DeviceHmacSha512KAT COMMAND test_device_hmac_sha512)
-            set_tests_properties(DeviceHmacSha512KAT PROPERTIES SKIP_RETURN_CODE 77)
+            # T3.15: gpu lock -- see MultiGpuBrainWallet.
+            set_tests_properties(DeviceHmacSha512KAT PROPERTIES
+                SKIP_RETURN_CODE 77
+                RESOURCE_LOCK gpu)
         endif()
 
         if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_ec_table_consistency.cu")
@@ -1277,9 +1925,12 @@ if(COLLIDER_BUILD_TESTS)
                 CUDA_SEPARABLE_COMPILATION ON
                 CUDA_RUNTIME_LIBRARY Shared
             )
-            target_link_libraries(test_ec_table_consistency collider_gpu CUDA::cudart)
+            target_link_libraries(test_ec_table_consistency collider_gpu collider_core CUDA::cudart)
             add_test(NAME EcTableConsistency COMMAND test_ec_table_consistency)
-            set_tests_properties(EcTableConsistency PROPERTIES SKIP_RETURN_CODE 77)
+            # T3.15: gpu lock -- see MultiGpuBrainWallet.
+            set_tests_properties(EcTableConsistency PROPERTIES
+                SKIP_RETURN_CODE 77
+                RESOURCE_LOCK gpu)
         endif()
 
         # Wave 1 Track C C-CRIT-2 follow-up (2026-05-04). Validates the
@@ -1291,9 +1942,12 @@ if(COLLIDER_BUILD_TESTS)
                 CUDA_SEPARABLE_COMPILATION ON
                 CUDA_RUNTIME_LIBRARY Shared
             )
-            target_link_libraries(test_puzzle_optimized_inv collider_gpu CUDA::cudart)
+            target_link_libraries(test_puzzle_optimized_inv collider_gpu collider_core CUDA::cudart)
             add_test(NAME PuzzleOptimizedInv COMMAND test_puzzle_optimized_inv)
-            set_tests_properties(PuzzleOptimizedInv PROPERTIES SKIP_RETURN_CODE 77)
+            # T3.15: gpu lock -- see MultiGpuBrainWallet.
+            set_tests_properties(PuzzleOptimizedInv PROPERTIES
+                SKIP_RETURN_CODE 77
+                RESOURCE_LOCK gpu)
         endif()
 
         # GpuHash160 exercises the fused brain-wallet pipeline
@@ -1309,7 +1963,31 @@ if(COLLIDER_BUILD_TESTS)
             )
             target_link_libraries(test_gpu_hash160 collider_gpu collider_core CUDA::cudart)
             add_test(NAME GpuHash160 COMMAND test_gpu_hash160)
-            set_tests_properties(GpuHash160 PROPERTIES SKIP_RETURN_CODE 77)
+            # T3.15: gpu lock -- see MultiGpuBrainWallet.
+            set_tests_properties(GpuHash160 PROPERTIES
+                SKIP_RETURN_CODE 77
+                RESOURCE_LOCK gpu)
+        endif()
+
+        # GpuMultiAddr exercises the V2 multi_addr=true path of the fused
+        # brain-wallet kernel (the path the user's --brainwallet-v2 --resume
+        # session was on when it took the cudaErrorIllegalAddress fault).
+        # Insert mode rotates compressed P2PKH / uncompressed P2PKH /
+        # P2SH-P2WPKH so the kernel's fused_multiaddr_extra_check sub-paths
+        # are all exercised, and runs against both a pow-of-2 bloom (mask
+        # fast path) and a prime-size bloom (modulo path, same code as the
+        # production 2.57 GB bloom).
+        if(COLLIDER_PRO AND EXISTS "${CMAKE_SOURCE_DIR}/tests/test_gpu_multi_addr.cu" AND TARGET collider_core)
+            add_executable(test_gpu_multi_addr tests/test_gpu_multi_addr.cu)
+            set_target_properties(test_gpu_multi_addr PROPERTIES
+                CUDA_SEPARABLE_COMPILATION ON
+                CUDA_RUNTIME_LIBRARY Shared
+            )
+            target_link_libraries(test_gpu_multi_addr collider_gpu collider_core CUDA::cudart)
+            add_test(NAME GpuMultiAddr COMMAND test_gpu_multi_addr)
+            set_tests_properties(GpuMultiAddr PROPERTIES
+                SKIP_RETURN_CODE 77
+                RESOURCE_LOCK gpu)
         endif()
 
         # EC scalar multiplication known-answer test. Hands the GPU a few well
@@ -1324,9 +2002,89 @@ if(COLLIDER_BUILD_TESTS)
                 CUDA_SEPARABLE_COMPILATION ON
                 CUDA_RUNTIME_LIBRARY Shared
             )
-            target_link_libraries(test_ec_mul_known_answers collider_gpu CUDA::cudart)
+            target_link_libraries(test_ec_mul_known_answers collider_gpu collider_core CUDA::cudart)
             add_test(NAME EcMulKnownAnswers COMMAND test_ec_mul_known_answers)
-            set_tests_properties(EcMulKnownAnswers PROPERTIES SKIP_RETURN_CODE 77)
+            # T3.15: gpu lock -- see MultiGpuBrainWallet.
+            set_tests_properties(EcMulKnownAnswers PROPERTIES
+                SKIP_RETURN_CODE 77
+                RESOURCE_LOCK gpu)
+        endif()
+
+        # T3.1 (A-tier wave 1, 2026-05-17): regression KATs that pin the
+        # crypto-correctness landmines deleted in T0.3.a/b/c. Each test
+        # acts as a reintroduction trap for a deleted symbol; if the
+        # kernel is brought back, the test runs and asserts the
+        # reintroduced kernel passes the original KAT (or fails loudly
+        # if the contributor leaves the stub body in place). See the
+        # per-test comment block for the bug each one guards.
+
+        # T0.3.a guard: secp256k1_batch_mul (windowed batch-inversion
+        # variant, double 2^(5w) shift).
+        if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_secp256k1_batch_mul_kat.cu")
+            add_executable(test_secp256k1_batch_mul_kat
+                tests/test_secp256k1_batch_mul_kat.cu)
+            set_target_properties(test_secp256k1_batch_mul_kat PROPERTIES
+                CUDA_SEPARABLE_COMPILATION ON
+                CUDA_RUNTIME_LIBRARY Shared
+            )
+            target_link_libraries(test_secp256k1_batch_mul_kat
+                collider_gpu collider_core CUDA::cudart)
+            add_test(NAME Secp256k1BatchMulKAT
+                     COMMAND test_secp256k1_batch_mul_kat)
+            set_tests_properties(Secp256k1BatchMulKAT PROPERTIES
+                SKIP_RETURN_CODE 77
+                RESOURCE_LOCK gpu)
+        endif()
+
+        # T0.3.b absence trap: mega_fused_brainwallet_batch (orphaned
+        # persistent kernel that carried the same windowed-mul double-shift
+        # bug as the deleted ec_mul_batch_optimized_kernel). The previous
+        # registration shipped an always-pass stub; reauthored 2026-05-17 to
+        # actually scan the compiled collider_gpu.lib archive for the
+        # deleted symbol substrings. The test fails if any of them are
+        # found, catching accidental reintroduction via copy-paste, stale
+        # object file, or source-tree re-add.
+        #
+        # COLLIDER_GPU_LIB_PATH is injected as a compile-time string so the
+        # test can find the archive at runtime without depending on the
+        # working directory ctest happens to launch from. The test still
+        # has no link-time dependency on collider_gpu itself; the lib is
+        # only inspected as bytes.
+        if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_mega_fused_brainwallet_kat.cu")
+            add_executable(test_mega_fused_brainwallet_kat
+                tests/test_mega_fused_brainwallet_kat.cu)
+            set_target_properties(test_mega_fused_brainwallet_kat PROPERTIES
+                CUDA_SEPARABLE_COMPILATION ON
+                CUDA_RUNTIME_LIBRARY Shared
+            )
+            target_compile_definitions(test_mega_fused_brainwallet_kat PRIVATE
+                COLLIDER_GPU_LIB_PATH="$<TARGET_FILE:collider_gpu>")
+            add_dependencies(test_mega_fused_brainwallet_kat collider_gpu)
+            add_test(NAME MegaFusedBrainwalletAbsence
+                     COMMAND test_mega_fused_brainwallet_kat)
+            set_tests_properties(MegaFusedBrainwalletAbsence PROPERTIES
+                SKIP_RETURN_CODE 77)
+        endif()
+
+        # T0.3.c guard: sha256_batch (single-block sha256_hash that
+        # truncated inputs > 55 bytes). Unlike the two reintroduction
+        # traps above, sha256_batch is alive in production after the T0.3.c
+        # rewire to sha256_hash_long; this KAT pins the boundary so
+        # any future "fast path" cap at 55 fails on inputs of 56/64/100.
+        if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_sha256_batch_kat.cu")
+            add_executable(test_sha256_batch_kat
+                tests/test_sha256_batch_kat.cu)
+            set_target_properties(test_sha256_batch_kat PROPERTIES
+                CUDA_SEPARABLE_COMPILATION ON
+                CUDA_RUNTIME_LIBRARY Shared
+            )
+            target_link_libraries(test_sha256_batch_kat
+                collider_gpu collider_core CUDA::cudart)
+            add_test(NAME Sha256BatchKAT
+                     COMMAND test_sha256_batch_kat)
+            set_tests_properties(Sha256BatchKAT PROPERTIES
+                SKIP_RETURN_CODE 77
+                RESOURCE_LOCK gpu)
         endif()
 
         # Known-answer test for the puzzle / kangaroo EC multiplication path
@@ -1344,9 +2102,178 @@ if(COLLIDER_BUILD_TESTS)
                 CUDA_SEPARABLE_COMPILATION ON
                 CUDA_RUNTIME_LIBRARY Shared
             )
-            target_link_libraries(test_kangaroo_small_puzzle collider_gpu CUDA::cudart)
+            target_link_libraries(test_kangaroo_small_puzzle collider_gpu collider_core CUDA::cudart)
             add_test(NAME KangarooSmallPuzzle COMMAND test_kangaroo_small_puzzle)
-            set_tests_properties(KangarooSmallPuzzle PROPERTIES SKIP_RETURN_CODE 77)
+            # T3.15: gpu lock -- see MultiGpuBrainWallet.
+            set_tests_properties(KangarooSmallPuzzle PROPERTIES
+                SKIP_RETURN_CODE 77
+                RESOURCE_LOCK gpu)
+        endif()
+
+        # v1.4.2 C.1: KAT for the shared GLV decomposition header
+        # (src/gpu/glv_decompose.cuh). Self-contained; does not depend on
+        # collider_gpu (only includes the header), so a header bug fails
+        # this test directly without requiring the full puzzle/brainwallet
+        # pipeline. Verifies for each test scalar k: (a) Babai bound
+        # k1[3] == k2[3] == 0, (b) algebraic identity
+        # signed_k1 + signed_k2 * lambda == k (mod n).
+        if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_glv_decompose.cu")
+            add_executable(test_glv_decompose tests/test_glv_decompose.cu)
+            set_target_properties(test_glv_decompose PROPERTIES
+                CUDA_SEPARABLE_COMPILATION ON
+                CUDA_RUNTIME_LIBRARY Shared
+            )
+            target_link_libraries(test_glv_decompose CUDA::cudart)
+            add_test(NAME GlvDecompose COMMAND test_glv_decompose)
+            # T3.15: gpu lock -- GLV decompose runs a CUDA kernel even
+            # though the math is small; share the same lock as the rest.
+            set_tests_properties(GlvDecompose PROPERTIES
+                SKIP_RETURN_CODE 77
+                RESOURCE_LOCK gpu)
+        endif()
+    endif()
+
+    # ========================================================================
+    # brainwallet TUI overhaul: pre-registered test targets
+    # ========================================================================
+    # Wave 1 builder-foundation registers every test the plan introduces so
+    # downstream phase builders only fill in the .cpp content. Each stub
+    # ships as `int main(){return 0;}` so ctest is green throughout.
+    # PRO-only because every test exercises code that lives in collider_core
+    # under #if COLLIDER_PRO.
+    if(COLLIDER_PRO)
+        # Phase 1 (builder-threading: scan-state-atomics).
+        if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_scan_state_atomics.cpp"
+           AND TARGET collider_core)
+            add_executable(test_scan_state_atomics tests/test_scan_state_atomics.cpp)
+            target_link_libraries(test_scan_state_atomics collider_core)
+            add_test(NAME ScanStateAtomics COMMAND test_scan_state_atomics)
+        endif()
+
+        # Phase 1 (builder-panels: baseline-panels): FTXUI headless render.
+        if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_tui_panels.cpp"
+           AND TARGET collider_core)
+            add_executable(test_tui_panels tests/test_tui_panels.cpp)
+            target_link_libraries(test_tui_panels collider_core)
+            add_test(NAME TuiPanels COMMAND test_tui_panels)
+        endif()
+
+        # Phase 1 (builder-panels: baseline-panels): Unicode + ASCII sparkline.
+        if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_sparkline.cpp"
+           AND TARGET collider_core)
+            add_executable(test_sparkline tests/test_sparkline.cpp)
+            target_link_libraries(test_sparkline collider_core)
+            add_test(NAME Sparkline COMMAND test_sparkline)
+        endif()
+
+        # Phase 1 (builder-threading: cooked-mode-guard): fork-child SIGINT.
+        if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_cooked_mode_guard.cpp"
+           AND TARGET collider_core)
+            add_executable(test_cooked_mode_guard tests/test_cooked_mode_guard.cpp)
+            target_link_libraries(test_cooked_mode_guard collider_core)
+            add_test(NAME CookedModeGuard COMMAND test_cooked_mode_guard)
+        endif()
+
+        # Phase 2 (builder-gpu: nvml-wrapper): happy-path + degraded.
+        if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_nvml_wrapper.cpp"
+           AND TARGET collider_core)
+            add_executable(test_nvml_wrapper tests/test_nvml_wrapper.cpp)
+            target_link_libraries(test_nvml_wrapper collider_core)
+            if(COLLIDER_BACKEND STREQUAL "CUDA")
+                target_link_libraries(test_nvml_wrapper CUDA::cudart)
+            endif()
+            add_test(NAME NvmlWrapper COMMAND test_nvml_wrapper)
+            # T3.15: gpu lock -- NVML init shares the driver context with
+            # CUDA tests; serialise to avoid driver-init races.
+            set_tests_properties(NvmlWrapper PROPERTIES
+                SKIP_RETURN_CODE 77
+                RESOURCE_LOCK gpu)
+        endif()
+
+        # Phase 3 (builder-perf: cuda-event-instrumentation): synthetic stream.
+        if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_perf_instrumentation.cpp"
+           AND TARGET collider_core)
+            add_executable(test_perf_instrumentation tests/test_perf_instrumentation.cpp)
+            target_link_libraries(test_perf_instrumentation collider_core)
+            # Q7: perf_instrumentation.cpp now registers a gpu-side adapter
+            # via collider::gpu::instrumentation::register_callbacks, whose
+            # storage lives in collider_gpu (instrumentation_hook.cpp). The
+            # test must link collider_gpu to resolve that symbol.
+            if(COLLIDER_BACKEND STREQUAL "CUDA" AND TARGET collider_gpu)
+                target_link_libraries(test_perf_instrumentation collider_gpu)
+            endif()
+            if(COLLIDER_BACKEND STREQUAL "CUDA")
+                target_link_libraries(test_perf_instrumentation CUDA::cudart)
+            endif()
+            add_test(NAME PerfInstrumentation COMMAND test_perf_instrumentation)
+        endif()
+
+        # Phase 4 (builder-threading: runtime-control-input).
+        if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_input_handler.cpp"
+           AND TARGET collider_core)
+            add_executable(test_input_handler tests/test_input_handler.cpp)
+            target_link_libraries(test_input_handler collider_core)
+            add_test(NAME InputHandler COMMAND test_input_handler)
+        endif()
+
+        # Phase 4 (builder-threading: runtime-yaml): round-trip load/save.
+        if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_runtime_yaml.cpp"
+           AND TARGET collider_core)
+            add_executable(test_runtime_yaml tests/test_runtime_yaml.cpp)
+            target_link_libraries(test_runtime_yaml collider_core)
+            add_test(NAME RuntimeYaml COMMAND test_runtime_yaml)
+        endif()
+
+        # Phase 5 (builder-threading: streaming-generator-hot-swap).
+        if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_wordlist_hot_swap.cpp"
+           AND TARGET collider_core)
+            add_executable(test_wordlist_hot_swap tests/test_wordlist_hot_swap.cpp)
+            target_link_libraries(test_wordlist_hot_swap collider_core)
+            add_test(NAME WordlistHotSwap COMMAND test_wordlist_hot_swap)
+        endif()
+
+        # Phase 5 (builder-threading: plugin-runner): synthetic echo plugin.
+        if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_plugin_runner.cpp"
+           AND TARGET collider_core)
+            add_executable(test_plugin_runner tests/test_plugin_runner.cpp)
+            target_link_libraries(test_plugin_runner collider_core)
+            add_test(NAME PluginRunner COMMAND test_plugin_runner)
+        endif()
+
+        # Tier 1 perf F-log (builder-perf): EmptyHitWriter steady-state,
+        # overflow drop-oldest, and concurrent stop+enqueue scenarios.
+        if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_empty_hit_writer.cpp"
+           AND TARGET collider_core)
+            add_executable(test_empty_hit_writer tests/test_empty_hit_writer.cpp)
+            target_link_libraries(test_empty_hit_writer collider_core Threads::Threads)
+            add_test(NAME EmptyHitWriter COMMAND test_empty_hit_writer)
+        endif()
+
+        # 2026-05-17 reviewer coverage: redact_argv golden cases, the
+        # SessionState JSON shape, shutdown_session_log double-fire
+        # guard, prune_old_logs at the kSessionLogRetainCount boundary,
+        # and the atomic_write_state_file tmp+rename + unwind contract.
+        # Routes through collider::log::detail trampolines so the test
+        # exec does not need anonymous-namespace internals.
+        if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_session_log.cpp"
+           AND TARGET collider_core)
+            add_executable(test_session_log tests/test_session_log.cpp)
+            target_link_libraries(test_session_log collider_core)
+            add_test(NAME SessionLog COMMAND test_session_log)
+        endif()
+
+        # Bloom false-positive-rate KAT (Tier 4 T7). Pins the empirical FP
+        # rate of UTXOBloomBuilder at 1e-5 (loose GPU bloom) and 1e-7
+        # (tight CPU bloom) within a 2x band. Header-only against
+        # src/tools/utxo_bloom_builder.hpp; no link deps beyond the C++
+        # runtime and bech32. Runs in both Free and Pro builds; the bloom
+        # math is edition-agnostic.
+        if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_bloom_fp_rate.cpp")
+            add_executable(test_bloom_fp_rate tests/test_bloom_fp_rate.cpp)
+            add_test(NAME BloomFpRate COMMAND test_bloom_fp_rate)
+            # 10M MurmurHash3-128 probes per trial; ~3-5s on desktop CPU,
+            # generous timeout for slower CI runners.
+            set_tests_properties(BloomFpRate PROPERTIES TIMEOUT 120)
         endif()
     endif()
 endif()
@@ -1355,9 +2282,19 @@ endif()
 # Benchmarks
 # ============================================================================
 if(COLLIDER_BUILD_BENCHMARKS AND COLLIDER_BACKEND STREQUAL "CUDA")
-    if(EXISTS "${CMAKE_SOURCE_DIR}/benchmarks/bench_gpu_pipeline.cu")
+    # Standalone full-pipeline benchmark. Pro-only because the bench core
+    # depends on the fused brain-wallet kernels in collider_gpu (free
+    # build's GPU library does not include them) and on the PerfCollector
+    # symbols in collider_core that fused_pipeline.cu references.
+    if(COLLIDER_PRO AND EXISTS "${CMAKE_SOURCE_DIR}/benchmarks/bench_gpu_pipeline.cu"
+       AND TARGET collider_core AND TARGET collider_gpu)
         add_executable(bench_gpu_pipeline benchmarks/bench_gpu_pipeline.cu)
+        set_target_properties(bench_gpu_pipeline PROPERTIES
+            CUDA_SEPARABLE_COMPILATION ON
+            CUDA_RUNTIME_LIBRARY Shared
+        )
         target_link_libraries(bench_gpu_pipeline
+            collider_core
             collider_gpu
             CUDA::cudart
         )
@@ -1365,7 +2302,7 @@ if(COLLIDER_BUILD_BENCHMARKS AND COLLIDER_BACKEND STREQUAL "CUDA")
 
     # v1.4.1 BW-DEDUP-3: bench_bloom_ab.cu was used to pick between
     # the two bloom impls. After the verdict (B-texture wins), the
-    # losing impl was deleted and the bench retired -- its purpose
+    # losing impl was deleted and the bench retired; its purpose
     # is served. A future B-global-vs-B-texture bench would be a
     # different harness (h160_bloom_filter.cu has no CUDA insert
     # wrapper, so the throughput-only comparison would look quite

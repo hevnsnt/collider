@@ -156,6 +156,30 @@ int main(int argc, char* argv[]) {
                       << (static_cast<double>(stats.num_bits) / stats.elements_added) << "\n";
         }
 
+        // v1.4.2 undersize warning: the bloom was sized for `expected_elements`
+        // but the CSV contained substantially more usable addresses. The
+        // actual FP rate is now much higher than the target, so every scan
+        // produces far more false positives than the operator planned for.
+        // Recommend a re-run with the correct -e value so the FP budget is
+        // honoured.
+        if (stats.elements_added > config.expected_elements * 11 / 10) {
+            uint64_t suggested_e = stats.elements_added + stats.elements_added / 10;
+            std::cerr << "\n[!] WARNING: bloom was sized for " << config.expected_elements
+                      << " elements but " << stats.elements_added << " were added.\n"
+                      << "    Estimated FP rate is " << (stats.estimated_fp_rate * 100)
+                      << "% (target was " << (fp_rate * 100) << "%).\n"
+                      << "    Re-run with: -e " << suggested_e
+                      << " for the target FP rate.\n";
+        } else if (stats.elements_added * 2 < config.expected_elements) {
+            // Inverse problem: bloom is way oversized. Less harmful but
+            // wastes GPU memory.
+            std::cerr << "\n[!] NOTE: bloom is oversized (" << stats.elements_added
+                      << " elements added, expected " << config.expected_elements
+                      << "). Disk + VRAM footprint is " << stats.size_mb
+                      << " MB; you could rebuild with -e " << stats.elements_added
+                      << " to halve the size at the same FP rate.\n";
+        }
+
         std::cout << "\nDone! Filter saved to: " << output_file << "\n";
 
         if (!verify_file.empty()) {

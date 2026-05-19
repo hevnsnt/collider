@@ -72,7 +72,6 @@ inline std::string truncate_visible(std::string_view s, std::size_t max_len) {
 }
 
 // Render `|  <label>: <value>[pad] |\n`.
-//
 // label_color and value_color are ANSI escape sequences inserted
 // AROUND the visible label/value text -- they don't count toward
 // visible width. Visible budget for value = kInnerWidth - 2 (leading

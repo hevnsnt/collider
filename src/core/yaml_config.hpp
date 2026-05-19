@@ -10,12 +10,15 @@
  *   3. Arguments default values.
  *
  * The CLIFlags struct is populated INSIDE parse_args at the moment argv supplies
- * a value -- not inferred post-parse from the resulting Arguments. This eliminates
+ * a value, not inferred post-parse from the resulting Arguments. This eliminates
  * the entire "value silently overridden" bug class documented in track-e
  * (e.g. --batch-size 4000000, --random against random_search:false, --puzzle 0).
  */
 
 #pragma once
+
+#include "paths.hpp"
+#include "secure_buffer.hpp"  // SecureString for the pool password
 
 #include <string>
 #include <fstream>
@@ -35,7 +38,11 @@ struct AppConfig {
     // Pool configuration
     std::string pool_url;
     std::string pool_worker;
-    std::string pool_password;
+    // Pool password. Held as SecureString (zero-on-free) so the credential
+    // does not survive in unwiped std::string heap allocations from config
+    // load to program end. Wiped on AppConfig destruction and explicitly
+    // wiped at the run_pool_mode boundary right after handoff.
+    ::collider::SecureString pool_password;
     std::string pool_api_key;
 
     // Puzzle configuration
@@ -49,10 +56,9 @@ struct AppConfig {
     bool auto_next = false;
     std::string checkpoint;
 
-    // v1.4.1: per-run target / range / pubkey override. Each field is
+    // per-run target / range / pubkey override. Each field is
     // empty by default; non-empty values overlay onto Arguments only
     // when the matching CLIFlags bit is unset (CLI flags win).
-    //
     //   target   - Bitcoin address to scan against (overrides the
     //              puzzle's bundled address from puzzle_history.json)
     //   start    - Range start in hex (with 0x prefix)
@@ -75,6 +81,19 @@ struct AppConfig {
 
     // Bloom filter
     std::string bloom_file;
+    std::string verify_set_file;  // UVRF companion file for HitVerifier
+    std::string bloom_tight_file;  // tight CPU bloom for dual-bloom empty-hit re-probe
+    // Three-state: nullopt = use runner auto-detect (default true when both
+    // bloom_tight_file and verify_set_file resolve); true/false = explicit
+    // operator preference that overrides auto-detect.
+    int bloom_track_empty_hits = -1;  // -1 = unset, 0 = false, 1 = true
+
+    // TUI toggle. -1 = unset (runner auto-detects TTY at run time);
+    // 0 = config explicitly disables the TUI (equivalent to --no-tui);
+    // 1 = config explicitly enables the TUI (equivalent to --tui). CLI flags
+    // (--no-tui / --tui) win over config via the no_tui_user_set sentinel
+    // in Arguments, mirroring the bloom.track_empty_hits resolution pattern.
+    int tui_enabled = -1;
 
     // GPU configuration
     std::vector<int> gpu_devices;
@@ -103,18 +122,14 @@ struct AppConfig {
         paths.push_back("./config.yml");
         paths.push_back("./config.yaml");
 
-        // 2. User home directory
-        std::string home;
-#ifdef _WIN32
-        const char* userprofile = std::getenv("USERPROFILE");
-        home = userprofile ? userprofile : "";
-#else
-        const char* home_env = std::getenv("HOME");
-        home = home_env ? home_env : "";
-#endif
-        if (!home.empty()) {
-            paths.push_back(home + "/.collider/config.yml");
-            paths.push_back(home + "/.collider/config.yaml");
+        // 2. User home directory. paths::collider_home() falls back to
+        // "./.collider" when neither USERPROFILE nor HOME is set; the old
+        // open-coded version skipped these entries entirely on an empty home.
+        // We preserve that behaviour by checking the home() helper first.
+        if (collider::paths::home() != std::filesystem::path(".")) {
+            const auto home_collider = collider::paths::collider_home();
+            paths.push_back((home_collider / "config.yml").string());
+            paths.push_back((home_collider / "config.yaml").string());
         }
 
         return paths;
@@ -230,7 +245,16 @@ private:
         if (section == "pool") {
             if (key == "url") pool_url = value;
             else if (key == "worker") pool_worker = value;
-            else if (key == "password") pool_password = value;
+            else if (key == "password") {
+                // Move into SecureString so the std::string `value` does not
+                // leave a wipe-less copy behind. `value` itself is a local
+                // std::string built by the loader; after assign() its bytes
+                // may persist in the std::string's heap allocation until the
+                // call frame returns, but assign() copies into the
+                // SecureString's wiped-on-free storage which is the only
+                // long-lived copy.
+                pool_password.assign(value.data(), value.size());
+            }
             else if (key == "api_key") pool_api_key = value;
         }
         else if (section == "puzzle") {
@@ -243,7 +267,7 @@ private:
             else if (key == "random_search") random_search = parse_bool(value);
             else if (key == "auto_next") auto_next = parse_bool(value);
             else if (key == "checkpoint") checkpoint = value;
-            // v1.4.1: target / range / pubkey overrides
+            // target / range / pubkey overrides
             else if (key == "target") puzzle_target = value;
             else if (key == "start") puzzle_start = value;
             else if (key == "end") puzzle_end = value;
@@ -257,6 +281,11 @@ private:
         }
         else if (section == "bloom") {
             if (key == "file") bloom_file = value;
+            else if (key == "verify_set") verify_set_file = value;
+            else if (key == "tight") bloom_tight_file = value;
+            else if (key == "track_empty_hits") {
+                bloom_track_empty_hits = parse_bool(value) ? 1 : 0;
+            }
         }
         else if (section == "gpu") {
             if (key == "devices") gpu_devices = parse_int_list(value);
@@ -272,6 +301,15 @@ private:
             if (key == "data_dir") data_dir = value;
             else if (key == "checkpoint_dir") checkpoint_dir = value;
             else if (key == "log_dir") log_dir = value;
+        }
+        else if (section == "tui") {
+            // TUI toggle. Mirrors bloom.track_empty_hits's three-state
+            // (nullopt / 0 / 1) shape so CLI --no-tui / --tui beats config when
+            // explicitly set, while leaving the runner's auto-detect logic to
+            // handle the unset case.
+            if (key == "enabled") {
+                tui_enabled = parse_bool(value) ? 1 : 0;
+            }
         }
     }
 
@@ -310,15 +348,13 @@ private:
 public:
     // -----------------------------------------------------------------------
     // Pool worker (BTC payout address) persistence.
-    //
     // Guided mode in interactive_ui calls save_pool_worker() after the user
     // enters their BTC address so the next launch defaults to it. We touch
     // ONLY ~/.collider/config.yml (or %USERPROFILE%/.collider/config.yml on
-    // Windows) -- never the user's working-directory ./config.yml, which is
+    // Windows), never the user's working-directory ./config.yml, which is
     // the operator-managed file. A power user with their own config remains
     // in control; the home-directory file is purely the "remember my BTC
     // address from guided mode" store.
-    //
     // Returns the path written, or empty string on any failure (callers
     // emit a hint, never abort).
     // -----------------------------------------------------------------------
@@ -326,21 +362,18 @@ public:
                                          const std::string& pool_url = "") {
         if (worker_addr.empty()) return {};
 
-        std::string home;
-#ifdef _WIN32
-        const char* userprofile = std::getenv("USERPROFILE");
-        home = userprofile ? userprofile : "";
-#else
-        const char* home_env = std::getenv("HOME");
-        home = home_env ? home_env : "";
-#endif
-        if (home.empty()) return {};
+        // The original code returned empty (no-op) when neither HOME nor
+        // USERPROFILE was set; we preserve that by checking against the "."
+        // last-resort fallback from paths::home(). Writing the guided-mode
+        // BTC address into ./.collider/config.yml would be surprising for
+        // operators who launched from a working dir, so we keep the skip.
+        if (collider::paths::home() == std::filesystem::path(".")) return {};
 
-        std::filesystem::path dir = std::filesystem::path(home) / ".collider";
+        const std::filesystem::path dir = collider::paths::collider_home();
         std::error_code ec;
         std::filesystem::create_directories(dir, ec);
         // Even if create_directories fails (e.g. read-only home), keep
-        // going -- the open-for-write below will be the authoritative
+        // going; the open-for-write below will be the authoritative
         // failure point.
 
         const std::filesystem::path file_path = dir / "config.yml";
@@ -365,16 +398,16 @@ public:
                     return file_path.string();  // Already configured.
                 }
             }
-            // Existing file but no pool.worker -- don't risk corrupting
+            // Existing file but no pool.worker; don't risk corrupting
             // it with a hand-rolled YAML edit. Hint and return.
             return {};
         }
 
-        // File does not exist -- write a minimal new one.
+        // File does not exist; write a minimal new one.
         std::ofstream out(file_path);
         if (!out) return {};
         out << "# theCollider config (auto-created from guided mode).\n";
-        out << "# Edit freely -- the format is documented in example-config.yml.\n";
+        out << "# Edit freely; the format is documented in example-config.yml.\n";
         out << "\n";
         out << "pool:\n";
         out << "  worker: \"" << worker_addr << "\"\n";
@@ -387,10 +420,10 @@ public:
 };
 
 /**
- * CLI flags tracking struct -- one bit per Arguments field.
+ * CLI flags tracking struct: one bit per Arguments field.
  *
  * Each *_set bit is set INSIDE parse_args at the moment argv supplies the value.
- * apply_config_to_args() consults these bits before overriding -- if the bit is
+ * apply_config_to_args() consults these bits before overriding; if the bit is
  * true, config never overrides the CLI value, regardless of whether the CLI value
  * happens to equal the Arguments default.
  *
@@ -403,6 +436,7 @@ struct CLIFlags {
     bool pool_url_set = false;          // --pool / -p
     bool pool_worker_set = false;       // --worker / -w
     bool pool_password_set = false;     // --pool-password
+    bool pool_password_file_set = false; // --pool-password-file
     bool pool_api_key_set = false;      // --pool-api-key
     bool brainwallet_set = false;       // --brainwallet
 
@@ -416,7 +450,7 @@ struct CLIFlags {
     bool puzzle_auto_next_set = false;  // --auto-next
     bool puzzle_kangaroo_set = false;   // --kangaroo
     bool smart_select_set = false;      // --no-smart
-    // v1.4.1: per-run override flags
+    // per-run override flags
     bool puzzle_target_set = false;     // --puzzle-target
     bool puzzle_start_set = false;      // --puzzle-start
     bool puzzle_end_set = false;        // --puzzle-end
@@ -462,7 +496,14 @@ void apply_config_to_args(Arguments& args, const AppConfig& config, const CLIFla
         args.pool_worker = config.pool_worker;
     }
     if (!cli.pool_password_set && !config.pool_password.empty()) {
-        args.pool_password = config.pool_password;
+        // SecureString is move-only; explicitly byte-copy into the
+        // Arguments slot. config is `const` here (multiple callers,
+        // including unit tests, rely on that), so a non-owning assign()
+        // is the right primitive. The config-side copy gets wiped on
+        // AppConfig destruction; the Arguments-side copy gets wiped at
+        // the run_pool_mode handoff (or on Arguments destruction).
+        args.pool_password.assign(config.pool_password.data(),
+                                  config.pool_password.size());
     }
     if (!cli.pool_api_key_set && !config.pool_api_key.empty()) {
         args.pool_api_key = config.pool_api_key;
@@ -487,7 +528,7 @@ void apply_config_to_args(Arguments& args, const AppConfig& config, const CLIFla
         args.puzzle_checkpoint = config.checkpoint;
     }
 
-    // v1.4.1: target / range / pubkey overlay. CLI wins when set.
+    // target / range / pubkey overlay. CLI wins when set.
     if (!cli.puzzle_target_set && !config.puzzle_target.empty()) {
         args.puzzle_target = config.puzzle_target;
     }
@@ -548,16 +589,44 @@ void apply_config_to_args(Arguments& args, const AppConfig& config, const CLIFla
         args.bloom_file = config.bloom_file;
 #else
         std::cerr << "[Pro] Ignoring bloom filter '" << config.bloom_file
-                  << "' from config -- opportunistic address scanning is a "
+                  << "' from config; opportunistic address scanning is a "
                      "Pro feature. https://collisionprotocol.com/pro"
                   << std::endl;
 #endif
+    }
+#ifdef COLLIDER_PRO
+    // UVRF verify-set overlay (Pro-only; HitVerifier rejects pure
+    // bloom collisions before display). CLI --verify-set wins over config.
+    if (args.verify_set_file.empty() && !config.verify_set_file.empty()) {
+        args.verify_set_file = config.verify_set_file;
+    }
+    // Tight bloom + track_empty_hits: CLI wins, then config.yml, then
+    // runner auto-detect. The runner consults args.track_empty_hits_user_set
+    // to know whether to override its auto-decision when neither CLI nor
+    // config pinned a value.
+    if (args.bloom_tight_file.empty() && !config.bloom_tight_file.empty()) {
+        args.bloom_tight_file = config.bloom_tight_file;
+    }
+    if (!args.track_empty_hits_user_set && config.bloom_track_empty_hits >= 0) {
+        args.track_empty_hits = (config.bloom_track_empty_hits != 0);
+        args.track_empty_hits_user_set = true;
+    }
+#endif
+
+    // TUI toggle resolution. CLI --no-tui / --tui already set the
+    // user_set sentinel inside parse_args_core; only fall back to config when
+    // neither flag was supplied. Pin the sentinel so the runner skips its
+    // TTY auto-detect branch (config-driven choices are deliberate).
+    if (!args.no_tui_user_set && config.tui_enabled >= 0) {
+        args.no_tui = (config.tui_enabled == 0);
+        args.no_tui_user_set = true;
     }
     if (!cli.gpu_ids_set && !config.gpu_devices.empty()) {
         args.gpu_ids = config.gpu_devices;
     }
     if (!cli.batch_size_set && config.batch_size > 0) {
         args.batch_size = config.batch_size;
+        args.batch_size_auto = false;
     }
     if (!cli.force_calibrate_set && config.force_calibrate) {
         args.calibrate = true;

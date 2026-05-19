@@ -49,132 +49,25 @@ static __constant__ uint32_t SHA256_H0[8] = {
 
 // Bitwise operations now come from hash_rounds.cuh via the using-decls above.
 
-/**
- * SHA256 hash of a single message.
- *
- * @param message Input message bytes
- * @param len Message length (max 55 bytes for single block)
- * @param hash Output 32-byte hash
- */
-__device__ void sha256_hash(
-    const uint8_t* message,
-    size_t len,
-    uint8_t* hash
-) {
-    uint32_t W[64];
-    uint32_t H[8];
-
-    // Initialize hash values
-    #pragma unroll
-    for (int i = 0; i < 8; i++) {
-        H[i] = SHA256_H0[i];
-    }
-
-    // Prepare message block with padding
-    // For simplicity, assume single block (len <= 55)
-    uint8_t block[64] = {0};
-
-    // Copy message
-    for (size_t i = 0; i < len && i < 55; i++) {
-        block[i] = message[i];
-    }
-
-    // Append 1 bit
-    block[len] = 0x80;
-
-    // Append length in bits (big-endian)
-    uint64_t bit_len = len * 8;
-    block[56] = (bit_len >> 56) & 0xff;
-    block[57] = (bit_len >> 48) & 0xff;
-    block[58] = (bit_len >> 40) & 0xff;
-    block[59] = (bit_len >> 32) & 0xff;
-    block[60] = (bit_len >> 24) & 0xff;
-    block[61] = (bit_len >> 16) & 0xff;
-    block[62] = (bit_len >> 8) & 0xff;
-    block[63] = bit_len & 0xff;
-
-    // Parse block into 16 32-bit words (big-endian)
-    #pragma unroll
-    for (int i = 0; i < 16; i++) {
-        W[i] = (block[i*4] << 24) |
-               (block[i*4 + 1] << 16) |
-               (block[i*4 + 2] << 8) |
-               block[i*4 + 3];
-    }
-
-    // Extend to 64 words
-    #pragma unroll
-    for (int i = 16; i < 64; i++) {
-        W[i] = gamma1(W[i-2]) + W[i-7] + gamma0(W[i-15]) + W[i-16];
-    }
-
-    // Initialize working variables
-    uint32_t a = H[0], b = H[1], c = H[2], d = H[3];
-    uint32_t e = H[4], f = H[5], g = H[6], h = H[7];
-
-    // Main loop - OPTIMIZED: Partial unroll (8 iterations) for reduced register pressure
-    // Full unroll of 64 iterations causes register spilling; 8 is optimal for Blackwell
-    #pragma unroll 8
-    for (int i = 0; i < 64; i++) {
-        uint32_t t1 = h + sigma1(e) + ch(e, f, g) + K[i] + W[i];
-        uint32_t t2 = sigma0(a) + maj(a, b, c);
-
-        h = g;
-        g = f;
-        f = e;
-        e = d + t1;
-        d = c;
-        c = b;
-        b = a;
-        a = t1 + t2;
-    }
-
-    // Add to hash
-    H[0] += a; H[1] += b; H[2] += c; H[3] += d;
-    H[4] += e; H[5] += f; H[6] += g; H[7] += h;
-
-    // Output hash (big-endian)
-    #pragma unroll
-    for (int i = 0; i < 8; i++) {
-        hash[i*4]     = (H[i] >> 24) & 0xff;
-        hash[i*4 + 1] = (H[i] >> 16) & 0xff;
-        hash[i*4 + 2] = (H[i] >> 8) & 0xff;
-        hash[i*4 + 3] = H[i] & 0xff;
-    }
-}
+// T0.3.c (A-tier wave 1): the single-block `sha256_hash(msg, len, out)`
+// previously defined here truncated len > 55 (the `for (size_t i = 0;
+// i < len && i < 55; i++)` copy loop) and then wrote the 1-bit and the
+// 8-byte big-endian length into a 64-byte block as if the input had
+// been the full `len`. Result: silently-wrong digests for any
+// passphrase / message >= 55 bytes. Wave-1 A-CRIT-1 patched the same
+// bug in the fused brain-wallet path; this standalone copy never got
+// the matching fix and was still wired into `sha256_batch_kernel` via
+// `sha256_batch`, which `bench_pipeline.cpp` stage 1 and
+// `puzzle_solver_benchmark.cpp` drove with `lengths[i] = 64`. The
+// truncating helper is deleted entirely; `sha256_batch_kernel` now
+// calls `sha256_hash_long` (multi-block, FIPS 180-4-correct for any
+// length including the 55/56/63/64 boundary). tests/test_sha256_batch_kat.cu
+// pins the boundary so any future re-introduction of a single-block
+// truncation fails KAT on inputs of 56/64/100 bytes.
 
 /**
- * Batch SHA256 kernel.
- *
- * Each thread processes one passphrase.
- *
- * @param passphrases Concatenated passphrases
- * @param offsets Start offset of each passphrase
- * @param lengths Length of each passphrase
- * @param hashes Output hashes (32 bytes each)
- * @param count Number of passphrases
- */
-__global__ void sha256_batch_kernel(
-    const uint8_t* __restrict__ passphrases,
-    const uint32_t* __restrict__ offsets,
-    const uint32_t* __restrict__ lengths,
-    uint8_t* __restrict__ hashes,
-    size_t count
-) {
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (idx >= count) return;
-
-    const uint8_t* msg = passphrases + offsets[idx];
-    size_t len = lengths[idx];
-    uint8_t* out = hashes + idx * 32;
-
-    sha256_hash(msg, len, out);
-}
-
-/**
- * Multi-block SHA256 for longer messages.
- * Handles messages > 55 bytes.
+ * Multi-block SHA256 for any-length messages.
+ * Handles len from 0 bytes through arbitrary multi-block inputs.
  */
 __device__ void sha256_hash_long(
     const uint8_t* message,
@@ -254,6 +147,41 @@ __device__ void sha256_hash_long(
         hash[i*4 + 2] = (H[i] >> 8) & 0xff;
         hash[i*4 + 3] = H[i] & 0xff;
     }
+}
+
+/**
+ * Batch SHA256 kernel.
+ *
+ * Each thread processes one passphrase via sha256_hash_long, which
+ * handles any length without truncation. The host wrapper
+ * `sha256_batch` below is consumed by run_pipeline_benchmark (stage 1
+ * timing) and puzzle_solver_benchmark's standalone CUDA SHA-256 rate
+ * driver; both currently feed 32- and 64-byte inputs, so the
+ * single-block fast path used to "work" by accident and stage rates
+ * were inflated by the truncation. T0.3.c restores correctness at
+ * those lengths.
+ *
+ * @param passphrases Concatenated passphrases
+ * @param offsets Start offset of each passphrase
+ * @param lengths Length of each passphrase
+ * @param hashes Output hashes (32 bytes each)
+ * @param count Number of passphrases
+ */
+__global__ void sha256_batch_kernel(
+    const uint8_t* __restrict__ passphrases,
+    const uint32_t* __restrict__ offsets,
+    const uint32_t* __restrict__ lengths,
+    uint8_t* __restrict__ hashes,
+    size_t count
+) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= count) return;
+
+    const uint8_t* msg = passphrases + offsets[idx];
+    size_t len = lengths[idx];
+    uint8_t* out = hashes + idx * 32;
+
+    sha256_hash_long(msg, len, out);
 }
 
 /**

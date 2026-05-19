@@ -10,7 +10,7 @@
 //                         migration hint); we capture stderr to confirm)
 //   - parse_pool_url:     port validation (0, 65536, non-numeric, valid max)
 //   - DistinguishedPoint: serialize() / deserialize() round-trip + size invariant
-//   - PoolStats:          default value-init zeroes numeric fields
+//   - PoolStatsLocal:     default value-init zeroes numeric fields
 //
 // No CTest framework: each check returns early with a printf + non-zero exit
 // code on failure. Same style as tests/test_jlp_pool_handshake.cpp.
@@ -37,7 +37,7 @@
 using collider::pool::PoolConfig;
 using collider::pool::parse_pool_url;
 using collider::pool::DistinguishedPoint;
-using collider::pool::PoolStats;
+using collider::pool::PoolStatsLocal;
 using collider::pool::POOL_TYPE_JLP;
 
 namespace {
@@ -228,13 +228,13 @@ bool test_dp_serialize_roundtrip() {
 }
 
 // ---------------------------------------------------------------------------
-// PoolStats default values
+// PoolStatsLocal default values
 // ---------------------------------------------------------------------------
 
 bool test_poolstats_default_values() {
     // Value-initialize -- this is what the rest of the codebase uses, e.g.
-    // PoolManager::get_stats() returns `PoolStats{}` when no client is set.
-    PoolStats s{};
+    // PoolManager::get_stats() returns `PoolStatsLocal{}` when no client is set.
+    PoolStatsLocal s{};
     if (s.total_dps        != 0) return fail("poolstats_default", "total_dps != 0");
     if (s.your_dps         != 0) return fail("poolstats_default", "your_dps != 0");
     if (s.your_share       != 0.0) return fail("poolstats_default", "your_share != 0");

@@ -163,7 +163,7 @@ theCollider ships in two editions from one source tree.
 | Hashcat-style rule engine on GPU (mutate any wordlist into billions)    |            | Yes              |
 | PCFG + Markov passphrase generators (high-probability candidates first) |            | Yes              |
 | v2 multi-scheme kernel: weak-PRNG sweeps (Milk Sad, Profanity, etc.)    |            | Yes              |
-| License gating (Ed25519, offline-verifiable)                            |            | Yes              |
+| License gating (HMAC-SHA256, offline-verifiable)                        |            | Yes              |
 
 Pro licenses are available at [collisionprotocol.com/pro](https://collisionprotocol.com/pro). The Pro source tree is not public; the Free build is the same source minus the Pro modules, generated automatically by GitHub and published at [github.com/hevnsnt/collider](https://github.com/hevnsnt/collider).
 
@@ -197,10 +197,10 @@ You bought the hardware. You pay the power bill. Pro makes sure every key your G
 
 When you are not pool-mining, Pro flips into dedicated treasure-hunter modes:
 
-- **Brain wallets**: PCFG + Markov + hashcat-style rule engine drive a fused GPU pipeline at hundreds of millions of candidates per second. `SHA256("correct horse battery staple")` is a real private key; tens of thousands of these wallets were created between 2011 and 2014, and many still hold real Bitcoin today.
+- **Brain wallets**: PCFG + Markov + hashcat-style rule engine drive a fused GPU pipeline (SHA-256 -> secp256k1 -> hash160 -> bloom probe) at tens to hundreds of millions of candidate checks per second on Ampere through Blackwell GPUs. Measure your card with `./collider --benchmark`. `SHA256("correct horse battery staple")` is a real private key; tens of thousands of these wallets were created between 2011 and 2014, and many still hold real Bitcoin today.
 - **Weak-PRNG sweeps (v2 multi-scheme kernel)**: scans for keys produced by historically-broken random number generators. Milk Sad (CVE-2023-39910), Profanity (CVE-2022-40769), Trust Wallet, glibc, MSVC, Java. Five Bitcoin address types per candidate seed, eight scheme variants per pass.
 
-Same install. Same UI. License-gated via Ed25519, verified offline.
+Same install. Same UI. License-gated via HMAC-SHA256, verified offline.
 
 ### **See [docs/PRO.md](docs/PRO.md) for the full Pro pitch, including the math behind opportunistic scanning, generator details, the bloom-filter internals, and the pricing tiers.**
 
@@ -319,7 +319,7 @@ Full per-platform guides:
 - [docs/INSTALL.md](docs/INSTALL.md) - prerequisites, CUDA setup, troubleshooting.
 - [docs/BUILD-MACOS.md](docs/BUILD-MACOS.md) - Metal specifics, embedded shaders, build flags.
 
-CUDA architecture defaults: `86;89;100` (Ampere, Ada, Blackwell). Override with `-DCMAKE_CUDA_ARCHITECTURES="89"` (or whichever SM matches your card) for ~3x faster compile times.
+CUDA architecture defaults: `75;86;89;120` (Turing, Ampere, Ada, Blackwell desktop). Override with `-DCMAKE_CUDA_ARCHITECTURES="89"` (or whichever SM matches your card) for ~3x faster compile times. Note: sm_120 is desktop Blackwell (RTX 5090, RTX PRO 6000); sm_100 is datacenter Blackwell (B100/B200) and is not in the default.
 
 ---
 
@@ -334,16 +334,60 @@ For a fresh number on your hardware:
 ./collider --benchmark --benchmark-time 60
 ```
 
-The benchmark prints kangaroo step rate and EC-multiply throughput per GPU.
+The Free benchmark measures CPU and GPU SHA-256 throughput so operators can validate that the hardware is reachable and approximately matches what other tools see on the same silicon. The Pro benchmark runs the full brain-wallet fused kernel (SHA-256 -> secp256k1 -> hash160 -> bloom probe) and reports per-stage and end-to-end rates. For the standalone benchmark driver with the full per-stage table:
+
+```bash
+./bench_gpu_pipeline --time 30 --gpu 0
+```
 
 ---
 
 ## Status
 
-Latest release: **v1.4.1** (2026-05-10). Highlights:
+Current release: **v1.4.2 (stable, public)**.
 
-- Apple Silicon kangaroo and brute-force pipelines (no more CPU fallback on Mac).
-- Per-DP sequence-nonce replay protection on the pool wire (`DP_BATCH_V2`).
+v1.4.2 is the "correctness shipped" release. It locks in the puzzle and brain-wallet pipelines as solved problems and adds the operational hardening (save/resume, pool resilience, multi-panel brain-wallet TUI) that day-to-day operators need. Performance work is the next milestone, not this one.
+
+### Performance expectations (v1.4.2)
+
+theCollider's CUDA secp256k1 + bloom pipeline currently runs at roughly **30 to 50% of the state-of-the-art** (RCKangaroo, libsecp256k1, brainflayer) on the same silicon. The kangaroo path links RCKangaroo directly and inherits its throughput; the brain-wallet fused pipeline does not yet share that field arithmetic and is the gap.
+
+The gap is concentrated in three known areas, all queued for the next release:
+
+- 32-bit limb PTX field arithmetic where SOTA uses hand-tuned 64-bit limbs.
+- No GLV decomposition on the brain-wallet scalar multiply path (`src/gpu/glv_decompose.cuh` exists but is not wired into `fused_pipeline.cu`).
+- Single-threaded host generators that can starve a 4090/5090 pipeline.
+
+Use the built-in benchmark for fresh numbers on your hardware:
+
+```bash
+./collider --benchmark
+./collider --benchmark --benchmark-time 60
+```
+
+### Scheduled work
+
+- **v1.5.0 (perf): crypto pipeline rewrite.** 64-bit limb PTX field arithmetic, GLV + Strauss-Shamir simultaneous double-scalar mul on the brain-wallet fused kernel, batched Montgomery inverse, host-generator thread pool. Target: 2.5 to 3.5x throughput vs v1.4.2 on the same GPU. Estimated 3 to 4 weeks for one engineer.
+- **v1.6.0 (anticipated): puzzle and pool TUI parallel overhaul.** The multi-panel TUI shipped in v1.4.2 covers brain-wallet mode only; puzzle and pool modes still use single-line flat progress. v1.6.0 brings the same multi-panel treatment (range coverage, GPU panel, connection state, DP sparkline, hotkeys) to those modes.
+
+### Known limitations in v1.4.2
+
+- **Standalone puzzle kangaroo save/resume**: works. Auto-saved to `~/.collider/state/kangaroo_herd_puzzle_<N>.kang` on shutdown (SIGINT or solve completion); resumed with `--resume-kangaroo`. Routes through a patched RCKangaroo (`third_party/RCKangaroo/.patches/save-load-state.patch`).
+- **Pool kangaroo save/resume**: works. Auto-saved to `~/.collider/state/kangaroo_herd_<work_id>.kang` and resumed on next chunk assignment.
+- **Puzzle and pool TUI**: flat-line single-line progress. Multi-panel TUI is the v1.6.0 scope; the brain-wallet TUI already shipped at v1.4.2.
+- **CUDA crypto pipeline throughput**: see "Performance expectations" above. v1.5.0 closes this gap.
+- **AMD ROCm and Apple Silicon Metal**: AMD has no ROCm port. Metal kangaroo and brute force ship in v1.4.2 (since v1.4.1) but the v1.5.0 field rewrite is CUDA-only because Metal lacks the PTX equivalent; a separate Metal field rewrite is out of scope for v1.5.0.
+
+### v1.4.2 highlights vs v1.4.1
+
+- Pool kangaroo herd save/resume (`Tier C`) across SIGINT and chunk reassignment.
+- Standalone puzzle kangaroo herd save/resume via a vendored RCKangaroo patch.
+- Brain-wallet multi-panel FTXUI experience (header, GPU panel, range coverage, DP sparkline, hotkeys, help overlay).
+- Empty-hit dual-bloom workflow (`--bloom-tight`, `--verify-set`, `--track-empty-hits`).
+- WarpWallet brain-wallet scheme (`--warpwallet-salt`).
+- v2 multi-scheme weak-PRNG kernel (Milk Sad, Profanity, Trust Wallet, glibc, MSVC, Java) wired through the puzzle pipeline.
+- DP sequence-nonce window on the pool wire (`DP_BATCH_V2`).
+- Apple Silicon kangaroo and brute force (no more CPU fallback on Mac).
 - All 82 confirmed-solved puzzles bundled (1 to 70 plus every multiple of 5 from 75 to 130).
 - Graceful kangaroo to brute-force demotion when no pubkey is available.
 - Live BTC balance on solved banners via mempool.space.

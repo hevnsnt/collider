@@ -30,7 +30,6 @@ inline constexpr uint32_t kPuzzleMetalThreadgroupWidth = 32;
 // dispatches under ~5 seconds of wall time on M1, which lets the host
 // react to Ctrl+C and update the on-screen rate without waiting an
 // eternity. The host can override via PuzzleMetalSolver::set_batch_size.
-//
 // 4M matches the CUDA default in puzzle_gpu.hpp::Config.batch_size_per_gpu;
 // on a healthy M-series setup we expect ~50 MKeys/s sustained, so a 4M
 // batch is ~80 ms per dispatch.
@@ -78,12 +77,10 @@ public:
     // Run one batch. Returns true on a match (and populates found_lo /
     // found_hi with the recovered private key), false if the entire
     // [start_lo:start_lo+batch_size) range was checked with no match.
-    //
     // start_lo / start_hi: low / high 64 bits of the 256-bit base scalar.
     //   The kernel forms k = (start_lo, start_hi, 0, 0) + gid for each
     //   thread, so callers feed sequential 64-bit chunks of the puzzle
     //   range and rely on this stride.
-    //
     // The dispatcher waits synchronously for the GPU before reading
     // match flags, so the function returns after the entire batch has
     // been hashed.

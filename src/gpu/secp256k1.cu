@@ -15,6 +15,11 @@
 #include <cstdint>
 #include <cstdio>
 
+// Tier 1 perf (F-inv): shared addition-chain mod_inv (see header for
+// rationale; also consumed by fused_pipeline.cu against its own
+// TU-local uint256 / mod_mul).
+#include "secp256k1_field.cuh"
+
 namespace collider {
 namespace gpu {
 
@@ -28,12 +33,6 @@ static __constant__ uint32_t SECP256K1_P[8] = {
     0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF
 };
 
-// p + 1 (for some reductions) - reserved for future Montgomery optimizations
-// static __constant__ uint32_t SECP256K1_P_PLUS_1[8] = {
-//     0xFFFFFC30, 0xFFFFFFFE, 0xFFFFFFFF, 0xFFFFFFFF,
-//     0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF
-// };
-
 // Generator point Gx
 static __constant__ uint32_t SECP256K1_GX[8] = {
     0x16F81798, 0x59F2815B, 0x2DCE28D9, 0x029BFCDB,
@@ -46,46 +45,14 @@ static __constant__ uint32_t SECP256K1_GY[8] = {
     0x0E1108A8, 0x5DA4FBFC, 0x26A3C465, 0x483ADA77
 };
 
-// Montgomery constants - reserved for future Montgomery form optimizations
-// static __constant__ uint32_t MONT_R[8] = {
-//     0x000003D1, 0x00000001, 0x00000000, 0x00000000,
-//     0x00000000, 0x00000000, 0x00000000, 0x00000000
-// };
-// static __constant__ uint32_t MONT_R2[8] = {
-//     0x000E90A1, 0x000007A2, 0x00000001, 0x00000000,
-//     0x00000000, 0x00000000, 0x00000000, 0x00000000
-// };
-// static __constant__ uint32_t MONT_N_PRIME = 0xD2253531;
-
-// =============================================================================
-// GLV ENDOMORPHISM CONSTANTS (1.5x speedup for scalar multiplication)
-// =============================================================================
-// secp256k1 has efficient endomorphism: lambda * P = (beta * P.x, P.y)
-// This allows decomposing k into k1 + k2*lambda where |k1|, |k2| ≈ sqrt(n)
-
-// Beta: cube root of 1 mod p (for point transformation)
-// beta^3 = 1 mod p
+// GLV endomorphism constants. secp256k1 has the efficient endomorphism
+// lambda * P = (beta * P.x, P.y), allowing decomposition of k into
+// k1 + k2*lambda where |k1|, |k2| are roughly sqrt(n). Beta below is the
+// cube root of 1 mod p (beta^3 = 1 mod p) used for the point transform.
 static __constant__ uint32_t GLV_BETA[8] = {
     0x719501EE, 0xC1396C28, 0x12F58995, 0x9CF04975,
     0xAC3434E9, 0x6E64479E, 0x657C0710, 0x7AE96A2B
 };
-
-// GLV constants - reserved for future GLV endomorphism implementation
-// Lambda: cube root of 1 mod n (for scalar decomposition)
-// static __constant__ uint32_t GLV_LAMBDA[8] = {
-//     0x1B23BD72, 0xDF02967C, 0x20816678, 0x122E22EA,
-//     0x8812645A, 0xA5261C02, 0xC05C30E0, 0x5363AD4C
-// };
-// Curve order n
-// static __constant__ uint32_t SECP256K1_N[8] = {
-//     0xD0364141, 0xBFD25E8C, 0xAF48A03B, 0xBAAEDCE6,
-//     0xFFFFFFFE, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF
-// };
-// GLV decomposition constants (a1, b1, a2, b2 from libsecp256k1)
-// static __constant__ uint32_t GLV_A1[4] = { 0xE4437ED6, 0xEB03090F, 0x30A198A9, 0x3086D221 };
-// static __constant__ uint32_t GLV_B1[4] = { 0xE86C90E4, 0x8B76EAAD, 0xF98FCFBF, 0x114CA50F };
-// static __constant__ uint32_t GLV_A2[4] = { 0xE86C90E4, 0x8B76EAAD, 0xF98FCFBF, 0x114CA50F };
-// static __constant__ uint32_t GLV_B2[4] = { 0x3AA1B14C, 0x8DAC0C6E, 0x0C3F3F2A, 0x1950B75F };
 
 // =============================================================================
 // DATA STRUCTURES
@@ -287,16 +254,37 @@ __device__ void uint256_mul_512_ptx(
 /**
  * Fast reduction mod p using secp256k1's special prime form.
  * p = 2^256 - 2^32 - 977 = 2^256 - c where c = 0x1000003D1
+ *
+ * Tier 2 perf F-modr (v1.4.2 brainwallet-tui-overhaul): replace the
+ * while-loop with a single conditional sub. After mod_mul's carry-folding,
+ * the input is provably in [0, 2p):
+ *
+ *   1. lo + hi*c is at most lo + hi*(2^32 + 977) where lo,hi < 2^256, so
+ *      < 2^256 + 2^288 + 977 * 2^256 < 2^289.
+ *   2. The first extra-fold adds extra*c with extra < 2^33, contributing
+ *      at most 2^33 * (2^32+977) < 2^66, leaving the result < 2^256 + 2^66.
+ *   3. The second fold (when a carry escapes the top limb) adds carry*c
+ *      with carry <= 1 (the only way a carry escapes is if step-2 produced
+ *      a value >= 2^256, and the residual after wrapping is < 2^66 + 2^33),
+ *      contributing at most c < 2^33.
+ *
+ *   Final r < 2^256 + 2^66 + 2^33 < 2^257 - 2*(2^32 + 977) = 2p.
+ *
+ * Therefore one conditional sub is sufficient. Callers MUST pass mod_mul
+ * output (or another value already known to be < 2p); raw 256-bit values
+ * could be < 4p and would need the older while-loop. Every in-tree caller
+ * (mod_mul tail + ec_add_mixed/ec_double/jac_to_affine pipelines) feeds
+ * mod_mul-derived values, satisfying the contract.
+ *
+ * KAT validation: this change is bit-equivalent on the input domain
+ * { x : 0 <= x < 2p } and tests/test_secp256k1_inv.cu + tests/test_ec_mul_known_answers.cu
+ * exercise that domain through the addition chain, ec_mul, and jac_to_affine.
  */
 __device__ __forceinline__ void mod_reduce(uint256& a) {
     uint256 p;
     uint256_load_const(p, SECP256K1_P);
 
-    // mod_mul's overflow correction can leave a in roughly [0, 4p), and on
-    // pathological inputs the second-pass extra*c add can push that higher.
-    // Loop until canonical to be safe; the loop body is trivially bounded by
-    // ceil(a/p) which is a small constant (<=4) for any value mod_mul produces.
-    while (uint256_cmp(a, p) >= 0) {
+    if (uint256_cmp(a, p) >= 0) {
         uint256_sub(a, a, p);
     }
 }
@@ -460,8 +448,13 @@ __device__ void mod_mul(uint256& result, const uint256& a, const uint256& b) {
         }
     }
 
-    // Final canonical reduction (loops while result >= p; bounded by a small
-    // constant in practice).
+    // Final canonical reduction. v1.4.2 G-B6: mod_reduce performs a SINGLE
+    // conditional sub. The caller MUST pass `result` already reduced to
+    // [0, 2p); the carry-fold logic above (lines ~440-486) is the proof
+    // that this mod_mul tail satisfies the precondition. Raw 256-bit
+    // values that have not been folded through mod_reduce_512 / the
+    // mod_add / mod_sub paths do NOT satisfy the precondition and must
+    // not be passed to mod_reduce directly.
     mod_reduce(result);
 }
 
@@ -482,106 +475,17 @@ __device__ __forceinline__ void mod_sqr(uint256& result, const uint256& a) {
  * to ~255 squarings + ~13 multiplications, a significant speedup.
  *
  * Based on the libsecp256k1 addition chain which is near-optimal.
+ *
+ * Tier 1 perf (v1.4.2 brainwallet-tui-overhaul, F-inv): the algorithm
+ * body now lives in secp256k1_field.cuh so fused_pipeline.cu can share
+ * the addition-chain implementation instead of carrying its own slow
+ * binary exponentiation of (p-2). The wrapper here keeps the public
+ * symbol stable for tests/test_secp256k1_inv.cu and every existing
+ * caller; the template instantiates against THIS TU's uint256 and
+ * mod_mul, so behaviour is bit-equal to the prior in-line definition.
  */
 __device__ void mod_inv(uint256& r, const uint256& a) {
-    // v1.4.0 phase 4 perf: libsecp256k1-style addition chain for
-    // a^(p-2) mod p. 256 squarings + 13 multiplications instead of 256
-    // squarings + 248 multiplications -- ~1.9x reduction in mod_mul
-    // calls per inversion.
-    //
-    // NOTE on the prior failed port: this file's first addition-chain
-    // attempt (v1.4.0 commit e8fc629, reverted as 5c673c5) faithfully
-    // mirrored kangaroo_kernel.cu's chain, which itself had a bug at
-    // the x223 step -- multiplying by x2 (= a^3) instead of x3 (= a^7).
-    // That made x223 = a^(2^223 - 5), poisoning the rest of the chain
-    // and producing a^(p - 2 - 2^35) instead of a^(p-2). The KAT
-    // tests/test_secp256k1_inv.cu reported 63/64 wrong; reverting
-    // restored the binary walk. This port uses the corrected x3
-    // multiplication and is verified against the same KAT before
-    // landing.
-    //
-    // The chain naming convention (xN = a^(2^N - 1)):
-    //   x2  = a^3
-    //   x3  = a^7
-    //   x6  = a^(2^6  - 1)
-    //   x9  = a^(2^9  - 1)
-    //   x11 = a^(2^11 - 1)
-    //   x22 = a^(2^22 - 1)
-    //   x44 = a^(2^44 - 1)
-    //   x88 = a^(2^88 - 1)
-    //   x176 = a^(2^176 - 1)
-    //   x220 = a^(2^220 - 1)
-    //   x223 = a^(2^223 - 1)  <-- libsecp256k1 uses x3 here, NOT x2.
-    //
-    // Aliasing safety: lambdas write through a fresh local then assign,
-    // matching the previous binary-walk convention (belt-and-suspenders
-    // for a function called millions of times per kernel launch).
-    auto sqr = [](uint256& r_, const uint256& x) {
-        uint256 t; mod_mul(t, x, x); r_ = t;
-    };
-    auto mul = [](uint256& r_, const uint256& x, const uint256& y) {
-        uint256 t; mod_mul(t, x, y); r_ = t;
-    };
-
-    uint256 x2, x3, x6, x9, x11, x22, x44, x88, x176, x220, x223, t1;
-
-    // x2 = a^3
-    sqr(x2, a);  mul(x2, x2, a);
-    // x3 = a^7
-    sqr(x3, x2); mul(x3, x3, a);
-
-    // x6 = a^(2^6 - 1)
-    sqr(x6, x3); sqr(x6, x6); sqr(x6, x6); mul(x6, x6, x3);
-    // x9 = a^(2^9 - 1)
-    sqr(x9, x6); sqr(x9, x9); sqr(x9, x9); mul(x9, x9, x3);
-    // x11 = a^(2^11 - 1)
-    sqr(x11, x9); sqr(x11, x11); mul(x11, x11, x2);
-
-    // x22 = a^(2^22 - 1)
-    sqr(x22, x11);
-    for (int i = 1; i < 11; ++i) sqr(x22, x22);
-    mul(x22, x22, x11);
-
-    // x44 = a^(2^44 - 1)
-    sqr(x44, x22);
-    for (int i = 1; i < 22; ++i) sqr(x44, x44);
-    mul(x44, x44, x22);
-
-    // x88 = a^(2^88 - 1)
-    sqr(x88, x44);
-    for (int i = 1; i < 44; ++i) sqr(x88, x88);
-    mul(x88, x88, x44);
-
-    // x176 = a^(2^176 - 1)
-    sqr(x176, x88);
-    for (int i = 1; i < 88; ++i) sqr(x176, x176);
-    mul(x176, x176, x88);
-
-    // x220 = a^(2^220 - 1)
-    sqr(x220, x176);
-    for (int i = 1; i < 44; ++i) sqr(x220, x220);
-    mul(x220, x220, x44);
-
-    // x223 = a^(2^223 - 1).
-    // CRITICAL: multiply by x3 (a^7), NOT x2 (a^3). The libsecp256k1
-    // chain has (2^220 - 1) * 2^3 + 7 = 2^223 - 1; multiplying by
-    // a^3 instead gives 2^223 - 5 (off by 4) and poisons the tail.
-    sqr(x223, x220); sqr(x223, x223); sqr(x223, x223);
-    mul(x223, x223, x3);
-
-    // Tail: x223^(2^23) * x22 ; ^(2^5) * a ; ^(2^3) * x2 ; ^(2^2) * a.
-    // Produces a^(p-2) where p = 2^256 - 2^32 - 977.
-    sqr(t1, x223);
-    for (int i = 1; i < 23; ++i) sqr(t1, t1);
-    mul(t1, t1, x22);
-    for (int i = 0; i < 5; ++i) sqr(t1, t1);
-    mul(t1, t1, a);
-    for (int i = 0; i < 3; ++i) sqr(t1, t1);
-    mul(t1, t1, x2);
-    sqr(t1, t1); sqr(t1, t1);
-    mul(t1, t1, a);
-
-    r = t1;
+    mod_inv_addition_chain<uint256>(r, a);
 }
 
 // =============================================================================
@@ -593,34 +497,51 @@ __device__ void mod_inv(uint256& r, const uint256& a) {
  * Uses optimized formulas for a=0 (secp256k1).
  * Cost: 1M + 5S + 1*a + 7add + 2*2 + 1*3 + 1*8
  */
+// T2.1 (A-tier wave 1, 2026-05-17): R may alias P. The prior code wrote
+// R.X (line 522 in the pre-T2.1 file) and R.Y (line 535) before reading
+// P.Y and P.Z (line 538) for the Z' computation, which silently
+// corrupted the result whenever R == P. ec_double(R, R) is the common
+// shape inside scalar mul. Sibling kernel puzzle_optimized.cu::ec_double
+// was patched for the same Defect C in May 2026 (snapshot P.X/P.Y/P.Z
+// into locals, commit R only after all reads); this is the matching
+// fix for the secp256k1.cu copy. The fused_pipeline.cu copy gets the
+// same treatment.
 __device__ void ec_double_jacobian(ECPointJacobian& R, const ECPointJacobian& P) {
     if (P.is_infinity()) {
         R.set_infinity();
         return;
     }
 
+    // Snapshot every input limb we need before writing anything to R.
+    // This guarantees correctness even when R and P are the same object.
+    const uint256 PX = P.X;
+    const uint256 PY = P.Y;
+    const uint256 PZ = P.Z;
+
     uint256 S, M, T, Y2;
 
     // Y^2
-    mod_sqr(Y2, P.Y);
+    mod_sqr(Y2, PY);
 
     // S = 4 * X * Y^2
-    mod_mul(S, P.X, Y2);        // X * Y^2
+    mod_mul(S, PX, Y2);         // X * Y^2
     mod_add(S, S, S);           // 2 * X * Y^2
     mod_add(S, S, S);           // 4 * X * Y^2
 
     // M = 3 * X^2 (since a = 0 for secp256k1)
-    mod_sqr(M, P.X);            // X^2
+    mod_sqr(M, PX);             // X^2
     mod_add(T, M, M);           // 2 * X^2
     mod_add(M, T, M);           // 3 * X^2
 
-    // X' = M^2 - 2*S
-    mod_sqr(R.X, M);            // M^2
-    mod_sub(R.X, R.X, S);       // M^2 - S
-    mod_sub(R.X, R.X, S);       // M^2 - 2*S
+    // X' = M^2 - 2*S  (into a local, not R.X)
+    uint256 newX;
+    mod_sqr(newX, M);           // M^2
+    mod_sub(newX, newX, S);     // M^2 - S
+    mod_sub(newX, newX, S);     // M^2 - 2*S
 
     // Y' = M * (S - X') - 8 * Y^4
-    mod_sub(T, S, R.X);         // S - X'
+    uint256 newY;
+    mod_sub(T, S, newX);        // S - X'
     mod_mul(T, M, T);           // M * (S - X')
 
     mod_sqr(Y2, Y2);            // Y^4
@@ -628,88 +549,46 @@ __device__ void ec_double_jacobian(ECPointJacobian& R, const ECPointJacobian& P)
     mod_add(Y2, Y2, Y2);        // 4 * Y^4
     mod_add(Y2, Y2, Y2);        // 8 * Y^4
 
-    mod_sub(R.Y, T, Y2);        // M * (S - X') - 8 * Y^4
+    mod_sub(newY, T, Y2);       // M * (S - X') - 8 * Y^4
 
-    // Z' = 2 * Y * Z
-    mod_mul(R.Z, P.Y, P.Z);
-    mod_add(R.Z, R.Z, R.Z);
+    // Z' = 2 * Y * Z  (uses snapshotted PY, PZ; safe even if R == P)
+    uint256 newZ;
+    mod_mul(newZ, PY, PZ);
+    mod_add(newZ, newZ, newZ);
+
+    // Commit all outputs together. R may alias P; the snapshots above
+    // mean every read above used the original input values.
+    R.X = newX;
+    R.Y = newY;
+    R.Z = newZ;
 }
 
 /**
  * Point addition: R = P + Q where Q is affine, P is Jacobian.
  * Mixed addition is more efficient.
  * Cost: 7M + 4S + 9add + 3*2 + 1*3
+ *
+ * B1 (2026-05-15): the body now lives in
+ * secp256k1_field.cuh::ec_add_mixed_shared so this TU and
+ * fused_pipeline.cu share one canonical implementation. The
+ * fused-pipeline copy was previously missing the H==0 special
+ * case and silently produced wrong public keys when triggered;
+ * extracting the canonical version into the shared header
+ * forces both TUs to honour the case identically. The doubler
+ * differs by name across the two TUs (this file:
+ * ec_double_jacobian; fused_pipeline.cu: ec_double_jac), so the
+ * template takes it as a callable parameter rather than relying
+ * on ADL on the bare name.
+ *
+ * KAT validation: tests/test_secp256k1_inv,
+ * tests/test_ec_mul_known_answers, tests/test_gpu_hash160,
+ * tests/test_multi_gpu_brain_wallet must all stay green.
  */
 __device__ void ec_add_mixed(ECPointJacobian& R, const ECPointJacobian& P, const ECPointAffine& Q) {
-    // Handle special cases
-    if (P.is_infinity()) {
-        R.X = Q.x;
-        R.Y = Q.y;
-        R.Z.set_one();
-        return;
-    }
-
-    uint256 Z1Z1, U2, S2, H, HH, I, J, r, V;
-
-    // Z1Z1 = Z1^2
-    mod_sqr(Z1Z1, P.Z);
-
-    // U2 = X2 * Z1Z1
-    mod_mul(U2, Q.x, Z1Z1);
-
-    // S2 = Y2 * Z1 * Z1Z1
-    mod_mul(S2, Q.y, P.Z);
-    mod_mul(S2, S2, Z1Z1);
-
-    // H = U2 - X1
-    mod_sub(H, U2, P.X);
-
-    // r = 2 * (S2 - Y1)
-    mod_sub(r, S2, P.Y);
-    mod_add(r, r, r);
-
-    // Check if P == Q (need to double instead)
-    if (H.is_zero()) {
-        if (r.is_zero()) {
-            // P == Q, need to double
-            ec_double_jacobian(R, P);
-            return;
-        } else {
-            // P == -Q, result is infinity
-            R.set_infinity();
-            return;
-        }
-    }
-
-    // HH = H^2
-    mod_sqr(HH, H);
-
-    // I = 4 * HH
-    mod_add(I, HH, HH);
-    mod_add(I, I, I);
-
-    // J = H * I
-    mod_mul(J, H, I);
-
-    // V = X1 * I
-    mod_mul(V, P.X, I);
-
-    // X3 = r^2 - J - 2*V
-    mod_sqr(R.X, r);
-    mod_sub(R.X, R.X, J);
-    mod_sub(R.X, R.X, V);
-    mod_sub(R.X, R.X, V);
-
-    // Y3 = r * (V - X3) - 2 * Y1 * J
-    mod_sub(V, V, R.X);         // V - X3
-    mod_mul(R.Y, r, V);         // r * (V - X3)
-    mod_mul(J, P.Y, J);         // Y1 * J
-    mod_add(J, J, J);           // 2 * Y1 * J
-    mod_sub(R.Y, R.Y, J);
-
-    // Z3 = 2 * Z1 * H
-    mod_mul(R.Z, P.Z, H);
-    mod_add(R.Z, R.Z, R.Z);
+    auto doubler = [](ECPointJacobian& Rd, const ECPointJacobian& Pd) {
+        ec_double_jacobian(Rd, Pd);
+    };
+    ec_add_mixed_shared(R, P, Q, doubler);
 }
 
 /**
@@ -786,19 +665,16 @@ struct uint128 {
  */
 // Wave 1 / C-CRIT-3 (2026-05-04): the prior glv_decompose, ec_mul_glv, and
 // ec_add_glv_affine were removed.
-//
 // Reason: glv_decompose was not a real GLV decomposition. It split k at the
 // 128-bit boundary (k1 = low128(k), k2 = high128(k)) instead of solving the
 // lattice problem k = k1 + k2*lambda (mod n). Since 2^128 != lambda (mod n),
 // the resulting k1*G + k2*(lambda*G) != k*G for almost any k. ec_mul_glv was
 // therefore a silent landmine: anyone wiring it up for the "30% speedup"
 // would have computed wrong pubkeys.
-//
 // Currently no caller uses these (ec_mul_optimized -> ec_mul_windowed). The
 // GLV constants in this file remain available for a future correct
 // implementation. To re-enable GLV, port libsecp256k1's
 // secp256k1_scalar_split_lambda (lattice-reduction-based decomposition).
-//
 // glv_endomorphism (point P -> (beta*x, y)) and glv_endomorphism_jacobian
 // remain; they are mathematically correct and harmless if invoked.
 
@@ -909,84 +785,44 @@ __device__ void ec_mul_simple(ECPointAffine& result, const uint256& scalar) {
 // BATCH INVERSION (MONTGOMERY'S TRICK)
 // =============================================================================
 
-/**
- * Batch inversion using Montgomery's trick.
- * Given z[0..n-1], compute z_inv[0..n-1] = z[i]^(-1) mod p
- * Using only ONE modular inversion (instead of n).
- *
- * Algorithm:
- * 1. products[i] = z[0] * z[1] * ... * z[i]
- * 2. inv_all = products[n-1]^(-1)
- * 3. Back-propagate: z_inv[i] = inv_all * products[i-1]
- *                   inv_all = inv_all * z[i]
- */
-__device__ void batch_invert(
-    uint256* z_inv,
-    const uint256* z,
-    int n,
-    uint256* products  // Scratch space, size n
-) {
-    if (n == 0) return;
-    if (n == 1) {
-        mod_inv(z_inv[0], z[0]);
-        return;
-    }
-
-    // Forward pass: compute cumulative products
-    products[0] = z[0];
-    for (int i = 1; i < n; i++) {
-        mod_mul(products[i], products[i-1], z[i]);
-    }
-
-    // Invert the final product (only ONE inversion!)
-    uint256 inv_all;
-    mod_inv(inv_all, products[n-1]);
-
-    // Backward pass: compute individual inverses
-    for (int i = n - 1; i > 0; i--) {
-        mod_mul(z_inv[i], inv_all, products[i-1]);
-        mod_mul(inv_all, inv_all, z[i]);
-    }
-    z_inv[0] = inv_all;
-}
-
-/**
- * Batch Jacobian to Affine conversion using batch inversion.
- * Converts multiple Jacobian points to Affine with only one mod_inv.
- */
-__device__ void batch_jacobian_to_affine(
-    ECPointAffine* affine,
-    const ECPointJacobian* jacobian,
-    int n,
-    uint256* scratch  // Size 2*n
-) {
-    uint256* z_vals = scratch;
-    uint256* z_inv = scratch + n;
-
-    // Extract Z coordinates
-    for (int i = 0; i < n; i++) {
-        z_vals[i] = jacobian[i].Z;
-    }
-
-    // Batch invert Z values
-    batch_invert(z_inv, z_vals, n, z_vals);  // Reuse z_vals as scratch
-
-    // Convert each point
-    for (int i = 0; i < n; i++) {
-        if (jacobian[i].is_infinity()) {
-            affine[i].x.set_zero();
-            affine[i].y.set_zero();
-            continue;
-        }
-
-        uint256 z_inv2, z_inv3;
-        mod_sqr(z_inv2, z_inv[i]);
-        mod_mul(z_inv3, z_inv2, z_inv[i]);
-
-        mod_mul(affine[i].x, jacobian[i].X, z_inv2);
-        mod_mul(affine[i].y, jacobian[i].Y, z_inv3);
-    }
-}
+// B4 (2026-05-15): the prior `batch_invert(z_inv, z, n, products)`
+// helper and its only caller `batch_jacobian_to_affine` were removed.
+// The forward pass overwrote products[i] (which was, in the only caller,
+// aliased with the input z[]) by storing the cumulative product through
+// it; the backward pass then needed the original z[i] to multiply
+// `inv_all` against, but read garbage because that slot had already
+// been overwritten by the forward pass. The bug manifested as silently
+// wrong inverses for n >= 2 whenever the products buffer aliased the
+// input, which is exactly how `batch_jacobian_to_affine` invoked it
+// (passing `z_vals` for both z and products). No production code path
+// reaches either function: the brain-wallet pipeline's batch path uses
+// the kangaroo solver's `warp_batch_jacobian_to_affine` in
+// kangaroo_kernel.cu (or the per-thread mod_inv inside
+// `jacobian_to_affine`). Removing the two latent helpers prevents a
+// future caller from re-discovering the aliasing landmine.
+// If a future kernel needs CPU-style sequential batch inversion, the
+// correct shape is to make a local copy of z[i] before overwriting
+// products[i] in the forward pass, OR to require non-aliased buffers
+// and document the contract loudly. The structurally better path is
+// to lane-cooperate the way kangaroo_kernel.cu's
+// `warp_batch_jacobian_to_affine` already does.
+//
+// T0.3.a (A-tier wave 1, 2026-05-17): `parallel_batch_jacobian_to_affine`
+// (the helper this comment used to cite as the model) and its only
+// caller `ec_mul_batch_optimized_kernel` were deleted as a same-class
+// crypto-correctness landmine. The "optimized" windowed-mul doubled R
+// by EC_WINDOW_SIZE between iterations AND added entries from the
+// precomputed table that already carry the per-window 2^(w*WINDOW_SIZE)
+// factor. Result: 2^(5*(NW-1)) * sum_w win_w * G instead of k*G. The
+// matching live windowed path lives in `ec_mul_windowed` above (no
+// extra inter-window doubling). The host wrapper that fed the deleted
+// kernel (`secp256k1_batch_mul`) is also gone; production callers (v2
+// orchestrator multi-address bridge, bench_pipeline stage 2,
+// pipeline.cu orchestrator) were all dead-in-current-production paths
+// and their dead-branch surface is removed alongside the kernel.
+// tests/test_secp256k1_batch_mul_kat.cu (T3.1) is a link-fail trap:
+// the test references `secp256k1_batch_mul` so reintroducing that
+// symbol without supplying KAT vectors fails the build.
 
 // =============================================================================
 // BATCH PROCESSING KERNELS
@@ -1009,181 +845,6 @@ __global__ void ec_mul_batch_kernel(
         ec_mul_windowed(public_keys[idx], private_keys[idx], table);
     } else {
         ec_mul_simple(public_keys[idx], private_keys[idx]);
-    }
-}
-
-/**
- * Batch EC multiplication with PARALLEL batch inversion.
- * Processes BATCH_INV_SIZE keys together to share one inversion.
- * OPTIMIZED: All threads participate in batch conversion, not just thread 0.
- */
-#define BATCH_INV_SIZE 32
-
-/**
- * Parallel batch inversion using cooperative threading.
- * All threads participate to amortize the single modular inversion.
- */
-__device__ void parallel_batch_jacobian_to_affine(
-    ECPointAffine* affine,
-    const ECPointJacobian* jacobian,
-    int n,
-    uint256* products,      // Shared memory: size n
-    uint256* z_inv,         // Shared memory: size n
-    int thread_idx
-) {
-    // Step 1: Each thread stores its Z coordinate
-    if (thread_idx < n) {
-        products[thread_idx] = jacobian[thread_idx].Z;
-    }
-    __syncthreads();
-
-    // Step 2: Thread 0 computes cumulative products (inherently sequential)
-    if (thread_idx == 0) {
-        for (int i = 1; i < n; i++) {
-            uint256 temp;
-            mod_mul(temp, products[i-1], products[i]);
-            products[i] = temp;
-        }
-    }
-    __syncthreads();
-
-    // Step 3: Thread 0 computes the single inversion
-    uint256 inv_all;
-    if (thread_idx == 0) {
-        mod_inv(inv_all, products[n-1]);
-        z_inv[n-1] = inv_all;
-    }
-    __syncthreads();
-
-    // Step 4: Thread 0 computes individual inverses (can't easily parallelize)
-    if (thread_idx == 0) {
-        uint256 running_inv = inv_all;
-        for (int i = n - 1; i > 0; i--) {
-            // z_inv[i] = running_inv * products[i-1]
-            mod_mul(z_inv[i], running_inv, products[i-1]);
-            // running_inv = running_inv * original_z[i]
-            mod_mul(running_inv, running_inv, jacobian[i].Z);
-        }
-        z_inv[0] = running_inv;
-    }
-    __syncthreads();
-
-    // Step 5: ALL THREADS convert their point in parallel (main optimization!)
-    if (thread_idx < n) {
-        if (jacobian[thread_idx].is_infinity()) {
-            affine[thread_idx].x.set_zero();
-            affine[thread_idx].y.set_zero();
-        } else {
-            uint256 z_inv2, z_inv3;
-            mod_sqr(z_inv2, z_inv[thread_idx]);
-            mod_mul(z_inv3, z_inv2, z_inv[thread_idx]);
-
-            mod_mul(affine[thread_idx].x, jacobian[thread_idx].X, z_inv2);
-            mod_mul(affine[thread_idx].y, jacobian[thread_idx].Y, z_inv3);
-        }
-    }
-}
-
-__global__ void ec_mul_batch_optimized_kernel(
-    const uint256* __restrict__ private_keys,
-    ECPointAffine* __restrict__ public_keys,
-    const PrecomputedPoint* __restrict__ table,
-    size_t count
-) {
-    // Shared memory for batch inversion
-    __shared__ uint256 products[BATCH_INV_SIZE];
-    __shared__ uint256 z_inv[BATCH_INV_SIZE];
-    __shared__ ECPointJacobian jac_points[BATCH_INV_SIZE];
-    __shared__ ECPointAffine affine_points[BATCH_INV_SIZE];
-
-    size_t batch_idx = blockIdx.x;
-    size_t batch_start = batch_idx * BATCH_INV_SIZE;
-    size_t thread_idx = threadIdx.x;
-
-    if (batch_start >= count) return;
-
-    size_t batch_count = min((size_t)BATCH_INV_SIZE, count - batch_start);
-
-    // Phase 1: Each thread in warp computes Jacobian result
-    if (thread_idx < batch_count) {
-        size_t global_idx = batch_start + thread_idx;
-
-        // Compute scalar multiplication in Jacobian coords
-        ECPointJacobian R;
-        R.set_infinity();
-
-        ECPointAffine G;
-        uint256_load_const(G.x, SECP256K1_GX);
-        uint256_load_const(G.y, SECP256K1_GY);
-
-        const uint256& scalar = private_keys[global_idx];
-
-        // Use windowed method if table available
-        if (table != nullptr) {
-            for (int w = EC_NUM_WINDOWS - 1; w >= 0; w--) {
-                if (w < EC_NUM_WINDOWS - 1) {
-                    #pragma unroll
-                    for (int i = 0; i < EC_WINDOW_SIZE; i++) {
-                        ECPointJacobian temp;
-                        ec_double_jacobian(temp, R);
-                        R = temp;
-                    }
-                }
-
-                int bit_start = w * EC_WINDOW_SIZE;
-                uint32_t window_val = 0;
-
-                #pragma unroll
-                for (int i = 0; i < EC_WINDOW_SIZE && (bit_start + i) < 256; i++) {
-                    int limb = (bit_start + i) / 32;
-                    int bit = (bit_start + i) % 32;
-                    window_val |= ((scalar.limbs[limb] >> bit) & 1) << i;
-                }
-
-                if (window_val != 0) {
-                    ECPointAffine Q;
-                    int table_idx = w * EC_TABLE_SIZE + window_val;
-                    Q.x = table[table_idx].x;
-                    Q.y = table[table_idx].y;
-
-                    ECPointJacobian temp;
-                    ec_add_mixed(temp, R, Q);
-                    R = temp;
-                }
-            }
-        } else {
-            // Simple double-and-add
-            for (int i = 255; i >= 0; i--) {
-                ECPointJacobian temp;
-                ec_double_jacobian(temp, R);
-                R = temp;
-
-                int limb = i / 32;
-                int bit = i % 32;
-
-                if ((scalar.limbs[limb] >> bit) & 1) {
-                    ec_add_mixed(temp, R, G);
-                    R = temp;
-                }
-            }
-        }
-
-        jac_points[thread_idx] = R;
-    }
-
-    __syncthreads();
-
-    // Phase 2: PARALLEL batch conversion - all threads participate!
-    parallel_batch_jacobian_to_affine(
-        affine_points, jac_points, batch_count,
-        products, z_inv, thread_idx
-    );
-
-    __syncthreads();
-
-    // Phase 3: All threads write their results in parallel
-    if (thread_idx < batch_count) {
-        public_keys[batch_start + thread_idx] = affine_points[thread_idx];
     }
 }
 
@@ -1321,32 +982,17 @@ cudaError_t secp256k1_cleanup() {
     return cudaSuccess;
 }
 
-cudaError_t secp256k1_batch_mul(
-    const void* d_private_keys,
-    void* d_public_keys,
-    size_t count,
-    cudaStream_t stream
-) {
-    if (count == 0) return cudaSuccess;
-
-    // Get table for current device
-    int device_id = 0;
-    cudaGetDevice(&device_id);
-    PrecomputedPoint* table = (device_id < MAX_GPU_DEVICES) ? g_precomputed_tables[device_id] : nullptr;
-
-    // Use optimized kernel with batch inversion
-    const int batch_size = BATCH_INV_SIZE;
-    const int num_batches = (count + batch_size - 1) / batch_size;
-
-    ec_mul_batch_optimized_kernel<<<num_batches, batch_size, 0, stream>>>(
-        reinterpret_cast<const uint256*>(d_private_keys),
-        reinterpret_cast<ECPointAffine*>(d_public_keys),
-        table,
-        count
-    );
-
-    return cudaGetLastError();
-}
+// T0.3.a (A-tier wave 1): `secp256k1_batch_mul` host wrapper deleted
+// along with its `ec_mul_batch_optimized_kernel` backend. Production
+// callers (v2 orchestrator multi-address bridge, bench_pipeline stage
+// 2, pipeline.cu orchestrator) were dead-in-current-production paths;
+// the correct sibling `secp256k1_batch_mul_simple` (which dispatches
+// `ec_mul_batch_kernel` -> `ec_mul_windowed`, the no-inter-window-
+// double path) remains as the single source of truth for batch EC
+// multiplication. Bench callers were migrated to the `_simple` API.
+// tests/test_secp256k1_batch_mul_kat.cu is a link-fail trap: it
+// declares (but does not call) the deleted wrapper, so reintroducing
+// the symbol without supplying KAT vectors fails the test build.
 
 cudaError_t secp256k1_batch_mul_simple(
     const void* d_private_keys,

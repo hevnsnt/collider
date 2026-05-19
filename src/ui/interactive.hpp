@@ -399,7 +399,7 @@ public:
 
         // Pool URL - use official pool as fallback default when none is configured.
         const std::string effective_default = default_url.empty()
-            ? "jlps://collisionprotocol.com:17403"
+            ? "jlps://pool.collisionprotocol.com:17403"
             : default_url;
         std::cout << "Pool URL [" << colors::CYAN << effective_default << colors::RESET << "]: ";
         {

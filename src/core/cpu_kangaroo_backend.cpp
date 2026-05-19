@@ -83,6 +83,15 @@ void CpuKangarooBackend::solve(BackendCallbacks cb) {
         return cb.on_progress(rate, dp_count);
     });
 
+    // wire the fast shutdown probe so the per-thread
+    // worker loops poll BackendCallbacks::should_continue every ~10k
+    // steps. Without this, a Ctrl+C / pool disconnect waits for the
+    // next 1Hz progress callback to flip stop_flag, leaving each
+    // worker thread mid-loop for up to a second.
+    solver_.set_should_continue_callback([&cb]() -> bool {
+        return cb.should_continue ? cb.should_continue() : true;
+    });
+
     KangarooResult result = solver_.solve();
     if (result.found) {
         // Convert little-endian limbs to BE 32-byte key for the pool.

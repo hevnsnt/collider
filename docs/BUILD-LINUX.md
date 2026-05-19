@@ -50,17 +50,17 @@ Outputs: `build/collider` and `build/collider_pro` (Pro builds produce both bina
 
 Options recognized by the project (defaults in `CMakeLists.txt`):
 
-| Option                      | Default     | Description                                                             |
-| --------------------------- | ----------- | ----------------------------------------------------------------------- |
-| `COLLIDER_USE_CUDA`         | `ON`        | Enable the CUDA backend. Required for GPU compute on Linux.             |
-| `COLLIDER_USE_METAL`        | `ON`        | Enable the Metal backend (no effect on Linux).                          |
-| `COLLIDER_USE_CPU`          | `ON`        | Enable the CPU fallback backend.                                        |
-| `COLLIDER_BUILD_TESTS`      | `ON`        | Build unit tests (`ctest` runs from `build/`).                          |
-| `COLLIDER_BUILD_BENCHMARKS` | `ON`        | Build the standalone benchmark targets.                                 |
-| `COLLIDER_BUILD_TOOLS`      | `ON`        | Build CLI tools (`build_bloom`, `generate_license`, ...).               |
-| `COLLIDER_PRO`              | `OFF`       | Enable the Pro brain-wallet pipeline. Requires the private source tree. |
-| `CMAKE_BUILD_TYPE`          | `Release`   | `Release`, `Debug`, or `RelWithDebInfo`.                                |
-| `CMAKE_CUDA_ARCHITECTURES`  | `86;89;100` | Target SM versions. Override for faster local builds.                   |
+| Option                      | Default      | Description                                                               |
+| --------------------------- | ------------ | ------------------------------------------------------------------------- |
+| `COLLIDER_USE_CUDA`         | `ON`         | Enable the CUDA backend. Required for GPU compute on Linux.               |
+| `COLLIDER_USE_METAL`        | `ON`         | Enable the Metal backend (no effect on Linux).                            |
+| `COLLIDER_USE_CPU`          | `ON`         | Enable the CPU fallback backend.                                          |
+| `COLLIDER_BUILD_TESTS`      | `ON`         | Build unit tests (`ctest` runs from `build/`).                            |
+| `COLLIDER_BUILD_BENCHMARKS` | `ON`         | Build the standalone benchmark targets.                                   |
+| `COLLIDER_BUILD_TOOLS`      | `ON`         | Build CLI tools (`build_bloom`, `generate_license`, ...).                 |
+| `COLLIDER_PRO`              | `OFF`        | Enable the Pro brain-wallet pipeline. Requires the private source tree.   |
+| `CMAKE_BUILD_TYPE`          | `Release`    | `Release`, `Debug`, or `RelWithDebInfo`.                                  |
+| `CMAKE_CUDA_ARCHITECTURES`  | (no default) | Target SM versions. The shipped release uses `"75;86;89;120"`. See below. |
 
 Override at configure time:
 
@@ -74,31 +74,51 @@ cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
 
 ## CUDA architecture selection
 
-The default architecture list (`86;89;100`) covers Ampere, Ada, and Blackwell. Compiling for every architecture roughly triples NVCC's work; for local development, restrict to your card.
+The shipped release (built by `.github/workflows/build-release.yml`) targets `"75;86;89;120"` on CUDA Toolkit 12.8. Those four SMs cover every consumer card from RTX 20 through RTX 50 plus the RTX 6000 Ada and RTX PRO 6000 Blackwell workstation cards. Compiling for every architecture roughly multiplies NVCC's work by the number of SMs; for local development, restrict to your card.
 
-| GPU series           | Compute capability | `CMAKE_CUDA_ARCHITECTURES` value |
-| -------------------- | ------------------ | -------------------------------- |
-| RTX 2000 (Turing)    | sm_75              | `75`                             |
-| RTX 3000 (Ampere)    | sm_86              | `86`                             |
-| RTX 4000 (Ada)       | sm_89              | `89`                             |
-| RTX 5000 (Blackwell) | sm_100             | `100`                            |
-| H100 (Hopper)        | sm_90              | `90`                             |
+| GPU                                          | Architecture         | SM    | Required CUDA toolkit |
+| -------------------------------------------- | -------------------- | ----- | --------------------- |
+| RTX 20 series (2060 / 2070 / 2080 / 2080 Ti) | Turing               | `75`  | 12.x                  |
+| RTX 30 series (3060 / 3070 / 3080 / 3090)    | Ampere consumer      | `86`  | 12.x                  |
+| RTX 40 series + RTX 6000 Ada Workstation     | Ada Lovelace         | `89`  | 12.x                  |
+| RTX 50 series + RTX PRO 6000 Blackwell       | Blackwell consumer   | `120` | **12.8+**             |
+| GTX 10 series (Pascal)                       | Pascal               | `61`  | 12.x                  |
+| A100 / A30                                   | Ampere datacenter    | `80`  | 12.x                  |
+| H100 / H200                                  | Hopper               | `90`  | 12.0+                 |
+| B100 / B200                                  | Blackwell datacenter | `100` | 12.4+                 |
 
-Example (RTX 4090 only):
+### Easiest: auto-detect this machine
+
+If you are building on the same machine the binary will run on:
+
+```bash
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+                       -DCMAKE_CUDA_ARCHITECTURES=native
+```
+
+`native` queries each installed GPU's compute capability via the CUDA driver and builds for exactly those SMs. Requires CMake 3.24+. Fastest compile, but the binary is not portable to other machines.
+
+### Specific architecture
+
+For a single card type (faster compile than building for many):
 
 ```bash
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
                        -DCMAKE_CUDA_ARCHITECTURES="89"
 ```
 
-Multi-card hosts with mixed architectures should list every architecture present:
+### Multiple architectures (portable binary)
+
+For a binary that runs on several different cards:
 
 ```bash
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-                       -DCMAKE_CUDA_ARCHITECTURES="86;89"
+                       -DCMAKE_CUDA_ARCHITECTURES="75;86;89;120"
 ```
 
-Minimum supported compute capability is **7.5** (Turing). Pre-Turing cards lack the required PTX features for `--use_fast_math` plus the lambda-in-device patterns used by the kernels.
+Each architecture adds roughly 10 to 15 MB of SASS to the binary and increases compile time roughly linearly. For forward compatibility with future GPUs, append `-virtual` to the highest entry (for example `"75;86;89;120-virtual"`) so newer cards can JIT-compile from PTX at first launch.
+
+Minimum supported compute capability is **7.5** (Turing). Pre-Turing cards lack `--use_fast_math` plus lambda-in-device patterns used by the kernels.
 
 ---
 
@@ -260,13 +280,13 @@ Linux Free release artifacts are built in CI on tag push (`v*`). The local equiv
 
 ```bash
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-                       -DCMAKE_CUDA_ARCHITECTURES="75;86;89;100"
+                       -DCMAKE_CUDA_ARCHITECTURES="75;86;89;120"
 cmake --build build --parallel
 strip build/collider
 sha256sum build/collider > build/collider.sha256
 ```
 
-The release artifact bundles every supported CUDA architecture in one binary; CUDA's runtime picks the closest match at launch.
+The release artifact bundles every supported CUDA architecture in one binary; CUDA's runtime picks the closest match at launch. SM 120 (RTX 50 / RTX PRO 6000 Blackwell) requires CUDA Toolkit 12.8 or newer; older toolkits will fail at configure time.
 
 Pro releases (binary-only, license-gated) go through the private CI plus the per-customer license signing pipeline; the operator workflow is documented in the private repo.
 

@@ -1,5 +1,5 @@
 /**
- * TheCollider - Clean ANSI Banner with Shine Wipe Effect
+ * theCollider - Clean ANSI Banner with Shine Wipe Effect
  *
  * Simple, context-aware display with animated shine.
  */
@@ -104,13 +104,11 @@ namespace ansi {
 
 // ---------------------------------------------------------------------------
 // Single source of truth for "X items per second" formatting.
-//
 // Auto-picks an SI prefix (K / M / G / T) based on magnitude and emits two
 // decimals of precision (one for sub-MKey/s, zero for sub-KKey/s) so output
 // width is bounded and predictable. Default unit is "Keys/s" since most
 // callers are measuring kangaroo / brute-force key throughput; the SHA
 // benchmark and brain-wallet check loops can override it.
-//
 // Replaces the three independent formatters that grew up alongside this
 // header (`Banner::format_speed(uint64_t)`,
 // `ProfessionalUI::format_speed(int mkeys_per_sec)`, and a substr-truncating
@@ -554,18 +552,23 @@ public:
 
     /**
      * Format large numbers with appropriate suffix (K, M, G, T).
+     *
+     * Uses a single space before the SI prefix so the suffix renders as a
+     * distinct token rather than fusing with the digits. Matches
+     * collider::ui::format_rate above so both formatters produce the same
+     * visual shape across the TUI.
      */
     static std::string format_number_short(uint64_t n) {
         std::ostringstream oss;
         oss << std::fixed << std::setprecision(2);
         if (n >= 1000000000000ULL) {
-            oss << (static_cast<double>(n) / 1e12) << "T";
+            oss << (static_cast<double>(n) / 1e12) << " T";
         } else if (n >= 1000000000ULL) {
-            oss << (static_cast<double>(n) / 1e9) << "G";
+            oss << (static_cast<double>(n) / 1e9) << " B";
         } else if (n >= 1000000ULL) {
-            oss << (static_cast<double>(n) / 1e6) << "M";
+            oss << (static_cast<double>(n) / 1e6) << " M";
         } else if (n >= 1000ULL) {
-            oss << (static_cast<double>(n) / 1e3) << "K";
+            oss << (static_cast<double>(n) / 1e3) << " K";
         } else {
             oss << n;
         }

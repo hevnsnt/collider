@@ -7,6 +7,8 @@
 
 #pragma once
 
+#include "paths.hpp"
+
 #include <string>
 #include <fstream>
 #include <sstream>
@@ -45,15 +47,11 @@ struct UserConfig {
      * Get config file path.
      */
     static std::string get_config_path() {
-        std::string home;
-#ifdef _WIN32
-        const char* userprofile = std::getenv("USERPROFILE");
-        home = userprofile ? userprofile : ".";
-#else
-        const char* home_env = std::getenv("HOME");
-        home = home_env ? home_env : ".";
-#endif
-        return home + "/.collider/config";
+        // NOTE: this is the legacy key=value config (~/.collider/config), not
+        // the YAML config (~/.collider/config.yml) handled by yaml_config.hpp
+        // via paths::config_file(). The two coexist; we keep the legacy name
+        // here for backward compatibility with installs that already have one.
+        return (collider::paths::collider_home() / "config").string();
     }
 
     /**

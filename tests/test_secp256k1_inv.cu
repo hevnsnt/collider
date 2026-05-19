@@ -73,6 +73,42 @@ int main() {
     // a = a high-bits value
     memset(&scalars[24], 0, 32); seed_with(&scalars[24], 0x0123456789ABCDEFull, 0xFEDCBA9876543210ull); scalars[24] = 1;
 
+    // v1.4.2 A.6: canonical edges that broke addition-chain mod_inv in v1.4.0
+    // and v1.4.1 - particularly the x223 addition-chain step. These ensure
+    // the inverse holds for values near p, for all-ones values that require
+    // internal reduction, and for boundary bit patterns.
+    //
+    // a = p - 1  (the involution: (p-1)^2 == 1 mod p, so inv(p-1) == p-1)
+    // p = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
+    // p - 1 = 0xFFFFFFFF...FEFFFFFC2E
+    memset(&scalars[32], 0, 32);
+    scalars[32] = 0xFFFFFC2Eu; scalars[33] = 0xFFFFFFFEu;
+    scalars[34] = 0xFFFFFFFFu; scalars[35] = 0xFFFFFFFFu;
+    scalars[36] = 0xFFFFFFFFu; scalars[37] = 0xFFFFFFFFu;
+    scalars[38] = 0xFFFFFFFFu; scalars[39] = 0xFFFFFFFFu;
+
+    // a = 2^256 - 1  (the absolute maximum 256-bit value; will be reduced
+    // internally to 2^32 + 976 = 0x1000003D0 mod p, then inverted)
+    memset(&scalars[40], 0, 32);
+    for (int j = 0; j < 8; j++) scalars[40 + j] = 0xFFFFFFFFu;
+
+    // a = 2^223 - 1  (exercises the x223 step in the addition chain that
+    // was historically miscoded as x224 / x222 in different forks)
+    memset(&scalars[48], 0, 32);
+    for (int j = 0; j < 6; j++) scalars[48 + j] = 0xFFFFFFFFu;
+    scalars[54] = 0x7FFFFFFFu;  // bits 192..222 set; bit 223 clear
+    scalars[55] = 0u;
+
+    // a = n - 1, the group order minus one. Working in the FIELD (mod p),
+    // this is just another bit pattern; the test verifies a * inv(a) == 1
+    // for that pattern.
+    // n = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+    memset(&scalars[56], 0, 32);
+    scalars[56] = 0xD0364140u; scalars[57] = 0xBFD25E8Cu;
+    scalars[58] = 0xAF48A03Bu; scalars[59] = 0xBAAEDCE6u;
+    scalars[60] = 0xFFFFFFFEu; scalars[61] = 0xFFFFFFFFu;
+    scalars[62] = 0xFFFFFFFFu; scalars[63] = 0xFFFFFFFFu;
+
     // Allocate device buffers
     uint32_t* d_scalars = nullptr;
     uint8_t*  d_results = nullptr;

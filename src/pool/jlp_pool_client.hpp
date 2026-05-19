@@ -15,13 +15,18 @@
 
 #include "pool_client.hpp"
 #include "pool_config.hpp"
+#include "../core/secure_buffer.hpp"  // SecureString for the pool password
 #include <thread>
 #include <mutex>
-#include <queue>
+#include <deque>
 #include <condition_variable>
 #include <atomic>
 #include <array>
+#include <cstddef>
+#include <functional>
 #include <limits>
+#include <vector>      // retry_threads_ storage for std::jthread uploaders
+#include <stop_token>  // std::stop_token for cooperative cancellation
 
 // TLS support via OpenSSL
 #ifdef COLLIDER_HAS_OPENSSL
@@ -103,13 +108,12 @@ struct JLPHeader {
     uint16_t payload_size;   // Size of payload (2 bytes, little-endian)
 };  // Total: 8 bytes
 
-// v1.4.1 B.2: AUTH wire format (120 bytes) -- pre-1.4.1 the client
-// sent JLPClientHello (76 bytes) but the Python server decoded
-// 96 bytes (name + password) and silently mis-aligned gpu_count/speed
-// onto the password slot. The new format is name + password + a
-// timestamp_ms + a 16-byte nonce so the server can reject replays of
-// captured AUTH packets and enforce client-clock drift bounds.
-//
+// AUTH wire format (120 bytes). A legacy JLPClientHello (76 bytes) sent
+// by the client was decoded as 96 bytes (name + password) by the Python
+// server and silently mis-aligned gpu_count/speed onto the password
+// slot. The current format is name + password + a timestamp_ms + a
+// 16-byte nonce so the server can reject replays of captured AUTH
+// packets and enforce client-clock drift bounds.
 // Field order matches collision-protocol/src/jlp_protocol.py
 // (struct.pack equivalent: '<64s32sQ16s').
 struct JLPClientHelloV2 {
@@ -144,17 +148,16 @@ struct JLPDistinguishedPoint {
 static_assert(sizeof(JLPDistinguishedPoint) == 66,
               "JLPDistinguishedPoint must be 66 bytes on the wire");
 
-// v2 distinguished point: 78-byte wire layout (was 74 pre-1.4.1). The
-// 8-byte work_id prefix attests which assigned chunk the DP came from;
-// the 4-byte sequence (v1.4.1 B.1) is a per-(worker, work_id) monotonic
-// counter. The server tracks an expected window and rejects out-of-
-// window sequences as replays. Matches the server's
-// DistinguishedPointV2.to_bytes() (struct.pack('<QI32s32sBB',
-// work_id, sequence, x, d, type, dp_bits)).
+// v2 distinguished point: 78-byte wire layout. The 8-byte work_id prefix
+// attests which assigned chunk the DP came from; the 4-byte sequence is
+// a per-(worker, work_id) monotonic counter. The server tracks an
+// expected window and rejects out-of-window sequences as replays.
+// Matches the server's DistinguishedPointV2.to_bytes()
+// (struct.pack('<QI32s32sBB', work_id, sequence, x, d, type, dp_bits)).
 // DP_BATCH_V2 payload is [count:u32 LE][dp1:78][dp2:78]...
 struct JLPDistinguishedPointV2 {
     uint64_t work_id;        // 8 bytes  - chunk id from WorkAssignment (LE)
-    uint32_t sequence;       // 4 bytes  - v1.4.1 B.1 monotonic per-chunk counter (LE)
+    uint32_t sequence;       // 4 bytes  - monotonic per-chunk counter (LE)
     uint8_t  x[32];          // 32 bytes - X coordinate
     uint8_t  d[32];          // 32 bytes - Distance
     uint8_t  type;           // 1 byte   - Tame (0) or Wild (1)
@@ -170,9 +173,9 @@ static_assert(sizeof(JLPDistinguishedPointV2) == 78,
 #pragma pack(pop)
 
 // Connection / authentication state machine.
-// Wave 4 (Track D D-H4): the receiver MUST gate work-affecting messages on
-// AUTH_OK so a malicious or misbehaving server cannot inject WORK_ASN /
-// SOLUTION / DP_ACK / STATS_RSP before the client has authenticated.
+// The receiver MUST gate work-affecting messages on AUTH_OK so a
+// malicious or misbehaving server cannot inject WORK_ASN / SOLUTION /
+// DP_ACK / STATS_RSP before the client has authenticated.
 enum class AuthState : uint8_t {
     DISCONNECTED = 0,  // Not connected (initial / after disconnect)
     CONNECTING   = 1,  // TCP/TLS handshake in progress
@@ -187,14 +190,18 @@ public:
     static constexpr size_t MAX_DP_QUEUE_SIZE = 100000;  // ~6.5MB of DPs max
     static constexpr uint8_t SUPPORTED_PROTOCOL_VERSION = 1;
 
-    // Wave 4 (Track D D-H5): bound the number of consecutive reconnect attempts
-    // that hit AUTH_FAIL. Without this, one bad credential keeps hammering the
-    // pool with the same worker name forever, looking like credential stuffing.
-    static constexpr uint32_t MAX_AUTH_FAIL_ATTEMPTS = 3;
-
-    // Wave 4 (Track D D-M5): bound the time we wait for an AUTH_OK / AUTH_FAIL
-    // response after sending the AUTH message.
+    // Bound the time we wait for an AUTH_OK / AUTH_FAIL response after
+    // sending the AUTH message.
     static constexpr uint32_t AUTH_RESPONSE_TIMEOUT_MS = 10000;  // 10s
+
+    // max time disconnect() waits for the sender to drain
+    // dp_queue_ before forcing the threads to exit. Was 500 ms originally;
+    // bumped to 2000 ms after Wave J reproduced shutdown_drains_dp_queue
+    // flaking on loaded Windows hosts where the OS scheduler can park
+    // the sender for >500 ms during process exit. 2 s still lets a wedged
+    // sender give up well before any operator-perceived hang and matches
+    // the AUTH_RESPONSE_TIMEOUT_MS / 5 budget proportion.
+    static constexpr uint32_t DRAIN_TIMEOUT_MS = 2000;
 
     JLPPoolClient();
     ~JLPPoolClient() override;
@@ -204,7 +211,7 @@ public:
     void disconnect() override;
     bool is_connected() const override;
 
-    // Wave 4 D-M5: actually waits for AUTH_OK / AUTH_FAIL / MSG_ERROR or timeout.
+    // actually waits for AUTH_OK / AUTH_FAIL / MSG_ERROR or timeout.
     // Returns false on AUTH_FAIL, MSG_ERROR, or timeout. The `password` parameter
     // is currently ignored by the JLP wire protocol (no password field in the
     // ClientHello struct); it is accepted for interface compatibility with
@@ -216,7 +223,7 @@ public:
     bool submit_dp(const DistinguishedPoint& dp) override;
     bool submit_dps(const std::vector<DistinguishedPoint>& dps) override;
 
-    PoolStats get_stats() override;
+    PoolStatsLocal get_stats() override;
     bool report_solution(const uint8_t* private_key) override;
 
     void set_solution_callback(SolutionCallback cb) override;
@@ -231,6 +238,52 @@ public:
     void set_use_tls(bool use_tls) { use_tls_ = use_tls; }
     void set_verify_cert(bool verify) { verify_cert_ = verify; }
 
+    // dp_sequence_next_ ownership lives in PoolManager
+    // so a supervisor-driven reconnect that recreates the JLPPoolClient
+    // does NOT reset the counter to 0 (which would self-ban the worker
+    // against the server's _dp_seq_high watermark). On every client
+    // construction the supervisor calls seed_dp_sequence(seq, work_id)
+    // with the persisted next-seq for that (worker, work_id) pair.
+    //   * seed_dp_sequence: write-only seed for the per-chunk counter.
+    //   * dp_sequence_progress_callback: mirror counter mutations back
+    //     so the manager-side map and the on-disk snapshot stay current.
+    //   * work_id_progress_callback: mirror work_id changes back so
+    //     the manager can detect genuine reassignment and reset the
+    //     counter for the new key (Pool-B1 final clause).
+    using DpSeqProgressCallback =
+        std::function<void(uint64_t work_id, uint32_t next_seq)>;
+    using WorkIdAssignedCallback =
+        std::function<void(uint64_t work_id)>;
+
+    void seed_dp_sequence(uint64_t work_id, uint32_t next_seq);
+    void set_dp_sequence_progress_callback(DpSeqProgressCallback cb);
+    void set_work_id_assigned_callback(WorkIdAssignedCallback cb);
+
+    // emit the plaintext warning before any bytes are
+    // written to the wire (AUTH carries credentials). Called by
+    // parse_pool_url + the supervisor when it spins up a fresh client.
+    // No-op for jlps://.
+    static void warn_if_plaintext(const std::string& url_scheme_or_host,
+                                  uint16_t port);
+
+    // pre-load DPs that were on disk from a prior shutdown.
+    // Called by PoolManager BEFORE authenticate() so the first DP_BATCH_V2
+    // includes the persisted backlog. The vector is moved in to avoid an
+    // extra copy of a large queue.
+    void preload_dp_queue(std::vector<DistinguishedPoint>&& persisted);
+
+    // serialize the current dp_queue_ to disk so the next
+    // process start can replay it. Called by PoolManager::disconnect()
+    // BEFORE the underlying JLPPoolClient is destroyed.
+    bool persist_dp_queue_to_disk(const std::string& path) const;
+
+    // snapshot the per-chunk DP counters held inside the
+    // client. After the supervisor decides to recreate the client (e.g.
+    // on disconnect) it should call this just before destroying the old
+    // instance so any in-flight increments are mirrored back to its map.
+    void snapshot_dp_sequence(uint64_t& out_work_id,
+                              uint32_t& out_next_seq) const;
+
 private:
     bool debug_mode_ = false;
     // Network
@@ -243,30 +296,27 @@ private:
     std::atomic<bool> running_;
     std::atomic<bool> last_receive_was_timeout_;  // Track if last recv was timeout vs disconnect
 
-    // Wave 4 D-H4: connection-state machine. atomic so the receiver and main
+    // connection-state machine. atomic so the receiver and main
     // threads can both read it without taking a lock on the hot dispatch path.
     std::atomic<AuthState> auth_state_{AuthState::DISCONNECTED};
 
-    // Wave 4 D-M5: condition variable + mutex used by authenticate() to wait
+    // condition variable + mutex used by authenticate() to wait
     // for an AUTH_OK / AUTH_FAIL / MSG_ERROR transition.
     std::mutex auth_cv_mutex_;
     std::condition_variable auth_cv_;
 
-    // Reconnection with exponential backoff. The cap MAX_RECONNECT_BACKOFF_MS
-    // is defined in pool_config.hpp and shared with PoolManager so the two
-    // reconnect paths agree on the upper bound.
-    static constexpr uint32_t RECONNECT_BASE_DELAY_MS = 1000;    // Start at 1 second
-    static constexpr double RECONNECT_BACKOFF_MULTIPLIER = 2.0;  // Double each time
-    uint32_t reconnect_delay_ms_ = RECONNECT_BASE_DELAY_MS;
-    uint32_t reconnect_attempts_ = 0;
-
-    // Wave 4 D-H5: count *consecutive* AUTH_FAILs across reconnects so we can
-    // give up instead of hammering the pool forever with bad creds.
-    uint32_t consecutive_auth_failures_ = 0;
+    // the in-receiver-thread reconnect block (which
+    // counted consecutive_auth_failures_ against MAX_AUTH_FAIL_ATTEMPTS
+    // and applied an exponential backoff with RECONNECT_BACKOFF_MULTIPLIER)
+    // was deleted because it ALWAYS returned after a single sleep, so the
+    // counters and constants were dead code suggesting behavior that never
+    // ran. The PoolManager supervisor (pool_manager.cpp) is now the only
+    // reconnect driver. The auth-fail cap moved to pool_config.hpp as
+    // MAX_AUTH_FAIL_ATTEMPTS and is enforced by the supervisor.
 
     // TLS support
     bool use_tls_ = false;
-    bool verify_cert_ = true;  // Wave 4 D-H2: default to verify (was false / fail-open)
+    bool verify_cert_ = true;  // default to verify (was false / fail-open)
 #ifdef COLLIDER_HAS_OPENSSL
     SSL_CTX* ssl_ctx_ = nullptr;
     SSL* ssl_ = nullptr;
@@ -277,7 +327,6 @@ private:
 #endif
 
     // Separate read and write mutexes for concurrent I/O on the SSL object.
-    //
     // OpenSSL is documented to support one concurrent reader and one
     // concurrent writer on the same SSL session, provided each direction is
     // serialized internally. A SINGLE mutex covering both sides deadlocks:
@@ -285,7 +334,6 @@ private:
     // main-thread send_message() (e.g. WORK_REQ) cannot acquire the mutex
     // to send -- so the request never goes on the wire and the worker
     // appears idle to the pool until it times out.
-    //
     // We therefore split into:
     //   ssl_write_mutex_  -- serializes sender_loop and main-thread sends
     //   ssl_read_mutex_   -- serializes only the receiver_loop (defensive;
@@ -297,42 +345,57 @@ private:
 
     // Worker info
     std::string worker_name_;
-    std::string password_;       // v1.4.1 B.2: optional pool password
+    // Pool password. Held as a SecureString so the bytes are wiped on
+    // destruction (zero-on-free) and can be wiped explicitly the moment
+    // the handshake completes. The supervisor (PoolManager) keeps its
+    // own copy so reconnect can re-authenticate without prompting; that
+    // is the storage owner of record. The client's copy exists only for
+    // the duration of one authenticate() call.
+    ::collider::SecureString password_;       // optional pool password
     uint32_t gpu_count_;
     uint64_t speed_;
 
     // Current work
     WorkAssignment current_work_;
     bool work_received_ = false;  // true once WORK_ASN arrives (work_id==0 is a valid chunk)
-    // v1.4.1 B.1: per-(worker, work_id) monotonic DP counter. Reset to
+    // per-(worker, work_id) monotonic DP counter. Reset to
     // 0 every time the server hands out a new chunk; incremented on
     // each DP submitted in DP_BATCH_V2. The server tracks the expected
     // window per (worker_name, work_id) and rejects out-of-window
     // sequences as replays. The counter lives next to current_work_
     // because both are reset together when WORK_ASN arrives.
     uint32_t dp_sequence_next_ = 0;
-    std::mutex work_mutex_;
+    // Mutable so const accessors (snapshot_dp_sequence) can lock without
+    // const_cast. The mutex itself is conceptually metadata, not state.
+    mutable std::mutex work_mutex_;
 
     // Statistics
-    PoolStats stats_;
+    PoolStatsLocal stats_;
     std::mutex stats_mutex_;
 
-    // Callbacks. v1.4.1 C.3: protected by callbacks_mutex_ so that
-    // set_*_callback can race against an inbound message handler
-    // without tearing the function pointer, and so the dedup state
-    // (last_solution_pubkey_, last_work_id_fired_) is consistent
-    // across threads. Pre-1.4.1 the SOLUTION handler read
-    // solution_callback_ directly without a lock and called the
-    // callback inside the read; if a SOLUTION message arrived twice
-    // (server retry, bug, malicious replay) the callback fired twice,
-    // which on a privacy-sensitive pool would expose the recovered key
-    // to two writers (e.g., logged + filed twice).
+    // Callbacks. Protected by callbacks_mutex_ so that set_*_callback
+    // can race against an inbound message handler without tearing the
+    // function pointer, and so the dedup state (last_solution_pubkey_,
+    // last_work_id_fired_) is consistent across threads. An earlier
+    // unlocked design had the SOLUTION handler read solution_callback_
+    // directly and call the callback inside the read; if a SOLUTION
+    // message arrived twice (server retry, bug, malicious replay) the
+    // callback fired twice, which on a privacy-sensitive pool would
+    // expose the recovered key to two writers (e.g., logged + filed
+    // twice).
     SolutionCallback solution_callback_;
     WorkCallback     work_callback_;
     mutable std::mutex callbacks_mutex_;
     std::array<uint8_t, 32> last_solution_pubkey_{};  // zero = none seen
     bool     solution_fired_ = false;
-    uint64_t last_work_id_fired_ = std::numeric_limits<uint64_t>::max();
+    // client-instance work_id dedup was removed because
+    // the supervisor recreates JLPPoolClient on reconnect, resetting any
+    // last_work_id_fired_ sentinel and re-firing the same work_id back to
+    // the host. Dedup now lives on PoolManager (which outlives client
+    // recreation). This client always forwards every WORK_ASN; the
+    // manager-side filter decides whether to surface it to the host.
+    DpSeqProgressCallback   dp_seq_progress_callback_;
+    WorkIdAssignedCallback  work_id_assigned_callback_;
     void fire_solution_callback(const uint8_t* pubkey_bytes);
     void fire_work_callback(const WorkAssignment& work);
 
@@ -340,12 +403,106 @@ private:
     std::thread receiver_thread_;
     void receiver_loop();
 
-    // DP queue for batched submission
-    std::queue<DistinguishedPoint> dp_queue_;
-    std::mutex dp_mutex_;
+    // Solution-upload retry threads. Each successful recovered key spawns one
+    // background uploader that retries for up to 24 hours. Previously the
+    // thread was std::thread.detach()'d capturing `this`, which is undefined
+    // behaviour if the JLPPoolClient is destroyed before the thread observes
+    // running_ == false. std::jthread owns its handle, requests stop on
+    // destruction, and joins; the lambda watches its stop_token and bails
+    // out of the backoff sleep + outer loop as soon as cancellation is
+    // requested. The vector is appended to under retry_threads_mutex_ from
+    // upload_solution() and is cleared on disconnect() so destructors run
+    // BEFORE the socket / TLS state we depend on is torn down.
+    std::vector<std::jthread> retry_threads_;
+    std::mutex retry_threads_mutex_;
+
+    // DP queue for batched submission. std::deque is used (vs
+    // std::queue) so the sender can push the head of an un-sendable
+    // batch BACK onto the front of the queue if it drained 100 DPs but
+    // the AUTH state hadn't reached AUTH_OK yet. Dropping those DPs
+    // silently loses work; pushing them to a side queue would re-order
+    // against fresh DPs.
+    std::deque<DistinguishedPoint> dp_queue_;
+    // Mutable so const accessors (snapshot_dp_queue) can lock without
+    // const_cast. The mutex itself is conceptually metadata, not state.
+    mutable std::mutex dp_mutex_;
     std::condition_variable dp_cv_;
     std::thread sender_thread_;
+    std::atomic<bool> drain_requested_{false};  // flush flag
+    // DPs that the sender had to drop on a genuine shutdown
+    // (running_=false before AUTH_OK). Surfaced via get_shutdown_drop_count
+    // so PoolManager can roll it into its own dropped_count_.
+    std::atomic<uint64_t> shutdown_drop_count_{0};
     void sender_loop();
+
+    // sender_loop sub-steps. The loop body is naturally five phases:
+    // wait for activity, drain the queue into a wire-ready batch, send
+    // it (or roll back the sequence counter and re-queue if AUTH isn't
+    // ready), do a final drain pass if disconnect() asked for one, and
+    // run periodic STATS_REQ + PING keepalives. Splitting the phases
+    // into private methods keeps sender_loop a thin orchestrator and
+    // collapses the duplicate drain-and-send code that previously
+    // appeared verbatim in both the main path and the disconnect
+    // cleanup block.
+    void wait_for_send_signal();
+    // Drain up to 100 DPs from dp_queue_ into `batch`, encoded for the
+    // wire under current_work_id / seq_start. The caller has already
+    // sampled current_work_id and dp_sequence_next_ under work_mutex_;
+    // we hold dp_mutex_ alone for the drain. Returns the number drained.
+    size_t drain_dp_queue_into_batch(uint64_t current_work_id,
+                                     uint32_t seq_start,
+                                     std::vector<JLPDistinguishedPointV2>& batch);
+    // Compare-and-set dp_sequence_next_ for current_work_id: only write
+    // if the chunk under work_mutex_ still matches (a racing WORK_ASN
+    // resets the counter for the new chunk, and we must not stomp it).
+    void advance_dp_sequence_if_unchanged(uint64_t current_work_id,
+                                          uint32_t new_next);
+    // Best-effort send of a batch under AUTH_OK. Wire format is
+    // [count:u32 LE][dp1:78][dp2:78]... (matches DP_BATCH_V2). On send
+    // success, mirrors the new sequence counter back to PoolManager,
+    // bumps stats / session-log counters, and updates last_send for
+    // keepalive bookkeeping. payload is a hoisted scratch buffer the
+    // caller owns to avoid per-call reallocation.
+    bool send_dp_batch(uint64_t current_work_id,
+                       uint32_t seq_start,
+                       const std::vector<JLPDistinguishedPointV2>& batch,
+                       std::vector<uint8_t>& payload,
+                       std::chrono::steady_clock::time_point& last_send);
+    // Roll back the sequence advance and push the drained DPs back onto
+    // the FRONT of dp_queue_ in reverse so wire order is preserved.
+    // Called when we drained DPs but the connection wasn't AUTH_OK yet,
+    // so the batch must wait for the next iteration.
+    void requeue_unauth_batch(uint64_t current_work_id,
+                              uint32_t seq_start,
+                              const std::vector<JLPDistinguishedPointV2>& batch);
+    // Final drain pass after disconnect() asked for a flush. Drains as
+    // many DPs as possible WHILE we still have connected_ + AUTH_OK,
+    // sending them in 100-DP batches. Exits when the queue is empty,
+    // running_ flips false, AUTH state slips, or a send fails. Returns
+    // when no more progress is possible. `batch` and `payload` are
+    // scratch buffers borrowed from the caller.
+    void perform_final_drain_pass(std::vector<JLPDistinguishedPointV2>& batch,
+                                  std::vector<uint8_t>& payload,
+                                  std::chrono::steady_clock::time_point& last_send);
+    // Send STATS_REQ every STATS_INTERVAL_SECONDS and PING every
+    // KEEPALIVE_SECONDS if no activity has gone out in that window.
+    // Both are gated on AUTH_OK so we don't talk to a server that
+    // hasn't accepted us yet. last_send is updated when either send
+    // happens.
+    void send_periodic_stats_and_keepalive(
+        std::chrono::steady_clock::time_point& last_send,
+        std::chrono::steady_clock::time_point& last_stats_req);
+
+public:
+    uint64_t get_shutdown_drop_count() const {
+        return shutdown_drop_count_.load(std::memory_order_relaxed);
+    }
+    // caller copies all queued DPs out so they can be
+    // serialized to disk before the client is destroyed. Returns the
+    // copy; original queue is left intact (caller decides whether to
+    // discard).
+    std::vector<DistinguishedPoint> snapshot_dp_queue() const;
+private:
 
     // Protocol helpers
     bool send_message(JLPMessageType type, const void* data, size_t size);
@@ -353,19 +510,55 @@ private:
     bool send_hello();
     void handle_server_message(const JLPHeader& header, const std::vector<uint8_t>& payload);
 
-    // Wave 4 B-LOW-6 helper: safely (re)assign a std::thread by joining the
-    // existing one if joinable. Plain `t = std::thread(...)` on a joinable
-    // thread invokes std::terminate per [thread.thread.assign]/p2.
-    //
-    // v1.4.1 P-T2: noexcept. The body catches every exception path
-    // (join's std::system_error, detach's std::system_error, anything
-    // else from std::cerr) and std::thread::operator= is itself
-    // noexcept per the standard, so the function never propagates an
-    // exception. Marking it noexcept lets the compiler tighten code
-    // generation in the reconnect-error path that called this --
-    // pre-1.4.1 the implicit "potentially-throwing" classification on
-    // a function used during error recovery is the kind of latent
-    // hazard that can cause std::terminate during cleanup.
+    // Per-message handlers. handle_server_message is a thin dispatcher:
+    // it enforces the pre-AUTH_OK gate and forwards to one of these. Each
+    // handler owns its own payload parsing, validation, side-effects, and
+    // callback firing. Splitting them out keeps the dispatcher small and
+    // lets each protocol case be reasoned about (and unit-tested) in
+    // isolation. handle_default_unknown covers the switch default branch
+    // (debug-only log of unrecognized message types) plus PONG, which has
+    // no client-side reaction beyond the keepalive bookkeeping already
+    // done by the receiver loop's last-receive timestamp.
+    void handle_auth_ok(const JLPHeader& header, const std::vector<uint8_t>& payload);
+    void handle_auth_fail(const JLPHeader& header, const std::vector<uint8_t>& payload);
+    void handle_msg_error(const JLPHeader& header,
+                          const std::vector<uint8_t>& payload,
+                          AuthState pre_dispatch_state);
+    void handle_work_asn(const JLPHeader& header, const std::vector<uint8_t>& payload);
+    void handle_solution(const JLPHeader& header, const std::vector<uint8_t>& payload);
+    void handle_dp_ack(const JLPHeader& header, const std::vector<uint8_t>& payload);
+    void handle_stats_rsp(const JLPHeader& header, const std::vector<uint8_t>& payload);
+    void handle_ping(const JLPHeader& header, const std::vector<uint8_t>& payload);
+    void handle_default_unknown(const JLPHeader& header,
+                                const std::vector<uint8_t>& payload);
+
+    // WORK_ASN sub-steps. handle_work_asn() composes these: validate
+    // dp_bits and tear the connection down on a violation, snapshot the
+    // assignment under work_mutex_, emit the session-log milestone and
+    // SessionState snapshot. Splitting them out keeps the WORK_ASN
+    // handler at dispatcher length and lets the parts be reasoned about
+    // (and tested) independently. reject_work_asn_dp_bits returns true
+    // when the assignment was rejected (caller must stop further
+    // processing); the helper is responsible for ALL the connection
+    // teardown bookkeeping previously inlined in the switch case.
+    bool reject_work_asn_dp_bits(const JLPServerConfig& config);
+    void apply_work_asn_assignment(const JLPServerConfig& config,
+                                   WorkAssignment& out_work_copy);
+    void log_work_asn_milestone(const JLPServerConfig& config,
+                                const WorkAssignment& work_copy);
+
+    // Safely (re)assign a std::thread by joining the existing one if
+    // joinable. Plain `t = std::thread(...)` on a joinable thread
+    // invokes std::terminate per [thread.thread.assign]/p2.
+    // Marked noexcept: the body catches every exception path (join's
+    // std::system_error, detach's std::system_error, anything else from
+    // std::cerr) and std::thread::operator= is itself noexcept per the
+    // standard, so the function never propagates an exception. The
+    // noexcept marker lets the compiler tighten code generation in the
+    // reconnect-error path that called this; an implicit
+    // "potentially-throwing" classification on a function used during
+    // error recovery is the kind of latent hazard that can cause
+    // std::terminate during cleanup.
     static void replace_thread(std::thread& t, std::thread new_thread) noexcept;
 
     // Platform init

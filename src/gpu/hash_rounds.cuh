@@ -9,10 +9,9 @@
  * puzzle_optimized.cu, rckangaroo_wrapper.cu, v2/device_hashes.cuh)
  * each defining its own rotr/ch/maj/sigma0/sigma1/gamma0/gamma1 with
  * a different per-TU prefix (rotr / mega_rotr / sha_rotr / rotr32 /
- * sha256_rotr). The duplication had nothing to load-bearing per-kernel
- * specialisation; the per-kernel comment in mega_fused_kernel.cu
- * about register-budget tuning is about the compression LOOP, not
- * the primitives.
+ * sha256_rotr). The duplication had nothing load-bearing per-kernel
+ * specialisation. (T0.3.b A-tier wave 1 deleted mega_fused_kernel.cu,
+ * so the live consumer set is now five TUs.)
  *
  * v1.4.1 D.2 (partial): one canonical header for the primitives.
  * Each consuming TU includes this header and uses the canonical

@@ -3,10 +3,11 @@
  *
  * The 64 round constants from FIPS 180-4 Section 4.2.2 (sqrt(p) where p is
  * the first 64 primes; ASCII initials of "Beethoven, Mozart, ...etc"
- * is a common mnemonic). Three GPU SHA-256 implementations in this
+ * is a common mnemonic). The GPU SHA-256 implementations in this
  * codebase used to define their own copy of this 64-element array
- * (fused_pipeline.cu / mega_fused_kernel.cu / v2/device_hashes.cuh);
- * v1.4.0 phase 4 audit folded them into this single header.
+ * (fused_pipeline.cu / v2/device_hashes.cuh, plus mega_fused_kernel.cu
+ * before T0.3.b deleted it); v1.4.0 phase 4 audit folded them into
+ * this single header.
  *
  * CUDA __constant__ memory is per-translation-unit (each PTX module
  * has its own constant cache region), so each consumer still emits

@@ -7,8 +7,10 @@
  * of each definition is identical to RFC 8092 / ISO/IEC 10118-3
  * specification of RIPEMD-160; there is no implementation
  * flexibility that would justify the duplication.
+ * (T0.3.b A-tier wave 1 deleted mega_fused_kernel.cu, so the live
+ * consumer set is now ripemd160.cu and fused_pipeline.cu.)
  *
- * v1.4.1 D.2: one canonical header, primitives live under
+ * one canonical header, primitives live under
  * `collider::gpu::ripemd160::*`. Each consuming TU includes this
  * header and brings the names in via using-decls. The round LOOPS
  * stay per-TU because their unroll factor and intermediate-state

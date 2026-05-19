@@ -116,7 +116,6 @@ For Free builds, `build/collider` is the only artifact. For Pro builds, the scri
 ```bash
 ./build/collider_pro --puzzle-only-v2 \
                      --schemes all \
-                     --addr-types puzzle_only \
                      --puzzle-keys ./data/puzzle_history.json
 ```
 

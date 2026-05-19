@@ -25,6 +25,7 @@
 #include <cstring>
 #include <array>
 #include "../core/byte_codec.hpp"
+#include "../core/bech32.hpp"   // BIP-173 checksum-verifying decoder
 #include <stdexcept>
 #include <algorithm>
 #include <chrono>
@@ -431,8 +432,11 @@ public:
             throw std::runtime_error("Cannot create BLF file: " + path);
         }
 
-        // Prepare header
-        BloomFilterHeader header;
+        // Prepare header. Value-initialize so reserved[80] is zeroed
+        // (default construction leaves it indeterminate, which leaks
+        // stack residue into the .blf file and trips the runtime
+        // BLF1 reserved-bytes warning on every fresh build).
+        BloomFilterHeader header{};
         header.num_bits = num_bits_;
         header.num_hashes = num_hashes_;
         header.seed = config_.seed;
@@ -464,7 +468,7 @@ public:
             throw std::runtime_error("Cannot open BLF file: " + path);
         }
 
-        BloomFilterHeader header;
+        BloomFilterHeader header{};
         file.read(reinterpret_cast<char*>(&header), sizeof(header));
 
         if (std::string(header.magic, 4) != "BLF1") {
@@ -550,8 +554,34 @@ private:
 
         num_bits_ = static_cast<uint64_t>(-n * std::log(p) / ln2_sq);
 
-        // Round up to 64-bit boundary for GPU efficiency
-        num_bits_ = ((num_bits_ + 63) / 64) * 64;
+        // B3 (2026-05-15): round up to next power of 2, NOT to a
+        // multiple of 64. The fused-pipeline bloom probe path branches on
+        // whether bloom_bits is a power of two: pow-2 case probes with a
+        // single bitwise AND (kernel arg `bloom_mask = bloom_bits - 1`,
+        // ~11 cycles per probe at num_hashes=11); non-pow-2 case falls
+        // back to a 64-bit modulo (~330 cycles per probe). The previous
+        // multiple-of-64 rounding meant every freshly-built .blf landed
+        // in the slow path and the F-mask optimisation (added in
+        // brain-wallet-tui-overhaul) was effectively dead code for new
+        // blooms.
+        // Cost: up to ~2x the bloom VRAM in the worst case (a num_bits
+        // value just above a power-of-2 boundary doubles), which is
+        // acceptable because (a) the bloom is a one-time allocation
+        // shared across every per-GPU dispatch and (b) the speedup on
+        // the steady-state hot path is ~30x per probe.
+        // Backward compatibility: the kernel KEEPS its mask=0 modulo
+        // fallback so existing .blf files (built before this fix) still
+        // load and probe correctly, just on the slow path. To upgrade
+        // an existing seen.blf to the fast path, rebuild it with this
+        // version of build_bloom (a `--convert <old.blf>` flag is a
+        // future enhancement, out of scope here).
+        if (num_bits_ == 0) {
+            num_bits_ = 64;  // degenerate guard; smallest power of 2 >= 64.
+        } else {
+            uint64_t next_pow2 = 1;
+            while (next_pow2 < num_bits_) next_pow2 <<= 1;
+            num_bits_ = next_pow2;
+        }
 
         // Optimal number of hash functions: k = (m/n) * ln(2)
         num_hashes_ = static_cast<uint32_t>(
@@ -648,8 +678,10 @@ private:
         } else if (address.substr(0, 4) == "bc1q" && config_.include_p2wpkh) {
             // P2WPKH: Bech32 decode
             result = bech32_decode(address);
-        } else if (address.size() == 40) {
-            // Raw H160 hex
+        } else if (address.size() == 40 &&
+                   std::all_of(address.begin(), address.end(),
+                               [](unsigned char c) { return std::isxdigit(c); })) {
+            // Raw H160 hex (v1.4.2 F.3: gated on hex char-class).
             result = H160::from_hex(address);
         } else {
             throw std::invalid_argument("Unsupported address format");
@@ -713,49 +745,16 @@ private:
     }
 
     H160 bech32_decode(const std::string& address) const {
-        // Simplified bech32 decode for bc1q addresses
-        // bc1q addresses are: hrp(bc) + separator(1) + data(witness version + H160)
-
-        if (address.size() < 14 || address.substr(0, 4) != "bc1q") {
-            throw std::invalid_argument("Invalid bech32 address");
-        }
-
-        static const char* BECH32_ALPHABET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
-
-        // Decode data part (skip "bc1")
-        std::vector<uint8_t> data;
-        for (size_t i = 3; i < address.size(); i++) {
-            const char* pos = std::strchr(BECH32_ALPHABET, std::tolower(address[i]));
-            if (!pos) {
-                throw std::invalid_argument("Invalid bech32 character");
-            }
-            data.push_back(pos - BECH32_ALPHABET);
-        }
-
-        // Convert from 5-bit to 8-bit groups
-        // First byte is witness version (0 for P2WPKH)
-        // Rest is the H160 in 5-bit encoding
-
-        std::vector<uint8_t> converted;
-        uint32_t acc = 0;
-        int bits = 0;
-
-        for (size_t i = 1; i < data.size() - 6; i++) {  // Skip version and checksum
-            acc = (acc << 5) | data[i];
-            bits += 5;
-            while (bits >= 8) {
-                bits -= 8;
-                converted.push_back((acc >> bits) & 0xff);
-            }
-        }
-
-        if (converted.size() != 20) {
-            throw std::invalid_argument("Invalid witness program length");
+        // full BIP-173 checksum verification via collider::bech32.
+        // Pre-fix this skipped the checksum entirely, so corrupted CSV addresses
+        // produced phantom H160s in the bloom / UVRF.
+        auto decoded = ::collider::bech32::decode_p2wpkh(address, "bc");
+        if (!decoded.has_value()) {
+            throw std::invalid_argument("Invalid bech32 address (checksum/format)");
         }
 
         H160 result;
-        std::memcpy(result.data, converted.data(), 20);
-
+        std::memcpy(result.data, decoded->data(), 20);
         return result;
     }
 };

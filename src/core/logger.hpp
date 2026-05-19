@@ -7,6 +7,8 @@
 
 #pragma once
 
+#include "paths.hpp"
+
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -42,17 +44,11 @@ public:
         // Determine log directory
         std::string dir = log_dir;
         if (dir.empty()) {
-            const char* home = nullptr;
-#ifdef _WIN32
-            home = std::getenv("USERPROFILE");
-#else
-            home = std::getenv("HOME");
-#endif
-            if (home) {
-                dir = std::string(home) + "/.collider";
-            } else {
-                dir = ".";
-            }
+            // paths::collider_home() returns "./.collider" as last-resort
+            // fallback when neither USERPROFILE nor HOME is set, matching the
+            // prior open-coded behaviour (home defaulted to "." then suffix
+            // "/.collider" was appended).
+            dir = collider::paths::collider_home().string();
         }
 
         // Create directory if needed
@@ -78,7 +74,7 @@ public:
             // Ignore rotation errors
         }
 
-        // Track-f F-04: log_file_ is now a shared_ptr so background threads
+        // log_file_ is now a shared_ptr so background threads
         // that grab a snapshot at the start of log() keep the underlying
         // ofstream alive even if the destructor races and tries to tear the
         // singleton down. The shared_ptr is swapped under mutex_ on shutdown.
@@ -116,7 +112,7 @@ public:
     }
 
     void log(Level level, const std::string& message) {
-        // Track-f F-04 fix: take the mutex BEFORE inspecting initialized_ /
+        // fix: take the mutex BEFORE inspecting initialized_ /
         // log_file_, and snapshot log_file_ as a shared_ptr local. That
         // prevents the destructor from tearing down log_file_ while we are
         // mid-write. The mutex pairs with the destructor's mutex acquire
@@ -134,7 +130,7 @@ public:
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             now.time_since_epoch()) % 1000;
 
-        // Track-f F-17: localtime_r is the thread-safe variant. The legacy
+        // localtime_r is the thread-safe variant. The legacy
         // std::localtime returns a pointer into a single static buffer that
         // can be torn between concurrent callers (Logger thread + main).
         std::tm tm_buf{};
@@ -171,18 +167,12 @@ public:
         log(Level::INFO, ss.str());
     }
 
-    void log_progress(uint64_t total_checked, double rate, int zone_idx, int total_zones) {
+    // dropped zone_idx/total_zones parameters together with the
+    // Center-Heavy scanning strategy that produced them.
+    void log_progress(uint64_t total_checked, double rate) {
         std::stringstream ss;
         ss << "PROGRESS: Checked=" << total_checked
-           << " (" << std::fixed << std::setprecision(1) << (rate / 1e6) << " M/s)"
-           << ", Zone=" << (zone_idx + 1) << "/" << total_zones;
-        log(Level::INFO, ss.str());
-    }
-
-    void log_zone_complete(int zone_idx, const std::string& zone_name, uint64_t keys_checked) {
-        std::stringstream ss;
-        ss << "ZONE_COMPLETE: Zone " << (zone_idx + 1) << " (" << zone_name << ")"
-           << ", KeysChecked=" << keys_checked;
+           << " (" << std::fixed << std::setprecision(1) << (rate / 1e6) << " M/s)";
         log(Level::INFO, ss.str());
     }
 
@@ -204,10 +194,9 @@ public:
         log(Level::ERR, ss.str());
     }
 
-    void log_state_save(int puzzle_number, int zone_idx, uint64_t position_lo, uint64_t position_hi) {
+    void log_state_save(int puzzle_number, uint64_t position_lo, uint64_t position_hi) {
         std::stringstream ss;
         ss << "STATE_SAVE: Puzzle=" << puzzle_number
-           << ", Zone=" << zone_idx
            << ", Position=0x" << std::hex << position_hi << std::setfill('0') << std::setw(16) << position_lo;
         log(Level::INFO, ss.str());
     }
@@ -222,7 +211,7 @@ public:
     std::string get_log_path() const { return log_path_; }
 
     ~Logger() {
-        // Track-f F-04 fix: do the final write WHILE still initialized_, then
+        // fix: do the final write WHILE still initialized_, then
         // atomically clear the flag and release log_file_ under the mutex.
         // After this destructor returns:
         //   - any future log() call will see initialized_=false under the
@@ -285,7 +274,7 @@ private:
         }
     }
 
-    // Track-f F-04 fix: initialized_ is now atomic so we can read it without
+    // fix: initialized_ is now atomic so we can read it without
     // holding the mutex when needed (and so a single store on shutdown is
     // visible to all threads). log_file_ is shared_ptr so background threads
     // can hold a stable snapshot across mutex release windows.

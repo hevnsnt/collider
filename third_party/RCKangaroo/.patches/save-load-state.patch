@@ -1,0 +1,83 @@
+v1.4.2 builder-final: RCKangaroo herd save/load hooks
+=====================================================
+
+Adds two opt-in hooks to RCKangaroo so theCollider's standalone puzzle
+solver can checkpoint and resume the per-GPU kangaroo herd. Without
+these, the standalone path (src/runtime/puzzle_solver.cpp) has no way
+to persist progress across SIGINT or process restart, because the
+third-party RCKangaroo encapsulates Kparams.Kangs (the device buffer
+holding every kangaroo's x, y, priv triple) behind a private member.
+
+Design constraints honored:
+
+  * No threading changes. RCGpuKang::Execute() still runs the kernel
+    loop continuously until Stop() is called. Save happens AFTER the
+    while loop exits, BEFORE Release() frees Kparams.Kangs, in the
+    same thread that owns the device. No new synchronization needed.
+  * No semantic change to the random-init path. When the new hooks
+    are not used (InitKangsHost == nullptr and SaveKangsHost ==
+    nullptr), the patched code is byte-equivalent to the pre-patch
+    code, including the same call sequence to CallGpuKernelGen.
+  * No public-API removals or signature changes. Two members are
+    added to RCGpuKang's public section. Existing callers compile
+    and link unchanged.
+
+Files changed:
+
+  GpuKang.h  (+10 LOC) - two public member pointers + comment.
+  GpuKang.cpp (+30 LOC, including comments) - Start() consumes
+                                              InitKangsHost when set;
+                                              Execute() dumps to
+                                              SaveKangsHost before
+                                              Release.
+
+On-disk layout (written by RCKangarooManager::save_herd_state in
+src/gpu/rckangaroo_wrapper.cu, not part of this patch):
+
+  Header (60 bytes):
+    16  magic        "COLLIDER_RCK\x01\x00\x00\x00"
+     4  version      1 (little-endian u32)
+     4  num_gpus     count of per-GPU blocks that follow
+     4  kang_cnt     KangCnt per GPU (must match all GPUs)
+     4  range_bits   passed to RCKangarooManager::range_bits
+     4  dp_bits      passed to RCKangarooManager::dp_bits
+    32  config_hash  SHA256 of (range_start_hex || pubkey_hex)
+                     so a load against a different target fails fast.
+
+  Per-GPU block (num_gpus times):
+     4  cuda_index   informational; load tolerates renumbering
+     4  reserved     0
+    KangCnt * 96 bytes:
+       For each kangaroo:
+          32 bytes x (u64[4] little-endian per RCKangaroo convention)
+          32 bytes y
+          32 bytes priv (lower 24 bytes are RC's private-portion;
+                         RC's GpuKang.cpp at line 295 memcpy's only 24
+                         bytes from EcInt::data, so the upper 8 bytes
+                         of each priv slot are reserved/zero on save
+                         and ignored on load).
+
+The buffer matches the cudaMalloc size at GpuKang.cpp line ~101 and the
+TPointPriv struct layout in GpuKang.h. The file's per-GPU per-kangaroo
+record is the same shape as the device buffer, byte-for-byte, so the
+wrapper can cudaMemcpy directly from the parsed file into KangsHost
+without any host-side rearrangement.
+
+Resume semantics:
+
+  * Random distances (RndPnts->priv) are part of the saved buffer, so
+    a resumed solve walks from exactly the points it stopped at.
+  * The DP database (s_db) is NOT saved by this patch. On resume the
+    kernel starts producing new DPs that get appended to a fresh
+    in-memory s_db; old DPs from the prior run are lost. This is the
+    same semantic as RCKangaroo's stand-alone tames-file workflow,
+    which only persists tame kangaroo positions, not collision state.
+    The resume saves wall-clock work proportional to the number of
+    steps taken (which dominates total elapsed time for puzzles >120
+    bits); it does NOT save partial collision progress.
+  * If the file's config_hash does not match the current solve's
+    target pubkey + range_start, load_herd_state returns false and
+    the solve proceeds with a freshly generated herd. Same fail-soft
+    semantic as the JLP MultiGPUKangaroo backend's load.
+
+License: RCKangaroo is GPLv3 (LICENSE.TXT). This patch keeps GPLv3.

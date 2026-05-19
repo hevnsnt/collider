@@ -14,6 +14,7 @@
 
 #if defined(COLLIDER_BACKEND_CPU)
 
+#include <algorithm>
 #include <thread>
 #include <mutex>
 #include <condition_variable>

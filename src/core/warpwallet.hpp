@@ -278,14 +278,14 @@ inline std::vector<uint8_t> scrypt(
                    (static_cast<uint32_t>(Bi[j * 4 + 3]) << 24);
         }
 
-        // Phase 1: Fill V with expensive memory-hard operations
+        // Fill V with expensive memory-hard operations
         for (uint64_t j = 0; j < N; j++) {
             std::memcpy(&V[j * block_words], X.data(), MFLen);
             detail::block_mix(X.data(), Y.data(), r);
             std::swap(X, Y);
         }
 
-        // Phase 2: Random memory access
+        // Random memory access
         for (uint64_t j = 0; j < N; j++) {
             uint64_t idx = detail::integerify(X.data(), r, N);
             for (size_t k = 0; k < block_words; k++) {
@@ -340,14 +340,14 @@ inline std::array<uint8_t, 32> derive_key(
     std::string pass_pbkdf2 = passphrase + "\x02";
     std::string salt_pbkdf2 = salt + "\x02";
 
-    // s1 = scrypt(key=passphrase+"\x01", salt=salt+"\x01", N=2^18, r=8, p=1, dkLen=32)
+    // = scrypt(key=passphrase+"\x01", salt=salt+"\x01", N=2^18, r=8, p=1, dkLen=32)
     auto s1 = scrypt(
         reinterpret_cast<const uint8_t*>(pass_scrypt.data()), pass_scrypt.size(),
         reinterpret_cast<const uint8_t*>(salt_scrypt.data()), salt_scrypt.size(),
         SCRYPT_N, SCRYPT_R, SCRYPT_P, KEY_LEN
     );
 
-    // s2 = pbkdf2(key=passphrase+"\x02", salt=salt+"\x02", c=2^16, dkLen=32)
+    // = pbkdf2(key=passphrase+"\x02", salt=salt+"\x02", c=2^16, dkLen=32)
     auto s2 = pbkdf2_sha256(
         reinterpret_cast<const uint8_t*>(pass_pbkdf2.data()), pass_pbkdf2.size(),
         reinterpret_cast<const uint8_t*>(salt_pbkdf2.data()), salt_pbkdf2.size(),
@@ -386,13 +386,29 @@ inline std::array<uint8_t, 20> compute_hash160(
  * @param target_hash   The target 20-byte Hash160
  * @return              True if match
  */
+// Constant-time hash160 equality. Both inputs are public-domain
+// values in the WarpWallet threat model (derived hashes, not
+// secrets), so a timing difference would not leak a key. The
+// constant-time form is for hygiene: future code that wants to
+// reuse verify() against a secret-bearing target gets the right
+// posture for free, and a casual code reader does not see an
+// operator== that visually invites variable-time compare habits.
+inline bool hash160_equal_ct(const std::array<uint8_t, 20>& a,
+                             const std::array<uint8_t, 20>& b) noexcept {
+    unsigned diff = 0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        diff |= static_cast<unsigned>(a[i] ^ b[i]);
+    }
+    return diff == 0;
+}
+
 inline bool verify(
     const std::string& passphrase,
     const std::string& salt,
     const std::array<uint8_t, 20>& target_hash
 ) {
     auto computed = compute_hash160(passphrase, salt);
-    return computed == target_hash;
+    return hash160_equal_ct(computed, target_hash);
 }
 
 /**

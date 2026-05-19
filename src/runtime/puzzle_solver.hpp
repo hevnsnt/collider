@@ -26,8 +26,7 @@
  *
  * The function bodies for analyze_puzzle / print_puzzle_analysis /
  * get_best_puzzle (declared in core/puzzle_analysis.hpp) also live in
- * puzzle_solver.cpp now (the puzzle_analysis.hpp comment that says "still
- * in main.cpp for now" is updated in this commit).
+ * puzzle_solver.cpp.
  */
 #pragma once
 
@@ -51,11 +50,5 @@ int run_benchmark(const Arguments& args, const GPUDetectionResult& gpu_info);
  * SearchStateManager checkpoint resume. Returns the process exit code.
  */
 int run_puzzle_mode(const Arguments& args, const GPUDetectionResult& gpu_info);
-
-/**
- * Print the solved-puzzle zone distribution analysis to stdout. Used by
- * main.cpp's verbose-mode pre-banner output and the interactive UI.
- */
-void analyze_solved_puzzles();
 
 }  // namespace collider::runtime

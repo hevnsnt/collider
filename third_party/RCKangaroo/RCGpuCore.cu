@@ -3,6 +3,14 @@
 // License: GPLv3, see "LICENSE.TXT" file
 // https://github.com/RetiredC
 
+// Local patch (collider-pro, v1.4.2): NVCC 12.8 on Ubuntu 22.04 doesn't
+// pull <cstdint> through "defs.h" transitively, so uint32_t/uint64_t at
+// line 65 (Kparams.DP shift math) fail to resolve. The Windows + macOS
+// builds work because their toolchains pre-pull it. Add the include
+// explicitly so the Linux GH Actions build doesn't die at 17% with
+// "identifier uint32_t is undefined" errors. Upstream this if a future
+// RCKangaroo sync drops the patch.
+#include <cstdint>
 
 #include "defs.h"
 #include "RCGpuUtils.h"
@@ -56,7 +64,16 @@ __global__ void KernelA(const TKparams Kparams)
     __syncthreads(); 
 
 	__align__(16) u64 x[4], y[4], tmp[4], tmp2[4];
-	u64 dp_mask64 = ~((1ull << (64 - Kparams.DP)) - 1);
+	u64 dp_mask64;
+	if (Kparams.DP <= 0)
+		dp_mask64 = 0ULL;
+	else if (Kparams.DP >= 64)
+		dp_mask64 = ~0ULL;
+	else {
+		uint32_t shift = (uint32_t)(64ULL - (uint64_t)Kparams.DP);
+		if (shift > 63) shift = 63;
+		dp_mask64 = ~((1ULL << shift) - 1ULL);
+	}
 	u16 jmp_ind;
 
 	//copy kangs from global to L2
@@ -241,7 +258,16 @@ __global__ void KernelA(const TKparams Kparams)
 
 	__align__(16) u64 inverse[5];
 	__align__(16) u64 x[4], y[4], tmp[4], tmp2[4];
-	u64 dp_mask64 = ~((1ull << (64 - Kparams.DP)) - 1);
+	u64 dp_mask64;
+	if (Kparams.DP <= 0)
+		dp_mask64 = 0ULL;
+	else if (Kparams.DP >= 64)
+		dp_mask64 = ~0ULL;
+	else {
+		uint32_t shift = (uint32_t)(64ULL - (uint64_t)Kparams.DP);
+		if (shift > 63) shift = 63;
+		dp_mask64 = ~((1ULL << shift) - 1ULL);
+	}
 	u16 jmp_ind;
 
 	//copy kangs from global to local

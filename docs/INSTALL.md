@@ -8,6 +8,7 @@ This document covers the **free** edition. **(PRO VERSION ONLY)** builds are iss
 
 ## Table of Contents
 
+- [GPU support in the shipped release](#gpu-support-in-the-shipped-release)
 - [Prerequisites](#prerequisites)
 - [Linux](#linux)
 - [Windows](#windows)
@@ -15,6 +16,25 @@ This document covers the **free** edition. **(PRO VERSION ONLY)** builds are iss
 - [Build Options](#build-options)
 - [Verifying the Build](#verifying-the-build)
 - [Troubleshooting](#troubleshooting)
+
+---
+
+## GPU support in the shipped release
+
+The binaries published at [github.com/hevnsnt/collider/releases](https://github.com/hevnsnt/collider/releases) are built for these NVIDIA GPUs (one fat binary, runtime-selected per device):
+
+| Marketing line                        | Architecture       | SM      |
+| ------------------------------------- | ------------------ | ------- |
+| RTX 20 (2060 / 2070 / 2080 / 2080 Ti) | Turing             | **75**  |
+| RTX 30 (3060 / 3070 / 3080 / 3090)    | Ampere consumer    | **86**  |
+| RTX 40 (4060 / 4070 / 4080 / 4090)    | Ada Lovelace       | **89**  |
+| RTX 6000 Ada Workstation              | Ada Lovelace       | **89**  |
+| RTX 50 (5060 / 5070 / 5080 / 5090)    | Blackwell consumer | **120** |
+| RTX PRO 6000 Blackwell Workstation    | Blackwell consumer | **120** |
+
+If your card is in this table, **download the release binary and skip the build steps below**. If your card is not in this table (older Pascal / Volta cards, datacenter Ampere A100 / A30, Hopper H100 / H200, datacenter Blackwell B100 / B200, or anything pre-Turing), see [Build Options](#build-options) below for how to compile from source with a custom `CMAKE_CUDA_ARCHITECTURES` value.
+
+Apple Silicon (M1 / M2 / M3 / M4) uses Metal instead of CUDA and is also supported by the shipped macOS arm64 release.
 
 ---
 
@@ -113,7 +133,7 @@ cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="8
 cmake --build build --parallel
 ```
 
-The default architecture list is `86;89;100` (Ampere, Ada, Blackwell).
+When `CMAKE_CUDA_ARCHITECTURES` is not specified, CMake selects a fallback default that depends on your CUDA toolkit version and may not include your GPU. For a build that runs everywhere the shipped release runs, pass `"75;86;89;120"` (and use CUDA Toolkit 12.8+ for SM 120). For a build that targets exactly this machine, pass `native` (CMake 3.24+). See [Build Options](#build-options) for the full mapping.
 
 Output: `build/collider`.
 
@@ -222,31 +242,62 @@ For a deeper Mac-specific reference (CMake options, embedded Metal shaders, trou
 
 CMake options recognized by the project:
 
-| Option                      | Default     | Description                                                        |
-| --------------------------- | ----------- | ------------------------------------------------------------------ |
-| `COLLIDER_USE_CUDA`         | `ON`        | Enable the CUDA backend (Linux / Windows).                         |
-| `COLLIDER_USE_METAL`        | `ON`        | Enable the Metal backend (macOS).                                  |
-| `COLLIDER_USE_CPU`          | `ON`        | Enable the CPU fallback backend.                                   |
-| `COLLIDER_BUILD_TESTS`      | `ON`        | Build unit tests (`ctest` runs from `build/`).                     |
-| `COLLIDER_BUILD_BENCHMARKS` | `ON`        | Build the benchmark targets.                                       |
-| `COLLIDER_BUILD_TOOLS`      | `ON`        | Build CLI tools (`build_bloom`, `generate_license`, etc.).         |
-| `CMAKE_BUILD_TYPE`          | `Release`   | `Release`, `Debug`, or `RelWithDebInfo`.                           |
-| `CMAKE_CUDA_ARCHITECTURES`  | `86;89;100` | Target SM versions. Set to a single value for faster local builds. |
+| Option                      | Default      | Description                                                                         |
+| --------------------------- | ------------ | ----------------------------------------------------------------------------------- |
+| `COLLIDER_USE_CUDA`         | `ON`         | Enable the CUDA backend (Linux / Windows).                                          |
+| `COLLIDER_USE_METAL`        | `ON`         | Enable the Metal backend (macOS).                                                   |
+| `COLLIDER_USE_CPU`          | `ON`         | Enable the CPU fallback backend.                                                    |
+| `COLLIDER_BUILD_TESTS`      | `ON`         | Build unit tests (`ctest` runs from `build/`).                                      |
+| `COLLIDER_BUILD_BENCHMARKS` | `ON`         | Build the benchmark targets.                                                        |
+| `COLLIDER_BUILD_TOOLS`      | `ON`         | Build CLI tools (`build_bloom`, `generate_license`, etc.).                          |
+| `CMAKE_BUILD_TYPE`          | `Release`    | `Release`, `Debug`, or `RelWithDebInfo`.                                            |
+| `CMAKE_CUDA_ARCHITECTURES`  | (no default) | Target SM versions. See the table below. The shipped release uses `"75;86;89;120"`. |
 
 ### CUDA architecture selection
 
-| GPU series | Compute capability | `CMAKE_CUDA_ARCHITECTURES` |
-| ---------- | ------------------ | -------------------------- |
-| RTX 2000   | sm_75              | `75`                       |
-| RTX 3000   | sm_86              | `86`                       |
-| RTX 4000   | sm_89              | `89`                       |
-| RTX 5000   | sm_100             | `100`                      |
+Pick the SM value(s) matching your hardware. The shipped release covers the first four rows; for anything else, build from source with the matching value.
 
-Example (RTX 4090 only):
+| GPU                                          | Architecture         | SM    | Required CUDA toolkit |
+| -------------------------------------------- | -------------------- | ----- | --------------------- |
+| RTX 20 series (2060 / 2070 / 2080 / 2080 Ti) | Turing               | `75`  | 12.x                  |
+| RTX 30 series (3060 / 3070 / 3080 / 3090)    | Ampere consumer      | `86`  | 12.x                  |
+| RTX 40 series + RTX 6000 Ada Workstation     | Ada Lovelace         | `89`  | 12.x                  |
+| RTX 50 series + RTX PRO 6000 Blackwell       | Blackwell consumer   | `120` | **12.8+**             |
+| GTX 10 series (1060 / 1070 / 1080)           | Pascal               | `61`  | 12.x                  |
+| A100 / A30                                   | Ampere datacenter    | `80`  | 12.x                  |
+| H100 / H200                                  | Hopper               | `90`  | 12.0+                 |
+| B100 / B200                                  | Blackwell datacenter | `100` | 12.4+                 |
+
+#### Easiest: auto-detect this machine
+
+If the build will only run on the same machine it was compiled on:
 
 ```bash
-cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="89"
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+                       -DCMAKE_CUDA_ARCHITECTURES=native
 ```
+
+`native` queries each installed GPU's compute capability via the CUDA driver and builds for exactly those SMs. Requires CMake 3.24+. Fastest compile, but the binary is not portable to other machines.
+
+#### Specific architecture
+
+For one card type (faster compile than building for many):
+
+```bash
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+                       -DCMAKE_CUDA_ARCHITECTURES="89"
+```
+
+#### Multiple architectures (portable binary)
+
+For a binary that runs on several different cards:
+
+```bash
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+                       -DCMAKE_CUDA_ARCHITECTURES="75;86;89;120"
+```
+
+Each architecture adds roughly 10 to 15 MB of SASS to the binary and increases compile time roughly linearly. For forward compatibility with future GPUs, append `-virtual` to the highest entry (for example `"75;86;89;120-virtual"`) so newer cards can JIT-compile from PTX at first launch.
 
 ---
 

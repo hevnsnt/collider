@@ -342,6 +342,38 @@ struct uint256_t {
     bool operator==(const uint256_t& o) const {
         return d[0] == o.d[0] && d[1] == o.d[1] && d[2] == o.d[2] && d[3] == o.d[3];
     }
+
+    // T3.13: load a 256-bit value from a 32-byte big-endian byte buffer.
+    // Mirrors the Bitcoin wire convention (privkeys, hashes, EC scalars all
+    // serialize as 32-byte BE). Pre-fix this expansion was open-coded as
+    // 32 line-per-byte shifts at every consumer; in brain_wallet_runner.cpp
+    // alone it appeared in ~57 sequential lines per privkey decode. The
+    // helper keeps the loop body identical so the produced limbs are
+    // byte-for-byte equivalent to the pre-fix sites.
+    //
+    // Byte layout:
+    //   bytes[0..7]   -> d[3] (most significant limb)
+    //   bytes[8..15]  -> d[2]
+    //   bytes[16..23] -> d[1]
+    //   bytes[24..31] -> d[0] (least significant limb)
+    //
+    // The caller must guarantee `bytes` points at >= 32 readable bytes.
+    static uint256_t from_be_bytes(const uint8_t* bytes) {
+        uint256_t r;
+        for (int limb = 0; limb < 4; ++limb) {
+            // r.d[3] takes bytes[0..7], r.d[2] takes bytes[8..15], ...
+            const uint8_t* p = bytes + (3 - limb) * 8;
+            r.d[limb] = (static_cast<uint64_t>(p[0]) << 56) |
+                        (static_cast<uint64_t>(p[1]) << 48) |
+                        (static_cast<uint64_t>(p[2]) << 40) |
+                        (static_cast<uint64_t>(p[3]) << 32) |
+                        (static_cast<uint64_t>(p[4]) << 24) |
+                        (static_cast<uint64_t>(p[5]) << 16) |
+                        (static_cast<uint64_t>(p[6]) <<  8) |
+                        (static_cast<uint64_t>(p[7]));
+        }
+        return r;
+    }
 };
 
 // secp256k1 field prime p = 2^256 - 2^32 - 977
@@ -451,6 +483,72 @@ inline void mod_add(uint256_t& r, const uint256_t& a, const uint256_t& b) {
 inline void mod_sub(uint256_t& r, const uint256_t& a, const uint256_t& b) {
     if (sub256(r, a, b)) {
         add256(r, r, SECP256K1_P);
+    }
+}
+
+// Uniform sampling in [0, modulus) via bit-masked rejection sampling.
+// Why: the kangaroo Tame init must produce a uniformly-random offset in the
+// puzzle range [0, range_size). Pre-fix, the code did per-limb % which is
+// mathematically meaningless (each limb is reduced independently), and the
+// 3+-limb case had no branch at all so for puzzles past 128 bits Tame
+// kangaroos started anywhere on the curve.
+// Algorithm: mask the random down to modulus's bit-length so rejection
+// rate is at most 50%. Expected iterations: < 2.
+// `rng` is any callable returning uint64_t (mt19937_64, xoshiro, etc.).
+template <typename RngFn>
+inline void random_below(uint256_t& out, RngFn&& rng, const uint256_t& modulus) {
+    if (modulus.is_zero()) {
+        out = uint256_t(0);
+        return;
+    }
+    // Find the top non-zero limb and its bit count.
+    int top_limb = 3;
+    while (top_limb > 0 && modulus.d[top_limb] == 0) --top_limb;
+    int top_bits = 64;
+    uint64_t top_val = modulus.d[top_limb];
+    while ((top_val & (uint64_t(1) << 63)) == 0 && top_bits > 0) {
+        top_val <<= 1;
+        --top_bits;
+    }
+    // Mask for the highest non-zero limb. `top_bits == 64` means no mask needed.
+    uint64_t top_mask = (top_bits == 64)
+                           ? ~uint64_t(0)
+                           : ((uint64_t(1) << top_bits) - 1);
+    for (;;) {
+        for (int i = 0; i < 4; ++i) {
+            if (i < top_limb) {
+                out.d[i] = static_cast<uint64_t>(rng());
+            } else if (i == top_limb) {
+                out.d[i] = static_cast<uint64_t>(rng()) & top_mask;
+            } else {
+                out.d[i] = 0;
+            }
+        }
+        if (out < modulus) return;
+    }
+}
+
+// Modular halving: r = a/2 mod m, for ODD modulus m, with a in [0, m).
+// Why this exists: the kangaroo Wild1-Wild2 collision recovery formula
+// k = (dist_w2 - dist_w1) / 2 (mod n) requires modular halving over the
+// group order n. A naive `a >> 1` is correct only when a is even; if a
+// is odd, the result is wrong by ~(n-1)/2.
+// Algorithm: when a is odd, (a + m) is even (m is odd by assumption)
+// and (a + m)/2 is a valid representative of a/2 mod m. We track the
+// 257th bit because a + m can be 2^256 or larger.
+inline void mod_half(uint256_t& r, const uint256_t& a, const uint256_t& m) {
+    if (a.is_odd()) {
+        uint256_t sum;
+        uint64_t carry = add256(sum, a, m);   // sum + (carry << 256) = a + m, even
+        r.d[0] = (sum.d[0] >> 1) | (sum.d[1] << 63);
+        r.d[1] = (sum.d[1] >> 1) | (sum.d[2] << 63);
+        r.d[2] = (sum.d[2] >> 1) | (sum.d[3] << 63);
+        r.d[3] = (sum.d[3] >> 1) | (carry << 63);
+    } else {
+        r.d[0] = (a.d[0] >> 1) | (a.d[1] << 63);
+        r.d[1] = (a.d[1] >> 1) | (a.d[2] << 63);
+        r.d[2] = (a.d[2] >> 1) | (a.d[3] << 63);
+        r.d[3] = a.d[3] >> 1;
     }
 }
 

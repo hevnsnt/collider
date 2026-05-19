@@ -57,6 +57,19 @@ bool CudaRCKangarooBackend::initialize(const collider::pool::WorkAssignment& wor
         error_ = std::string("failed to set target public key: ") + hex;
         return false;
     }
+
+    // Forward the chunk's range_start offset to RCKangaroo. Without this,
+    // the solver hunts in [0, 2^range_bits) instead of [range_start,
+    // range_start + 2^range_bits) and every DP it produces is mapped to
+    // the wrong slice of the global keyspace. The standalone puzzle path
+    // (puzzle_solver.cpp ~line 1551) already does this; the pool path
+    // regressed during the IKangarooBackend refactor. range_start is BE
+    // bytes on the wire; RCKangaroo's set_start_offset takes a lowercase
+    // hex string of arbitrary length and parses it as a big integer.
+    char start_hex[67];
+    ::collider::hex_encode_lower(work.range_start, 32, start_hex);
+    rc_.set_start_offset(std::string(start_hex));
+
     initialized_ = true;
     return true;
 }

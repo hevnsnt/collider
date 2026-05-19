@@ -15,8 +15,8 @@
  *     ANSI escapes suppressed when stdout is not a TTY or NO_COLOR is
  *     set.
  *
- * Caller passes primitive ints (not collider::pool::PoolStats) so this
- * UI header stays free of any pool-module dependency.
+ * Caller passes primitive ints (not collider::pool::PoolStatsLocal) so
+ * this UI header stays free of any pool-module dependency.
  */
 
 #pragma once
@@ -61,9 +61,8 @@ public:
     //                >= 1 GKey/s as GKeys/s with two decimals; etc.
     // local_dps    : DPs surfaced this session by this worker.
     // sent_dps     : DPs the pool client has acknowledged on the wire.
-    // pool_total   : pool-wide lifetime DP count (PoolStats.total_dps).
-    // your_total   : worker-lifetime DP count (PoolStats.your_dps).
-    //
+    // pool_total   : pool-wide lifetime DP count (PoolStatsLocal.total_dps).
+    // your_total   : worker-lifetime DP count (PoolStatsLocal.your_dps).
     // Repaint at most once every kMinRepaintMs to avoid flooding the
     // terminal from a tight kernel-dispatch loop.
     void tick(double   ops_per_sec,
@@ -80,7 +79,7 @@ public:
         }
         last_paint_ = now;
 
-        // v1.4.1: cumulative-lifetime share, not session delta. Operator
+        // cumulative-lifetime share, not session delta. Operator
         // wants their address's standing relative to the whole pool
         // history. As more workers come online the value falls; as this
         // worker contributes more it rises. Session deltas were

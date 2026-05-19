@@ -56,14 +56,14 @@ Both are linked from the same CMake project, gated by `-DCOLLIDER_PRO=ON|OFF`.
 
 The build is split into focused static libraries so that platforms missing a backend (e.g. macOS without CUDA) can drop the relevant target without #ifdef sprawl.
 
-| Target              | Purpose                                                                             |
-| ------------------- | ----------------------------------------------------------------------------------- |
-| `collider_platform` | Platform abstraction over CUDA / Metal / CPU. Backend selection at configure time.  |
-| `collider_core`     | CPU-side solver logic: rule engine, priority queue, host orchestration.             |
-| `collider_gpu`      | GPU kernels: SHA-256, secp256k1, RIPEMD-160, bloom filter, kangaroo, puzzle solver. |
-| `collider_pool`     | JLP wire client, HTTP fallback, pool manager. Links OpenSSL for TLS.                |
-| `collider_license`  | **(PRO VERSION ONLY)** Ed25519 license verification with a 256-byte patchable slot. |
-| `rckangaroo`        | Third-party Kangaroo solver (GPLv3, in `third_party/RCKangaroo/`).                  |
+| Target              | Purpose                                                                                                                                                                      |
+| ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `collider_platform` | Platform abstraction over CUDA / Metal / CPU. Backend selection at configure time.                                                                                           |
+| `collider_core`     | CPU-side solver logic: rule engine, priority queue, host orchestration.                                                                                                      |
+| `collider_gpu`      | GPU kernels: SHA-256, secp256k1, RIPEMD-160, bloom filter, kangaroo, puzzle solver.                                                                                          |
+| `collider_pool`     | JLP wire client, HTTP fallback, pool manager. Links OpenSSL for TLS.                                                                                                         |
+| `collider_license`  | **(PRO VERSION ONLY)** License verification: HMAC-SHA256 cache validation, with remote re-validation against the issuer endpoint when the local cache is missing or expired. |
+| `rckangaroo`        | Third-party Kangaroo solver (GPLv3, in `third_party/RCKangaroo/`).                                                                                                           |
 
 Compile definitions follow the platform: `COLLIDER_USE_CUDA=1`, `COLLIDER_USE_METAL=1`, or `COLLIDER_USE_CPU=1`, plus exactly one of `COLLIDER_PLATFORM_WINDOWS`, `COLLIDER_PLATFORM_LINUX`, `COLLIDER_PLATFORM_MACOS`. `COLLIDER_PRO=1` is set for Pro builds.
 
@@ -87,7 +87,7 @@ Mode dispatchers split out from `main.cpp` during the v1.4.1 A.3 refactor. One f
 | `pool_solver.cpp`       | Pool client driver: connect, AUTH, request work, submit DPs, handle solutions. |
 | `brain_wallet_runner.*` | **(PRO VERSION ONLY)** Brain-wallet pipeline driver.                           |
 | `gpu_detection.cpp`     | Enumerate visible GPUs, query memory, assign device indices.                   |
-| `license_gate.cpp`      | **(PRO VERSION ONLY)** Verify Ed25519 license signature at startup.            |
+| `license_gate.cpp`      | **(PRO VERSION ONLY)** Verify HMAC-SHA256 license signature at startup.        |
 | `runtime_globals.hpp`   | Globals shared across runtime modules (signal handlers, logger).               |
 
 ### `src/core/`
@@ -150,7 +150,7 @@ Interactive terminal UI: banner, ROI table, brain-wallet setup wizard. No busine
 
 ### `src/license/` **(PRO VERSION ONLY)**
 
-Ed25519 signature verification. The binary contains a 256-byte slot patched at release time with the issuer's signed license payload; startup verification rejects tampered binaries before any kernel runs.
+License validation. On first run with `--activate KEY`, the binary POSTs the key to the issuer's license endpoint over TLS and, on success, persists the result in `~/.collider/license.cache` as a JSON blob authenticated with HMAC-SHA256 against an embedded shared key. Subsequent runs verify the cache HMAC offline (constant-time compare via `CRYPTO_memcmp`) and re-validate against the endpoint after the cache TTL (24 hours) expires.
 
 ### `src/generators/` **(PRO VERSION ONLY)**
 
@@ -185,7 +185,7 @@ CUDA-specific compile flags (Release):
 
 CUDA runtime library is **Shared** (`cudart.lib`) on Windows to avoid duplicate-symbol errors with the static runtime when linking multiple .cu translation units.
 
-Default CUDA architectures: `86;89;100` (Ampere, Ada, Blackwell). Override with `-DCMAKE_CUDA_ARCHITECTURES`.
+Default CUDA architectures: `75;86;89;120` (Turing, Ampere, Ada, Blackwell desktop). Override with `-DCMAKE_CUDA_ARCHITECTURES`. Note: sm_120 is desktop Blackwell (RTX 5090, RTX PRO 6000); sm_100 is datacenter Blackwell (B100/B200) and is not in the default.
 
 ---
 

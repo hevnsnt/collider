@@ -29,6 +29,7 @@
  */
 
 #import <Foundation/Foundation.h>
+#import <Metal/Metal.h>
 
 #include "kangaroo_solver_gpu.hpp"
 #include "kangaroo_metal.hpp"
@@ -168,6 +169,27 @@ inline std::string x_be_key(const uint8_t x_be[32]) {
     return std::string(reinterpret_cast<const char*>(x_be), 32);
 }
 
+// Pick num_kangaroos_per_gpu from the Metal device name. The original
+// 1024 default was tuned on M1 (8 GPU cores); larger Apple GPUs have
+// more SIMD groups and the kernel starves them at 1024. Match the
+// kangaroo count to the GPU's occupancy ceiling so every core sees
+// work every step.
+// Lookup matches Apple's product names from `[device name]`:
+//   "Apple M4"          -> base       (10 GPU cores)
+//   "Apple M4 Pro"      -> Pro        (16 or 20 cores)
+//   "Apple M4 Max"      -> Max        (32 or 40 cores)
+//   "Apple M2 Ultra"    -> Ultra      (60 or 76 cores)
+// All return values are multiples of 32 (threadgroup batch-inversion
+// contract; see KANGAROO_BATCH_SIZE in kangaroo.metal).
+// More-specific suffix names (Ultra/Max/Pro) are checked before the
+// bare chip name since "M4" is a substring of "M4 Pro" and "M4 Max".
+int pick_kangaroos_for_apple_gpu(const std::string& device_name) {
+    if (device_name.find("Ultra") != std::string::npos) return 8192;
+    if (device_name.find("Max")   != std::string::npos) return 4096;
+    if (device_name.find("Pro")   != std::string::npos) return 2048;
+    return 1024;  // base M-series (M1/M2/M3/M4 with 7-10 GPU cores)
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -206,6 +228,38 @@ bool MultiGPUKangarooManager::init(const std::vector<int>& /*gpu_ids*/) {
     // Mac has a single integrated GPU per device; gpu_ids is honored
     // for API parity but the solver only ever uses [0]. If the caller
     // requested specific IDs we still log it for visibility.
+
+    // Auto-tune num_kangaroos_per_gpu when the caller left it at the
+    // sentinel 0. Inspect the Metal device name and pick the value
+    // that saturates that chip's GPU core count; the M1-era 1024
+    // default was leaving M3 Pro / M4 Pro / Max / Ultra parts idle
+    // for most of every step. We write the chosen value back into
+    // the public field so callers reading it after init() (e.g.
+    // puzzle_solver.cpp's total_kangaroos display) see the tuned
+    // value, not the sentinel.
+    if (num_kangaroos_per_gpu == 0) {
+        std::string device_name;
+        @autoreleasepool {
+            id<MTLDevice> probe = MTLCreateSystemDefaultDevice();
+            if (probe != nil) {
+                device_name = std::string([probe.name UTF8String]);
+            }
+        }
+        if (device_name.empty()) {
+            // No Metal device visible -- fall back to the M1-era default
+            // and let the solver fail later if Metal really is missing.
+            num_kangaroos_per_gpu = 1024;
+            std::cerr << "[Metal] Could not query device name for "
+                         "auto-tune; defaulting num_kangaroos_per_gpu "
+                         "to 1024.\n";
+        } else {
+            num_kangaroos_per_gpu = pick_kangaroos_for_apple_gpu(device_name);
+            std::cout << "[Metal] Auto-tuned num_kangaroos_per_gpu="
+                      << num_kangaroos_per_gpu
+                      << " for " << device_name << "\n";
+        }
+    }
+
     impl_->cfg = KangarooMetalConfig{};
     impl_->cfg.dp_bits         = dp_bits;
     impl_->cfg.num_kangaroos   = static_cast<uint32_t>(num_kangaroos_per_gpu);

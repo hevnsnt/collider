@@ -1,27 +1,32 @@
 /**
- * test_cli_parser.cpp - Wave 5 (track-e) CLI parser + config override matrix tests.
+ * test_cli_parser.cpp - CLI parser + config override matrix tests.
  *
  * Validates the CLIFlags-aware override behaviour in apply_config_to_args() and
- * the mode-mutex check in parse_args(). Each test row exercises one cell of the
- * (CLI flag x config field) matrix from docs/review-2026-05-04/track-e-cli-config.md.
+ * the mode-mutex check in parse_args_core(). Each test row exercises one cell
+ * of the (CLI flag x config field) matrix from
+ * docs/review-2026-05-04/track-e-cli-config.md.
  *
- * Note: parse_args() lives in src/main.cpp and would pull in the entire main
- * binary (with detect_gpus, run_pool_mode, etc). To keep the test target self
- * contained we replicate a minimal Arguments + parse_args_for_test that mirrors
- * the production parser. The two parsers MUST stay in sync; if you add a flag
- * to main.cpp::parse_args_core, mirror it here.
+ * The test links the real parser (src/cli/cli_parser.cpp via the registry in
+ * src/cli/flag_spec.hpp) directly. parse_args_mirror() below is a one-line
+ * adapter that turns vector<string> argv into char*[] and calls
+ * parse_args_core() through src/cli/cli_parser.hpp. There is no longer any
+ * in-test reimplementation of flag parsing. A regression in the production
+ * parser fails this test, which was the documented goal of the T2 wiring
+ * fix in v1.4.2-final-validation-blockers.md.
  *
- * The override-matrix half of these tests calls collider::apply_config_to_args
- * directly (template, header-only) -- no main.cpp link required.
+ * If you add a CLI flag, register it in src/cli/cli_parser.cpp's kFlagsRaw[]
+ * table. No test-side mirror update is needed.
  */
 
-#include "../src/core/yaml_config.hpp"
+#include "cli/cli_parser.hpp"     // ::Arguments, parse_args_core, ::collider::CLIFlags
+#include "core/yaml_config.hpp"   // collider::AppConfig, apply_config_to_args
 
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -30,197 +35,25 @@
 namespace {
 
 // ---------------------------------------------------------------------------
-// Local Arguments mirror -- must match src/main.cpp::Arguments fields used by
-// apply_config_to_args(). We keep ONLY the fields the override path touches.
-// ---------------------------------------------------------------------------
-struct Arguments {
-    std::vector<int> gpu_ids = {};
-    size_t batch_size = 4'000'000;
-    bool verbose = false;
-    bool help = false;
-
-    bool benchmark = false;
-    int benchmark_seconds = 30;
-
-    bool puzzle_mode = true;
-    int puzzle_number = 0;
-    std::string puzzle_target;
-    std::string puzzle_range_start;
-    std::string puzzle_range_end;
-    bool puzzle_random = true;
-    std::string puzzle_checkpoint;
-    bool puzzle_auto_next = false;
-    bool puzzle_all_unsolved = false;
-    int puzzle_min_bits = 0;
-    int puzzle_max_bits = 160;
-    bool puzzle_kangaroo = false;
-    bool use_rckangaroo = true;
-    int dp_bits = -1;
-    std::string bloom_file;
-
-    bool brainwallet_mode = false;
-    bool brainwallet_setup = false;
-    std::string wordlist_file;
-    bool resume = false;
-    size_t save_interval = 1000000;
-    bool cpu_rules = false;
-
-    bool calibrate = false;
-    bool force_calibrate = false;
-
-    bool analyze_puzzles = false;
-    bool smart_select = true;
-
-    bool debug = false;
-
-    bool pool_mode = false;
-    std::string pool_url;
-    std::string pool_worker;
-    std::string pool_password;
-    std::string pool_api_key;
-
-    std::string config_file;
-};
-
-// ---------------------------------------------------------------------------
-// validate_mode_mutex -- must mirror main.cpp::validate_mode_mutex exactly.
-// ---------------------------------------------------------------------------
-int validate_mode_mutex(const Arguments& args, std::string& msg) {
-    int active = 0;
-    std::vector<std::string> chosen;
-    if (args.brainwallet_mode) { active++; chosen.emplace_back("--brainwallet"); }
-    if (args.pool_mode)        { active++; chosen.emplace_back("--pool <url>"); }
-    if (args.puzzle_kangaroo && (args.brainwallet_mode || args.pool_mode)) {
-        active++;
-        chosen.emplace_back("--kangaroo");
-    }
-    if ((args.puzzle_number > 0 || args.puzzle_all_unsolved) &&
-        (args.brainwallet_mode || args.pool_mode)) {
-        active++;
-        if (args.puzzle_all_unsolved) chosen.emplace_back("--all-unsolved");
-        else chosen.emplace_back("--puzzle " + std::to_string(args.puzzle_number));
-    }
-    if (active <= 1) return 0;
-    msg = "[!] Conflicting search modes: ";
-    for (size_t i = 0; i < chosen.size(); ++i) {
-        msg += chosen[i];
-        if (i + 1 < chosen.size()) msg += ", ";
-    }
-    return -1;
-}
-
-// ---------------------------------------------------------------------------
-// parse_args mirror (no exit, no stderr). Must stay in sync with
-// src/main.cpp::parse_args_core. Tests pass argv arrays through this.
+// Adapter: turn vector<string> argv -> char*[] and call the real parser.
+// Slot 0 is a synthetic program name (parse_args_core skips it the same way
+// it skips argv[0] in production).
 // ---------------------------------------------------------------------------
 int parse_args_mirror(const std::vector<std::string>& argv,
                       Arguments& args,
                       collider::CLIFlags& cli,
                       std::string& err_msg) {
-    args = Arguments{};
-    cli = collider::CLIFlags{};
-    int argc = static_cast<int>(argv.size());
-
-    // Build argv[] with a fake program name at slot 0 (parse_args skips i=0).
     std::vector<std::string> storage;
-    storage.reserve(argc + 1);
+    storage.reserve(argv.size() + 1);
     storage.emplace_back("test_collider");
     for (auto& s : argv) storage.push_back(s);
 
-    auto get = [&](int i) -> const char* { return storage[i].c_str(); };
+    std::vector<char*> argv_c;
+    argv_c.reserve(storage.size());
+    for (auto& s : storage) argv_c.push_back(s.data());
 
-    int n = static_cast<int>(storage.size());
-    for (int i = 1; i < n; i++) {
-        std::string arg = get(i);
-
-        if (arg == "--help" || arg == "-h") {
-            args.help = true;
-        } else if (arg == "--verbose" || arg == "-v") {
-            args.verbose = true; cli.verbose_set = true;
-        } else if ((arg == "--gpus" || arg == "-g") && i + 1 < n) {
-            args.gpu_ids.clear();
-            std::string gpus = get(++i);
-            size_t pos = 0;
-            while ((pos = gpus.find(',')) != std::string::npos) {
-                args.gpu_ids.push_back(std::stoi(gpus.substr(0, pos)));
-                gpus.erase(0, pos + 1);
-            }
-            args.gpu_ids.push_back(std::stoi(gpus));
-            cli.gpu_ids_set = true;
-        } else if (arg == "--batch-size" && i + 1 < n) {
-            args.batch_size = std::stoull(get(++i)); cli.batch_size_set = true;
-        } else if (arg == "--benchmark") {
-            args.benchmark = true;
-        } else if (arg == "--benchmark-time" && i + 1 < n) {
-            args.benchmark_seconds = std::stoi(get(++i)); cli.benchmark_seconds_set = true;
-        } else if (arg == "--puzzle" || arg == "-P") {
-            args.puzzle_mode = true;
-            if (i + 1 < n && storage[i + 1][0] != '-') {
-                args.puzzle_number = std::stoi(get(++i)); cli.puzzle_number_set = true;
-            }
-        } else if (arg == "--puzzle-target" && i + 1 < n) {
-            args.puzzle_target = get(++i);
-        } else if (arg == "--puzzle-start" && i + 1 < n) {
-            args.puzzle_range_start = get(++i);
-        } else if (arg == "--puzzle-end" && i + 1 < n) {
-            args.puzzle_range_end = get(++i);
-        } else if (arg == "--sequential") {
-            args.puzzle_random = false; cli.puzzle_random_set = true;
-        } else if (arg == "--random") {
-            args.puzzle_random = true;  cli.puzzle_random_set = true;
-        } else if (arg == "--puzzle-checkpoint" && i + 1 < n) {
-            args.puzzle_checkpoint = get(++i); cli.puzzle_checkpoint_set = true;
-        } else if (arg == "--auto-next") {
-            args.puzzle_auto_next = true; cli.puzzle_auto_next_set = true;
-        } else if (arg == "--all-unsolved") {
-            args.puzzle_all_unsolved = true;
-        } else if (arg == "--puzzle-min-bits" && i + 1 < n) {
-            args.puzzle_min_bits = std::stoi(get(++i)); cli.puzzle_min_bits_set = true;
-        } else if (arg == "--puzzle-max-bits" && i + 1 < n) {
-            args.puzzle_max_bits = std::stoi(get(++i)); cli.puzzle_max_bits_set = true;
-        } else if (arg == "--kangaroo") {
-            args.puzzle_kangaroo = true; cli.puzzle_kangaroo_set = true;
-        } else if (arg == "--dp-bits" && i + 1 < n) {
-            args.dp_bits = std::stoi(get(++i)); cli.dp_bits_set = true;
-        } else if (arg == "--bloom" && i + 1 < n) {
-            args.bloom_file = get(++i); cli.bloom_file_set = true;
-        } else if (arg == "--brainwallet") {
-            args.brainwallet_mode = true;
-            args.pool_mode = false;
-            args.pool_url.clear();
-            cli.brainwallet_set = true;
-        } else if (arg == "--brainwallet-setup") {
-            args.brainwallet_setup = true;
-        } else if (arg == "--resume") {
-            args.resume = true; cli.resume_set = true;
-        } else if (arg == "--cpu-rules") {
-            args.cpu_rules = true;
-        } else if (arg == "--save-interval" && i + 1 < n) {
-            args.save_interval = std::stoull(get(++i)); cli.save_interval_set = true;
-        } else if (arg == "--calibrate") {
-            args.calibrate = true;
-        } else if (arg == "--force-calibrate") {
-            args.calibrate = true; args.force_calibrate = true; cli.force_calibrate_set = true;
-        } else if (arg == "--debug") {
-            args.debug = true; cli.debug_set = true;
-        } else if (arg == "--analyze") {
-            args.analyze_puzzles = true;
-        } else if (arg == "--no-smart") {
-            args.smart_select = false; cli.smart_select_set = true;
-        } else if ((arg == "--pool" || arg == "-p") && i + 1 < n) {
-            args.pool_mode = true; args.pool_url = get(++i); cli.pool_url_set = true;
-        } else if ((arg == "--worker" || arg == "-w") && i + 1 < n) {
-            args.pool_worker = get(++i); cli.pool_worker_set = true;
-        } else if (arg == "--pool-password" && i + 1 < n) {
-            args.pool_password = get(++i); cli.pool_password_set = true;
-        } else if (arg == "--pool-api-key" && i + 1 < n) {
-            args.pool_api_key = get(++i); cli.pool_api_key_set = true;
-        } else if ((arg == "--config" || arg == "-c") && i + 1 < n) {
-            args.config_file = get(++i);
-        }
-    }
-
-    return validate_mode_mutex(args, err_msg);
+    int argc = static_cast<int>(argv_c.size());
+    return parse_args_core(argc, argv_c.data(), args, cli, err_msg);
 }
 
 // ---------------------------------------------------------------------------
@@ -266,7 +99,7 @@ void run_all() {
     using collider::apply_config_to_args;
 
     // -----------------------------------------------------------------------
-    // Group A: parse_args alone -- per-flag CLIFlags bit accuracy
+    // Group A: parse_args alone (per-flag CLIFlags bit accuracy)
     // -----------------------------------------------------------------------
     {
         Arguments a; CLIFlags c; std::string err;
@@ -328,7 +161,7 @@ void run_all() {
         EXPECT_TRUE(!err.empty(), "B.01.err-msg-set");
     }
     {
-        // Order test: --pool then --brainwallet -- brainwallet always wins inside
+        // Order test: --pool then --brainwallet; brainwallet always wins inside
         // parse_args_core (clears pool), so this should NOT trigger mutex.
         Arguments a; CLIFlags c; std::string err;
         int rc = parse_args_mirror({"--pool", "jlp://x:1", "--brainwallet"}, a, c, err);
@@ -492,7 +325,7 @@ void run_all() {
         apply_config_to_args(a, cfg, c);
         EXPECT_TRUE(a.brainwallet_mode, "E.02.brainwallet-on");
         EXPECT_TRUE(!a.pool_mode, "E.02.pool-mode-off");
-        // pool_url WILL get populated because nothing CLI-set the bit -- but
+        // pool_url WILL get populated because nothing CLI-set the bit, but
         // pool_mode should remain false because brainwallet is set. This is
         // the documented compromise: callers must check pool_mode, not pool_url.
     }
@@ -572,9 +405,12 @@ void run_all() {
     {
         Arguments a; CLIFlags c; std::string err;
         parse_args_mirror({"--pool", "jlp://x:1", "--pool-password", "cli_pw"}, a, c, err);
-        AppConfig cfg; cfg.pool_password = "cfg_pw";
+        AppConfig cfg; cfg.pool_password.assign("cfg_pw", 6);
         apply_config_to_args(a, cfg, c);
-        EXPECT_EQ(a.pool_password, std::string("cli_pw"), "F.05.password-cli-wins");
+        // pool_password is a SecureString (move-only, no operator==);
+        // compare by extracting the bytes into a transient std::string.
+        EXPECT_EQ(std::string(a.pool_password.data(), a.pool_password.size()),
+                  std::string("cli_pw"), "F.05.password-cli-wins");
     }
     // F.06 --pool-api-key CLI vs config -> CLI wins
     {
@@ -680,6 +516,24 @@ void run_all() {
         apply_config_to_args(a, cfg, c);
         EXPECT_TRUE(a.debug, "F.18.debug-cli");
     }
+    // F.18a (2026-05-16) --perf-instrument opt-in. The brain-wallet runner
+    // gates perf::set_enabled(true) on args.perf_instrument so the
+    // per-kernel cudaEvent collector stays off by default; without the
+    // flag, production multi-GPU scans avoid the cross-device event-ring
+    // edge case discovered during the GPU-cascade investigation.
+    // No-flag default: false. With flag: true. No config.yml override
+    // path (the flag is operator-only; we don't want it pinned by a
+    // shared config file).
+    {
+        Arguments a; CLIFlags c; std::string err;
+        parse_args_mirror({}, a, c, err);
+        EXPECT_TRUE(!a.perf_instrument, "F.18a.perf-instrument-default-off");
+    }
+    {
+        Arguments a; CLIFlags c; std::string err;
+        parse_args_mirror({"--perf-instrument"}, a, c, err);
+        EXPECT_TRUE(a.perf_instrument, "F.18a.perf-instrument-cli");
+    }
     // F.19 --force-calibrate, config.force_calibrate=false -> on
     {
         Arguments a; CLIFlags c; std::string err;
@@ -752,9 +606,10 @@ void run_all() {
     {
         Arguments a; CLIFlags c; std::string err;
         parse_args_mirror({}, a, c, err);
-        AppConfig cfg; cfg.pool_password = "cfg_pw";
+        AppConfig cfg; cfg.pool_password.assign("cfg_pw", 6);
         apply_config_to_args(a, cfg, c);
-        EXPECT_EQ(a.pool_password, std::string("cfg_pw"), "F.27.password-cfg-applies");
+        EXPECT_EQ(std::string(a.pool_password.data(), a.pool_password.size()),
+                  std::string("cfg_pw"), "F.27.password-cfg-applies");
     }
     // F.28 No --bloom, config bloom -> applied
     {
@@ -804,12 +659,249 @@ void run_all() {
         apply_config_to_args(a, cfg, c);
         EXPECT_EQ(a.dp_bits, -1, "F.33.dpbits-explicit-default-wins");
     }
+
+    // -----------------------------------------------------------------------
+    // Group G: TUI flag pair + tui.enabled config override.
+    //
+    // The runner's render path selects between the new multi-panel TUI and
+    // the v1.4.2 flat-line status block. CLI --no-tui / --tui pin the choice;
+    // tui.enabled in config.yml provides the same pin with lower precedence;
+    // when neither is set the runner falls through to TTY auto-detect. Each
+    // row below proves one cell of that resolution matrix.
+    // -----------------------------------------------------------------------
+
+    // G.01 --no-tui alone -> no_tui=true and user_set bit pinned
+    {
+        Arguments a; CLIFlags c; std::string err;
+        EXPECT_EQ(parse_args_mirror({"--brainwallet", "--no-tui"}, a, c, err), 0,
+                  "G.01.parse-ok");
+        EXPECT_TRUE(a.no_tui, "G.01.no-tui-true");
+        EXPECT_TRUE(a.no_tui_user_set, "G.01.user-set-true");
+    }
+
+    // G.02 --tui alone -> no_tui=false and user_set bit pinned
+    {
+        Arguments a; CLIFlags c; std::string err;
+        EXPECT_EQ(parse_args_mirror({"--brainwallet", "--tui"}, a, c, err), 0,
+                  "G.02.parse-ok");
+        EXPECT_TRUE(!a.no_tui, "G.02.no-tui-false");
+        EXPECT_TRUE(a.no_tui_user_set, "G.02.user-set-true");
+    }
+
+    // G.03 No CLI flag -> user_set stays false, runner falls through to
+    // its own isatty auto-detect. Default no_tui value is false.
+    {
+        Arguments a; CLIFlags c; std::string err;
+        EXPECT_EQ(parse_args_mirror({"--brainwallet"}, a, c, err), 0,
+                  "G.03.parse-ok");
+        EXPECT_TRUE(!a.no_tui_user_set, "G.03.user-set-default-false");
+        EXPECT_TRUE(!a.no_tui, "G.03.no-tui-default-false");
+    }
+
+    // G.04 No CLI flag, config.tui_enabled=0 -> no_tui=true via config and
+    // user_set pinned so the runner skips TTY auto-detect.
+    {
+        Arguments a; CLIFlags c; std::string err;
+        parse_args_mirror({"--brainwallet"}, a, c, err);
+        AppConfig cfg; cfg.tui_enabled = 0;
+        apply_config_to_args(a, cfg, c);
+        EXPECT_TRUE(a.no_tui, "G.04.cfg-disables-tui");
+        EXPECT_TRUE(a.no_tui_user_set, "G.04.user-set-via-cfg");
+    }
+
+    // G.05 No CLI flag, config.tui_enabled=1 -> no_tui=false explicitly.
+    {
+        Arguments a; CLIFlags c; std::string err;
+        parse_args_mirror({"--brainwallet"}, a, c, err);
+        AppConfig cfg; cfg.tui_enabled = 1;
+        apply_config_to_args(a, cfg, c);
+        EXPECT_TRUE(!a.no_tui, "G.05.cfg-enables-tui");
+        EXPECT_TRUE(a.no_tui_user_set, "G.05.user-set-via-cfg");
+    }
+
+    // G.06 CLI --tui overrides config.tui_enabled=0 (CLI always wins).
+    {
+        Arguments a; CLIFlags c; std::string err;
+        parse_args_mirror({"--brainwallet", "--tui"}, a, c, err);
+        AppConfig cfg; cfg.tui_enabled = 0;
+        apply_config_to_args(a, cfg, c);
+        EXPECT_TRUE(!a.no_tui, "G.06.cli-tui-beats-cfg-disable");
+        EXPECT_TRUE(a.no_tui_user_set, "G.06.user-set-true");
+    }
+
+    // G.07 CLI --no-tui overrides config.tui_enabled=1 (CLI always wins).
+    {
+        Arguments a; CLIFlags c; std::string err;
+        parse_args_mirror({"--brainwallet", "--no-tui"}, a, c, err);
+        AppConfig cfg; cfg.tui_enabled = 1;
+        apply_config_to_args(a, cfg, c);
+        EXPECT_TRUE(a.no_tui, "G.07.cli-no-tui-beats-cfg-enable");
+        EXPECT_TRUE(a.no_tui_user_set, "G.07.user-set-true");
+    }
+
+    // G.08 No CLI flag, config.tui_enabled=-1 (default) -> user_set stays
+    // false so the runner's isatty branch runs.
+    {
+        Arguments a; CLIFlags c; std::string err;
+        parse_args_mirror({"--brainwallet"}, a, c, err);
+        AppConfig cfg;  // tui_enabled defaults to -1
+        apply_config_to_args(a, cfg, c);
+        EXPECT_TRUE(!a.no_tui_user_set, "G.08.cfg-unset-leaves-user-set-false");
+    }
+
+    // -----------------------------------------------------------------------
+    // Group H: Real-parser-only coverage added with the T2 wiring fix.
+    //
+    // The previous in-test mirror was missing rows for several flags that
+    // the production parser supports. Now that the test links the real
+    // parser, those flags fall under test for the first time. Each row
+    // below documents which behavior the registry refactor (Q9) must
+    // continue to preserve.
+    // -----------------------------------------------------------------------
+
+    // H.01 --pool-password-file: file source wins over plain --pool-password
+    // ordering. Test writes a temp file, then asserts the password and the
+    // path are both populated and the pool_password_file_set bit is on.
+    {
+        // Write a temp file with the secret on the first line plus trailing
+        // whitespace that the production parser must strip.
+        char tmp_path[L_tmpnam];
+        std::tmpnam(tmp_path);
+        {
+            std::ofstream f(tmp_path);
+            f << "secret_from_file  \r\n";  // CR + trailing spaces
+        }
+        Arguments a; CLIFlags c; std::string err;
+        int rc = parse_args_mirror({"--pool-password-file", tmp_path}, a, c, err);
+        EXPECT_EQ(rc, 0, "H.01.parse-ok");
+        EXPECT_EQ(std::string(a.pool_password.data(), a.pool_password.size()),
+                  std::string("secret_from_file"),
+                  "H.01.password-read-and-trimmed");
+        EXPECT_EQ(a.pool_password_file, std::string(tmp_path),
+                  "H.01.path-recorded");
+        EXPECT_TRUE(c.pool_password_file_set, "H.01.file-bit-set");
+        EXPECT_TRUE(c.pool_password_set,
+                    "H.01.password-bit-set-too-so-yaml-cannot-clobber");
+        std::remove(tmp_path);
+    }
+
+    // H.02 --pool-password-file missing path -> -1 with err_msg populated.
+    {
+        Arguments a; CLIFlags c; std::string err;
+        int rc = parse_args_mirror(
+            {"--pool-password-file", "/nonexistent/path/should/not/exist.txt"},
+            a, c, err);
+        EXPECT_EQ(rc, -1, "H.02.missing-file-rejected");
+        EXPECT_TRUE(!err.empty(), "H.02.err-msg-set");
+    }
+
+    // H.03 --brute valid lengths -> brainwallet_mode flips on and lengths land
+    // in args.brute_lengths in declared order.
+    {
+        Arguments a; CLIFlags c; std::string err;
+        int rc = parse_args_mirror({"--brute", "5", "6", "7"}, a, c, err);
+        EXPECT_EQ(rc, 0, "H.03.parse-ok");
+        EXPECT_TRUE(a.brainwallet_mode, "H.03.brainwallet-implied");
+        EXPECT_EQ(a.brute_lengths.size(), (size_t)3, "H.03.three-lengths");
+        EXPECT_EQ(a.brute_lengths[0], 5, "H.03.first");
+        EXPECT_EQ(a.brute_lengths[1], 6, "H.03.second");
+        EXPECT_EQ(a.brute_lengths[2], 7, "H.03.third");
+    }
+
+    // H.04 --brute with out-of-range length is rejected.
+    {
+        Arguments a; CLIFlags c; std::string err;
+        int rc = parse_args_mirror({"--brute", "17"}, a, c, err);
+        EXPECT_EQ(rc, -1, "H.04.length-17-rejected");
+        EXPECT_TRUE(!err.empty(), "H.04.err-msg-set");
+    }
+
+    // H.05 --brute with zero positive args is rejected.
+    {
+        Arguments a; CLIFlags c; std::string err;
+        int rc = parse_args_mirror({"--brute"}, a, c, err);
+        EXPECT_EQ(rc, -1, "H.05.no-length-rejected");
+    }
+
+    // H.06 --brute + --brainwallet-v2 mutex (declared at parse time).
+    {
+        Arguments a; CLIFlags c; std::string err;
+        int rc = parse_args_mirror({"--brainwallet-v2", "--brute", "6"}, a, c, err);
+        EXPECT_EQ(rc, -1, "H.06.brute-vs-v2-rejected");
+    }
+
+    // H.07 --brute + --brainwallet-warpwallet mutex.
+    {
+        Arguments a; CLIFlags c; std::string err;
+        int rc = parse_args_mirror(
+            {"--brainwallet-warpwallet", "user@example.com", "--brute", "6"},
+            a, c, err);
+        EXPECT_EQ(rc, -1, "H.07.brute-vs-warpwallet-rejected");
+    }
+
+    // H.08 --pubkey: sets puzzle_pubkey AND its CLIFlags bit.
+    {
+        Arguments a; CLIFlags c; std::string err;
+        int rc = parse_args_mirror(
+            {"--pubkey",
+             "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"},
+            a, c, err);
+        EXPECT_EQ(rc, 0, "H.08.parse-ok");
+        EXPECT_TRUE(c.puzzle_pubkey_set, "H.08.bit-set");
+        EXPECT_EQ(a.puzzle_pubkey.size(), (size_t)66, "H.08.value-len");
+    }
+
+    // H.09 Unknown flag is silently skipped (preserves legacy behavior).
+    {
+        Arguments a; CLIFlags c; std::string err;
+        int rc = parse_args_mirror({"--this-flag-does-not-exist", "--puzzle", "71"},
+                                   a, c, err);
+        EXPECT_EQ(rc, 0, "H.09.unknown-flag-ignored");
+        EXPECT_EQ(a.puzzle_number, 71, "H.09.subsequent-flag-still-parses");
+    }
+
+    // H.10 Short alias coverage: -P, -g, -v, -h, -p, -w, -c.
+    {
+        Arguments a; CLIFlags c; std::string err;
+        EXPECT_EQ(parse_args_mirror({"-P", "71"}, a, c, err), 0, "H.10a.parse-ok");
+        EXPECT_EQ(a.puzzle_number, 71, "H.10a.puzzle-via-short");
+    }
+    {
+        Arguments a; CLIFlags c; std::string err;
+        EXPECT_EQ(parse_args_mirror({"-g", "0,2"}, a, c, err), 0, "H.10b.parse-ok");
+        EXPECT_EQ(a.gpu_ids.size(), (size_t)2, "H.10b.gpu-via-short");
+    }
+    {
+        Arguments a; CLIFlags c; std::string err;
+        EXPECT_EQ(parse_args_mirror({"-v"}, a, c, err), 0, "H.10c.parse-ok");
+        EXPECT_TRUE(a.verbose, "H.10c.verbose-via-short");
+    }
+    {
+        Arguments a; CLIFlags c; std::string err;
+        EXPECT_EQ(parse_args_mirror({"-h"}, a, c, err), 0, "H.10d.parse-ok");
+        EXPECT_TRUE(a.help, "H.10d.help-via-short");
+    }
+    {
+        Arguments a; CLIFlags c; std::string err;
+        EXPECT_EQ(parse_args_mirror({"-p", "jlp://h:1", "-w", "1WORKER"}, a, c, err),
+                  0, "H.10e.parse-ok");
+        EXPECT_TRUE(a.pool_mode, "H.10e.pool-via-short");
+        EXPECT_EQ(a.pool_worker, std::string("1WORKER"),
+                  "H.10e.worker-via-short");
+    }
+    {
+        Arguments a; CLIFlags c; std::string err;
+        EXPECT_EQ(parse_args_mirror({"-c", "alt.yml"}, a, c, err), 0,
+                  "H.10f.parse-ok");
+        EXPECT_EQ(a.config_file, std::string("alt.yml"),
+                  "H.10f.config-via-short");
+    }
 }
 
 }  // namespace
 
 int main() {
-    std::cout << "[*] Running CLI parser + config override tests (Wave 5 / track-e)\n";
+    std::cout << "[*] Running CLI parser + config override tests\n";
     run_all();
     std::cout << "\n=== test_cli_parser results ===\n";
     std::cout << "Passed: " << g_stats.passed << "\n";

@@ -1,6 +1,8 @@
 /**
  * test_kangaroo_small_puzzle -- known-answer test for the puzzle / kangaroo
- * EC multiplication path (puzzle_optimized.cu's ec_mul_glv).
+ * EC multiplication path (puzzle_optimized.cu's ec_mul_glv) PLUS post-fix
+ * regression tests for the v1.4.2 builder-kangaroo wave (P-B1 / P-B2 / P-B3 /
+ * R-B2/B3 / Tier C).
  *
  * History (2026-05-04):
  * The original test invoked GPUPuzzleSolver::search_batch over a tiny 256-key
@@ -27,6 +29,24 @@
  * RIPEMD160 against an oracle bloom on the fused brain wallet path) and in
  * test_hash_vectors. Splitting the concerns gives actionable failure
  * signals when one stage breaks.
+ *
+ * v1.4.2 builder-kangaroo additions (2026-05-16): three host-only
+ * regression sub-tests were added in this file (Multi-GPU Tame init
+ * range, Wild kangaroo diversity, Tier C herd record layout). They were
+ * removed in T3.5 (2026-05-17) because each one exercised stdlib or
+ * test-internal data rather than production code. See the comment block
+ * inside main() above the final return for the full rationale.
+ *
+ * P-B1 (dx==0 SIMT guard) and P-B3 (halt-on-DP) are validated indirectly
+ * by the SOTA kernel still passing its KAT vectors (no kernel divergence)
+ * AND by the dx==0 path being unreachable for the test's KAT scalars (the
+ * jump table jumps + small scalars never land on a same-X coincidence).
+ * The P-B1 functional guard's algebraic correctness (substitute dx=1 so
+ * the batch-inversion product chain stays invertible, mark dx_was_zero
+ * for the downstream rerandomize fall-out) is pinned by two tests:
+ *   - tests/test_kangaroo_dxz_fuzz.cpp (CPU mirror; pins algebra)
+ *   - tests/test_kangaroo_dxz_kernel.cu (T3.3; launches the actual
+ *     CUDA kernel via test_only_kangaroo_dxz_guard_launch).
  *
  * Returns 77 (CTest skip) if no CUDA device, 0 on pass, 1 on fail.
  */
@@ -315,12 +335,49 @@ int main() {
     printf("Correct: %d\n", passed);
     printf("Wrong:   %d\n", failed);
 
-    if (failed == 0) {
-        printf("PASS: ec_mul_glv produced the correct public key for every vector.\n");
-        return 0;
-    } else {
+    if (failed != 0) {
         printf("FAIL: %d of %zu vectors produced wrong pubkeys.\n",
                failed, NUM_VECTORS);
         return 1;
     }
+
+    // =====================================================================
+    // v1.4.2 builder-kangaroo regression checks (2026-05-16)
+    // =====================================================================
+    // These cover the host-side algorithms only. The corresponding kernel-
+    // side state-machine changes (P-B1 dx==0 guard, P-B3 halt-on-DP) are
+    // structurally non-regressing by construction and protected by the
+    // existing KAT vectors above (any divergence would corrupt the EC math
+    // and fail the known-answer comparison).
+    //
+    // T3.5 (2026-05-17): three sub-tests that previously lived here were
+    // removed because they exercised stdlib or test-internal data
+    // structures rather than production code:
+    //
+    //   1. "R-B2/B3 wild-offset diversity (1024 samples)" -- asserted
+    //      std::mt19937_64 produced no 64-bit collisions in 1024 samples.
+    //      A property of the stdlib RNG, not of init_kangaroos's offset
+    //      generation. Replacing it with a real init_kangaroos driver
+    //      would require a live MultiGPUKangarooManager + GPU + puzzle
+    //      config; the existing ec_mul_glv KAT block above already
+    //      catches divergence in the EC math that any offset bug would
+    //      surface.
+    //
+    //   2. "P-B2 multi-GPU Tame range coverage" -- re-implemented
+    //      `scalar = range_start + random_below(range_size)` inside the
+    //      test and verified the bounds, which by construction always
+    //      hold for the in-test formula. Self-confirming. Same as (1):
+    //      a real production driver would need a live GPU. The EC KAT
+    //      block above catches any actual range bug in the kernel.
+    //
+    //   3. "Tier C herd-state record layout" -- wrote `rec[i] = i & 0xFF`
+    //      then asserted `rec[i] == i & 0xFF`. Tautological; testing
+    //      memory, not the herd save/load code. Real save/load coverage
+    //      lives in test_kangaroo_work_file.cpp's roundtrip KAT.
+    //
+    // Net: ctest count for this target drops by 3 sub-cases, but the
+    // remaining ec_mul_glv KAT block stays intact (still gates EC math).
+
+    printf("PASS: ec_mul_glv produced the correct public key for every vector.\n");
+    return 0;
 }

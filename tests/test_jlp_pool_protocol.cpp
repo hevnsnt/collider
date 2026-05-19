@@ -75,6 +75,7 @@
 #include "pool/jlp_pool_client.hpp"
 #include "pool/pool_client.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -120,13 +121,17 @@ constexpr uint8_t TYPE_PING      = 0x50;
 constexpr uint8_t TYPE_PONG      = 0x51;
 constexpr uint8_t TYPE_MSG_ERROR = 0xFF;
 
-// Build [magic=KANG][type][flags=0][len:LE u16][payload].
+// Build [magic=KANG][type][flags=PROTOCOL_VERSION][len:LE u16][payload].
+// v1.4.2 B.5: flags now carries PROTOCOL_VERSION (=2). The client rejects
+// non-matching flags as a protocol version mismatch, so mock-server frames
+// must use the same value.
+constexpr uint8_t MOCK_PROTOCOL_VERSION = 2;
 std::vector<uint8_t> build_frame(uint8_t type, const void* payload, uint16_t len) {
     std::vector<uint8_t> out;
     out.reserve(8 + len);
     out.push_back('K'); out.push_back('A'); out.push_back('N'); out.push_back('G');
     out.push_back(type);
-    out.push_back(0);                                  // flags
+    out.push_back(MOCK_PROTOCOL_VERSION);              // v1.4.2 B.5: flags = PROTOCOL_VERSION
     out.push_back(static_cast<uint8_t>(len & 0xFF));   // len LE low
     out.push_back(static_cast<uint8_t>(len >> 8));     // len LE high
     if (payload && len > 0) {
@@ -281,9 +286,29 @@ public:
     }
 
     // Close the accepted client socket (simulates server-side disconnect).
+    //
+    // The shutdown(SD_BOTH) call before closesocket is load-bearing on
+    // Windows. MSDN explicitly documents that calling closesocket on a
+    // socket while another thread is blocked in recv() on the same
+    // handle leaves the recv in an UNDEFINED state. With our run()
+    // thread parked in ::recv(c) waiting for client bytes, a bare
+    // closesocket from this thread reliably reproduced an
+    // execute-at-NULL access violation in the recv-blocked thread on
+    // the order of 1-in-3 runs of test_jlp_pool_protocol (crash sites
+    // distributed across multiple unrelated subtests because the race
+    // window opens on every test fixture teardown). shutdown(SD_BOTH)
+    // signals a graceful close, so the blocked recv returns 0 BEFORE
+    // closesocket actually frees the handle, eliminating the
+    // unspecified-behaviour window. POSIX shutdown(SHUT_RDWR) has the
+    // same semantics, so the call works unmodified on Linux + macOS.
     void close_client() {
         std::lock_guard<std::mutex> lk(client_mu_);
         if (client_ != INVALID_SOCK_T) {
+#ifdef _WIN32
+            ::shutdown(client_, SD_BOTH);
+#else
+            ::shutdown(client_, SHUT_RDWR);
+#endif
             CLOSE_SOCK(client_);
             client_ = INVALID_SOCK_T;
             client_ready_ = false;
@@ -292,11 +317,25 @@ public:
 
     void stop() {
         if (stopped_.exchange(true)) return;
-        // Close listen so accept() unblocks.
+        // Signal the kicker BEFORE closing anything so it stops trying
+        // to send into a soon-to-be-half-shut socket. The kicker checks
+        // stopped_/stop_kicking_ at the top of every iteration; setting
+        // both here means the kicker bails out on its next 2ms wakeup
+        // (or in the middle of the current iteration if it has not yet
+        // entered ::send). Without this, stop() could race the kicker
+        // into a window where the kicker holds client_mu_ blocked in
+        // ::send while close_client() spins waiting for the same lock,
+        // serializing teardown against the kernel's send-buffer drain.
+        stop_kicking_ = true;
+        // Close listen so a pending accept() unblocks.
         if (listen_ != INVALID_SOCK_T) {
             CLOSE_SOCK(listen_);
             listen_ = INVALID_SOCK_T;
         }
+        // shutdown + close on the accepted client socket. The
+        // shutdown(SD_BOTH) is what unblocks the recv-blocked run()
+        // thread without invoking the closesocket-during-recv UB; see
+        // the comment on close_client() above.
         close_client();
         client_cv_.notify_all();
         buf_cv_.notify_all();
@@ -312,6 +351,30 @@ private:
             // Likely stop() closed the listen socket; just exit.
             return;
         }
+        // Apply a short recv timeout to the accepted socket so the recv
+        // loop below can poll stopped_ on its own without depending on
+        // close_client() to unblock it. The previous design relied on
+        // close_client() to wake recv via a graceful shutdown(SD_BOTH)
+        // plus closesocket, which still left a narrow Windows-specific
+        // window where the recv-blocked thread could observe an
+        // inconsistent socket state during teardown. A 50ms poll keeps
+        // CPU cost negligible while letting the run() thread exit on
+        // its own clock rather than racing against the teardown thread.
+#ifdef _WIN32
+        {
+            DWORD recv_timeout_ms = 50;
+            setsockopt(c, SOL_SOCKET, SO_RCVTIMEO,
+                       reinterpret_cast<const char*>(&recv_timeout_ms),
+                       sizeof(recv_timeout_ms));
+        }
+#else
+        {
+            struct timeval tv;
+            tv.tv_sec  = 0;
+            tv.tv_usec = 50000;  // 50ms
+            setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        }
+#endif
         {
             std::lock_guard<std::mutex> lk(client_mu_);
             client_ = c;
@@ -375,25 +438,40 @@ private:
 
         while (!stopped_) {
             int n = ::recv(c, tmp.data(), static_cast<int>(tmp.size()), 0);
-            if (n <= 0) break;
+            if (n == 0) {
+                // Graceful FIN from peer.
+                break;
+            }
+            if (n < 0) {
+                // Distinguish a benign recv timeout (SO_RCVTIMEO above)
+                // from a real socket error. On timeout we loop back to
+                // check stopped_. On any other error the socket is gone
+                // and we exit.
+                int err = last_sock_err();
+#ifdef _WIN32
+                if (err == WSAETIMEDOUT || err == WSAEWOULDBLOCK) continue;
+#else
+                if (err == EAGAIN || err == EWOULDBLOCK) continue;
+#endif
+                break;
+            }
             {
                 std::lock_guard<std::mutex> lk(buf_mu_);
                 // Filter out the client's PONG responses to our kicker PINGs
                 // so tests inspecting the received byte stream don't trip on
                 // unexpected PONG frames. PONG is fixed-size: 8-byte header
-                // (KANG, type=0x51, flags=0, len=0). We do this by scanning
-                // for KANG+0x51+0x00+0x00+0x00 sequences and removing them
-                // in-place. This is a stream filter, so a PONG arriving split
-                // across two recv() calls would slip through; in practice the
-                // 8 bytes always come together because send_message() writes
-                // the full header in one syscall.
+                // (KANG, type=0x51, flags=PROTOCOL_VERSION, len=0). v1.4.2 B.5
+                // landed flags=PROTOCOL_VERSION on every client send, so the
+                // 6th byte is no longer 0; track MOCK_PROTOCOL_VERSION so the
+                // filter actually matches (pre-fix the filter silently no-op'd
+                // because byte 5 didn't match).
                 size_t base = rx_.size();
                 rx_.insert(rx_.end(), tmp.data(), tmp.data() + n);
                 if (filter_pongs_.load()) {
                     // Only filter the freshly appended chunk; earlier bytes
                     // were already inspected on previous iterations.
-                    static constexpr uint8_t PONG_HEADER[8] = {
-                        'K','A','N','G',0x51,0x00,0x00,0x00
+                    static const uint8_t PONG_HEADER[8] = {
+                        'K','A','N','G',0x51,MOCK_PROTOCOL_VERSION,0x00,0x00
                     };
                     // Walk forwards, removing each match. Safe under removal
                     // because we don't advance i on a match.
@@ -561,10 +639,11 @@ bool test_auth_wire_format() {
         t.join();
         return fail("auth_wire_format", "header type != AUTH (0x01)");
     }
-    if (bytes[5] != 0) {
+    if (bytes[5] != MOCK_PROTOCOL_VERSION) {
+        // v1.4.2 B.5: client must set flags = PROTOCOL_VERSION (=2).
         server.send_frame(TYPE_AUTH_FAIL, nullptr, 0);
         t.join();
-        return fail("auth_wire_format", "header flags != 0");
+        return fail("auth_wire_format", "header flags != PROTOCOL_VERSION");
     }
     uint16_t plen = static_cast<uint16_t>(bytes[6] | (bytes[7] << 8));
     if (plen != kPayloadSize) {
@@ -809,11 +888,20 @@ bool test_ping_pong() {
 //    the same WORK_ASN MUST invoke it.
 // ---------------------------------------------------------------------------
 bool test_pre_auth_work_gated() {
+    // Callback captures live LONGER than the client (declared first, destroyed
+    // last). Pre-fix the client was declared before `callback_count`, so the
+    // atomic went out of scope first; the receiver thread joined inside
+    // ~JLPPoolClient could still be mid fire_work_callback (copy made under
+    // callbacks_mutex_, callback invoked outside the lock) writing through a
+    // stale capture reference. The receiver join inside disconnect() ensures
+    // no callback fires after `client` is destroyed, so as long as
+    // `callback_count` outlives `client`, the lambda's reference is valid for
+    // the entire duration the callback can be invoked.
+    std::atomic<int> callback_count{0};
     MockJlpServer server;
     auto client = make_connected(server.port());
     if (!client) return fail("pre_auth_work_gated", "connect failed");
 
-    std::atomic<int> callback_count{0};
     client->set_work_callback([&](const WorkAssignment&) { callback_count++; });
 
     // Build a 109-byte JLPServerConfig payload with a recognizable work_id.
@@ -859,6 +947,16 @@ bool test_pre_auth_work_gated() {
         return fail("pre_auth_work_gated",
                     "work callback NOT invoked after AUTH_OK");
     }
+    // Tear the client down EXPLICITLY before the function returns so
+    // the receiver thread is fully joined before `callback_count` even
+    // begins its scoped lifetime exit. Relying on unique_ptr's implicit
+    // destruction at function return is correct in principle (the
+    // capture is declared first, destroyed last), but explicit reset
+    // moves the join out of the stack-unwind window where Windows
+    // exit-cleanup races are most visible. Also clears the std::function
+    // first so even a stray late dispatch attempt is a no-op.
+    client->set_work_callback(nullptr);
+    client.reset();
     return true;
 }
 
@@ -867,12 +965,18 @@ bool test_pre_auth_work_gated() {
 //    WorkAssignment in the callback.
 // ---------------------------------------------------------------------------
 bool test_work_asn_parsing() {
+    // Callback captures (`captured`, `got`) must outlive `client`. See the
+    // matching comment in test_pre_auth_work_gated for the full lifetime
+    // rationale: the receiver thread is joined inside ~JLPPoolClient, so once
+    // `client` is destroyed no callback can fire; declaring captures first
+    // (destroyed last) keeps their addresses valid for the lambda's entire
+    // observable lifetime.
+    WorkAssignment captured{};
+    std::atomic<bool> got{false};
     MockJlpServer server;
     auto client = make_connected(server.port());
     if (!client) return fail("work_asn_parsing", "connect failed");
 
-    WorkAssignment captured{};
-    std::atomic<bool> got{false};
     client->set_work_callback([&](const WorkAssignment& w) {
         captured = w;
         got = true;
@@ -880,12 +984,15 @@ bool test_work_asn_parsing() {
 
     if (!drive_auth_ok(server, *client, "work_asn_parsing")) return false;
 
-    // Build a payload with values we can byte-compare.
+    // Build a payload with values we can byte-compare. dp_bits must be in
+    // the validated [8..32] window (the WORK_ASN handler drops the message
+    // otherwise; see tests/test_jlp_pool_dp_bits_validation.cpp). Use 26 --
+    // mid-range, still byte-distinctive (it is 0x0000001A on the wire).
     JLPServerConfig cfg{};
     for (int i = 0; i < 33; ++i) cfg.public_key[i]  = static_cast<uint8_t>(0x80 + i);
     for (int i = 0; i < 32; ++i) cfg.range_start[i] = static_cast<uint8_t>(0x01 + i);
     for (int i = 0; i < 32; ++i) cfg.range_end[i]   = static_cast<uint8_t>(0xC0 + i);
-    cfg.dp_bits = 0xDEADBEEFu;
+    cfg.dp_bits = 26u;
     cfg.work_id = 0x1122'3344'5566'7788ULL;
 
     server.send_frame(TYPE_WORK_ASN, &cfg, sizeof(cfg));
@@ -904,6 +1011,15 @@ bool test_work_asn_parsing() {
         return fail("work_asn_parsing", "dp_bits mismatch");
     if (captured.work_id != cfg.work_id)
         return fail("work_asn_parsing", "work_id mismatch");
+    // Explicit teardown: clear the callback first (so no late dispatch
+    // can touch the `captured`/`got` captures even via a copied
+    // std::function inside fire_work_callback) and then reset the
+    // unique_ptr so the receiver/sender threads are joined before the
+    // function frame begins unwinding. See test_pre_auth_work_gated for
+    // the full rationale on why moving the join out of the implicit
+    // destructor window improves teardown determinism on Windows.
+    client->set_work_callback(nullptr);
+    client.reset();
     return true;
 }
 
@@ -940,14 +1056,14 @@ bool test_stats_rsp_parsing() {
 
     // The receiver thread updates stats_ under stats_mutex_, so wait briefly.
     if (!wait_for([&] {
-            PoolStats s = client->get_stats();
+            PoolStatsLocal s = client->get_stats();
             return s.total_dps == total
                 && s.active_workers == active_workers
                 && s.your_dps == your_dps
                 && s.uptime_seconds == uptime;
         }, 2000ms))
     {
-        PoolStats s = client->get_stats();
+        PoolStatsLocal s = client->get_stats();
         std::fprintf(stderr,
             "[debug] stats: total=%llu active=%u your=%llu uptime=%u\n",
             (unsigned long long)s.total_dps,
@@ -1139,11 +1255,13 @@ bool test_report_solution() {
 //     payload twice fires the user's callback exactly once.
 // ---------------------------------------------------------------------------
 bool test_solution_callback_dedup() {
+    // Capture must outlive client. See test_pre_auth_work_gated for the
+    // lifetime rationale.
+    std::atomic<int> fire_count{0};
     MockJlpServer server;
     auto client = make_connected(server.port());
     if (!client) return fail("solution_callback_dedup", "connect failed");
 
-    std::atomic<int> fire_count{0};
     client->set_solution_callback([&](const uint8_t*) { fire_count++; });
 
     if (!drive_auth_ok(server, *client, "solution_callback_dedup")) return false;
@@ -1164,19 +1282,35 @@ bool test_solution_callback_dedup() {
         return fail("solution_callback_dedup",
                     "callback fired more than once for duplicate SOLUTION");
     }
+    // Explicit teardown: see test_pre_auth_work_gated. Clearing the
+    // callback first guarantees that even a late receiver-thread copy
+    // of the std::function cannot invoke the lambda after this point;
+    // resetting the client then joins all background threads before
+    // `fire_count` begins scoped destruction.
+    client->set_solution_callback(nullptr);
+    client.reset();
     return true;
 }
 
 // ---------------------------------------------------------------------------
-// 17. v1.4.1 C.3: WORK_ASN callback dedup. Sending two WORK_ASN frames
-//     with the same work_id fires the work callback only once.
+// 17. v1.4.2 Pool-F6: WORK_ASN callback dedup MOVED from JLPPoolClient
+//     to PoolManager. The supervisor recreates JLPPoolClient on every
+//     reconnect, so client-instance dedup state (last_work_id_fired_)
+//     reset to numeric_limits::max() after each reconnect and re-fired
+//     the same work_id to the host. The manager-level dedup outlives
+//     client churn. This test now verifies the OPPOSITE: the JLPPoolClient
+//     ALWAYS forwards every WORK_ASN. It is no longer the dedup
+//     authority. The PoolManager-level dedup is exercised by
+//     tests/test_jlp_pool_manager.cpp (not this file).
 // ---------------------------------------------------------------------------
 bool test_work_callback_dedup() {
+    // Capture must outlive client. See test_pre_auth_work_gated for the
+    // lifetime rationale.
+    std::atomic<int> fire_count{0};
     MockJlpServer server;
     auto client = make_connected(server.port());
     if (!client) return fail("work_callback_dedup", "connect failed");
 
-    std::atomic<int> fire_count{0};
     client->set_work_callback([&](const WorkAssignment&) { fire_count++; });
 
     if (!drive_auth_ok(server, *client, "work_callback_dedup")) return false;
@@ -1193,22 +1327,284 @@ bool test_work_callback_dedup() {
         return fail("work_callback_dedup",
                     "first WORK_ASN did not fire callback");
     }
-    // Same work_id arriving again -- treat as a network-layer duplicate.
-    server.send_frame(TYPE_WORK_ASN, &cfg, sizeof(cfg));
-    std::this_thread::sleep_for(200ms);
-
-    if (fire_count.load() != 1) {
-        return fail("work_callback_dedup",
-                    "callback fired again for duplicate work_id");
-    }
-
-    // Sanity: a different work_id MUST fire the callback again.
-    cfg.work_id = 0xDEADBEEF'CAFE0002ULL;
+    // Same work_id arriving again. Post-Pool-F6 the JLPPoolClient
+    // forwards every WORK_ASN (dedup is the manager's job); we expect
+    // fire_count to reach 2.
     server.send_frame(TYPE_WORK_ASN, &cfg, sizeof(cfg));
     if (!wait_for([&] { return fire_count.load() >= 2; }, 2000ms)) {
         return fail("work_callback_dedup",
+                    "duplicate WORK_ASN should re-fire at client level "
+                    "(dedup moved to PoolManager in v1.4.2 Pool-F6)");
+    }
+
+    // Sanity: a different work_id MUST also fire the callback.
+    cfg.work_id = 0xDEADBEEF'CAFE0002ULL;
+    server.send_frame(TYPE_WORK_ASN, &cfg, sizeof(cfg));
+    if (!wait_for([&] { return fire_count.load() >= 3; }, 2000ms)) {
+        return fail("work_callback_dedup",
                     "fresh work_id failed to fire callback");
     }
+    // Explicit teardown: see test_pre_auth_work_gated. Clear the
+    // callback first so a late dispatch is a no-op, then reset the
+    // client so its receiver/sender threads finish joining before
+    // `fire_count` enters its scoped destruction.
+    client->set_work_callback(nullptr);
+    client.reset();
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// 18. v1.4.1 B.1 anti-replay: sequence numbers on DP_BATCH_V2.
+//
+// The v2 wire grew a 4-byte LE sequence field per DP (DistinguishedPointV2
+// is 78 bytes = work_id(8) + sequence(4) + x(32) + d(32) + type(1) + dp_bits(1)).
+// The server tracks an expected window and rejects out-of-window sequences
+// (replays of captured DP_BATCHes, late duplicates from a misbehaving
+// client).
+//
+// What this test pins (CLIENT-side anti-replay properties):
+//
+//   a. Per-WorkAssignment monotonic sequence: every DP the client emits
+//      under a single work_id carries a sequence strictly greater than
+//      every previously-emitted DP for that work_id. Pre-fix, a sender
+//      restart could reset the counter to 0 mid-chunk, producing
+//      replay-looking sequences a malicious server could exploit.
+//
+//   b. Sequence reset on WORK_ASN: when the server assigns a new work_id,
+//      the client's sequence counter restarts at 0 for the new chunk.
+//      Mixing sequences across work_ids would let a captured DP_BATCH be
+//      replayed against a different chunk.
+//
+//   c. No sequence is reused: across the entire DP stream we observe, no
+//      two DPs with the same (work_id, sequence) tuple appear on the wire.
+//
+// The mock-server-rejection scenario in the task plan (server REJECTS a
+// stale sequence) actually lives in the SERVER, not the client. The
+// JLP wire is unidirectional for DP submission: client -> server. The
+// equivalent client-side property is "the client never emits a stale
+// sequence in the first place" -- which is what we test here.
+// ---------------------------------------------------------------------------
+bool test_dp_sequence_anti_replay() {
+    MockJlpServer server;
+    auto client = make_connected(server.port());
+    if (!client) return fail("dp_sequence_anti_replay", "connect failed");
+
+    if (!drive_auth_ok(server, *client, "dp_sequence_anti_replay")) return false;
+
+    // Assign the first work_id BEFORE submitting any DPs. Without a work
+    // assignment, the client's current_work_.work_id stays 0, and the
+    // sequence-reset-on-WORK_ASN property cannot be observed.
+    JLPServerConfig cfg{};
+    for (int i = 0; i < 33; ++i) cfg.public_key[i]  = 0x40 + i;
+    for (int i = 0; i < 32; ++i) cfg.range_start[i] = 0x50 + i;
+    for (int i = 0; i < 32; ++i) cfg.range_end[i]   = 0x60 + i;
+    cfg.dp_bits = 24;
+    cfg.work_id = 0xAAAA'BBBB'CCCC'0001ULL;
+    server.send_frame(TYPE_WORK_ASN, &cfg, sizeof(cfg));
+
+    // Brief sleep so the client's receiver thread dispatches the WORK_ASN
+    // before we submit any DPs. Without this the first DP can be tagged
+    // with work_id=0 (snapshotted before the WORK_ASN landed).
+    std::this_thread::sleep_for(150ms);
+    // Stop the kicker and drain leftover bytes so the next wait_recv_pop
+    // returns the actual DP_BATCH frame instead of unknown-type filler.
+    server.stop_kicker();
+    std::this_thread::sleep_for(30ms);
+    server.drain_rx();
+
+    // Helper: drain one DP_BATCH_V2 frame from the wire and return the
+    // 4-byte LE sequence of EACH DP in the batch (in submission order).
+    // The frame is [magic:4][type:1][flags:1][len:u16 LE][count:u32 LE]
+    // [dp(78) x count]. Sequence sits at offset 8 within each 78-byte DP
+    // entry (after work_id at offset 0).
+    auto pop_batch_sequences = [&](std::chrono::milliseconds timeout)
+        -> std::vector<uint32_t> {
+        std::vector<uint32_t> out;
+        auto header = server.wait_recv_pop(8, timeout);
+        if (header.size() != 8) return out;
+        if (header[4] != TYPE_DP_BATCH_V2) {
+            std::fprintf(stderr,
+                "[debug] dp_sequence_anti_replay: expected DP_BATCH_V2 (0x24), got 0x%02x\n",
+                header[4]);
+            return out;
+        }
+        uint16_t plen = static_cast<uint16_t>(header[6] | (header[7] << 8));
+        if (plen < 4) return out;
+        auto payload = server.wait_recv_pop(plen, 1000ms);
+        if (payload.size() != plen) return out;
+        uint32_t count =
+            static_cast<uint32_t>(payload[0]) |
+            (static_cast<uint32_t>(payload[1]) << 8) |
+            (static_cast<uint32_t>(payload[2]) << 16) |
+            (static_cast<uint32_t>(payload[3]) << 24);
+        // Sanity: payload size must equal 4 + count * 78.
+        if (payload.size() != 4ULL + static_cast<size_t>(count) * 78) {
+            std::fprintf(stderr,
+                "[debug] dp_sequence_anti_replay: payload size %zu != 4 + count(%u)*78\n",
+                payload.size(), count);
+            return out;
+        }
+        for (uint32_t i = 0; i < count; ++i) {
+            // Per-DP layout: work_id(8) | sequence(4) | x(32) | d(32) | type(1) | dp_bits(1).
+            const uint8_t* dp = payload.data() + 4 + i * 78;
+            uint32_t seq =
+                static_cast<uint32_t>(dp[8]) |
+                (static_cast<uint32_t>(dp[9]) << 8) |
+                (static_cast<uint32_t>(dp[10]) << 16) |
+                (static_cast<uint32_t>(dp[11]) << 24);
+            out.push_back(seq);
+        }
+        return out;
+    };
+
+    auto make_dp = [](uint8_t marker) {
+        DistinguishedPoint dp{};
+        for (int i = 0; i < 32; ++i) {
+            dp.x[i] = static_cast<uint8_t>(marker ^ i);
+            dp.d[i] = static_cast<uint8_t>(0x80 + (marker ^ i));
+        }
+        dp.type = 0;
+        dp.dp_bits = 24;
+        return dp;
+    };
+
+    // ----- Phase 1: submit 3 batches under work_id #1 -----
+    // Each batch is 3 DPs. The sender thread drains up to 100 DPs per
+    // iteration, but the client allocates sequences in submission order
+    // regardless. Across the three batches we expect 9 monotonically-
+    // increasing sequences starting at 0: [0,1,2,3,4,5,6,7,8].
+    std::vector<DistinguishedPoint> batch_a;
+    for (int i = 0; i < 3; ++i) batch_a.push_back(make_dp(0x10 + i));
+    if (!client->submit_dps(batch_a))
+        return fail("dp_sequence_anti_replay", "submit_dps batch_a failed");
+
+    std::vector<uint32_t> work1_seqs;
+    // First flush may bring just batch_a (3 DPs) or batch_a + later submissions
+    // if the sender hasn't woken yet; poll up to 9 total sequences (across
+    // potentially multiple DP_BATCH_V2 frames) under work_id #1.
+    auto collect_until = [&](size_t want, std::vector<uint32_t>& acc,
+                             std::chrono::milliseconds total_timeout) {
+        auto deadline = std::chrono::steady_clock::now() + total_timeout;
+        while (acc.size() < want &&
+               std::chrono::steady_clock::now() < deadline) {
+            auto s = pop_batch_sequences(200ms);
+            for (uint32_t v : s) acc.push_back(v);
+            if (acc.size() < want && s.empty()) {
+                std::this_thread::sleep_for(20ms);
+            }
+        }
+    };
+
+    collect_until(3, work1_seqs, 5000ms);
+    if (work1_seqs.size() < 3) {
+        std::fprintf(stderr,
+            "[debug] dp_sequence_anti_replay: got only %zu seqs from batch_a\n",
+            work1_seqs.size());
+        return fail("dp_sequence_anti_replay",
+                    "batch_a sequences never reached the wire");
+    }
+
+    // Submit two more batches under the SAME work_id. Each should
+    // continue the sequence monotonically.
+    std::vector<DistinguishedPoint> batch_b;
+    for (int i = 0; i < 3; ++i) batch_b.push_back(make_dp(0x20 + i));
+    if (!client->submit_dps(batch_b))
+        return fail("dp_sequence_anti_replay", "submit_dps batch_b failed");
+
+    std::vector<DistinguishedPoint> batch_c;
+    for (int i = 0; i < 3; ++i) batch_c.push_back(make_dp(0x30 + i));
+    if (!client->submit_dps(batch_c))
+        return fail("dp_sequence_anti_replay", "submit_dps batch_c failed");
+
+    collect_until(9, work1_seqs, 5000ms);
+    if (work1_seqs.size() < 9) {
+        std::fprintf(stderr,
+            "[debug] dp_sequence_anti_replay: got %zu/9 work1 seqs\n",
+            work1_seqs.size());
+        return fail("dp_sequence_anti_replay",
+                    "fewer than 9 sequences seen under work_id #1");
+    }
+
+    // Property (a): per-work_id strict monotonicity.
+    for (size_t i = 1; i < work1_seqs.size(); ++i) {
+        if (work1_seqs[i] <= work1_seqs[i-1]) {
+            std::fprintf(stderr,
+                "[debug] dp_sequence_anti_replay: non-monotonic work1: seq[%zu]=%u <= seq[%zu]=%u\n",
+                i, work1_seqs[i], i-1, work1_seqs[i-1]);
+            return fail("dp_sequence_anti_replay",
+                        "work_id #1 sequence is not strictly increasing (replay window)");
+        }
+    }
+
+    // Property (c) for the work1 stream: every seq is unique.
+    {
+        std::vector<uint32_t> sorted = work1_seqs;
+        std::sort(sorted.begin(), sorted.end());
+        for (size_t i = 1; i < sorted.size(); ++i) {
+            if (sorted[i] == sorted[i-1]) {
+                std::fprintf(stderr,
+                    "[debug] dp_sequence_anti_replay: duplicate seq %u in work1 stream\n",
+                    sorted[i]);
+                return fail("dp_sequence_anti_replay",
+                            "work_id #1 emitted a duplicate sequence number");
+            }
+        }
+    }
+
+    // The first sequence under a brand-new work_id should be 0 (or close
+    // to it; some implementations seed > 0 from the manager-supplied
+    // dp_sequence_next_). We only assert "starts low" here -- a brand-new
+    // worker should never start mid-window for the first chunk it sees.
+    if (work1_seqs.front() > 4u) {
+        std::fprintf(stderr,
+            "[debug] dp_sequence_anti_replay: first work1 seq = %u (expected near 0)\n",
+            work1_seqs.front());
+        return fail("dp_sequence_anti_replay",
+                    "first sequence under a fresh work_id is not near zero");
+    }
+
+    // ----- Phase 2: switch work_id, observe sequence reset -----
+    cfg.work_id = 0xAAAA'BBBB'CCCC'0002ULL;
+    server.send_frame(TYPE_WORK_ASN, &cfg, sizeof(cfg));
+
+    // Wait briefly so the WORK_ASN dispatcher latches the new work_id
+    // before we drain new DPs. Without this the next submit_dp could
+    // still tag DPs with the OLD work_id (stale current_work_).
+    std::this_thread::sleep_for(150ms);
+
+    std::vector<DistinguishedPoint> batch_d;
+    for (int i = 0; i < 3; ++i) batch_d.push_back(make_dp(0x40 + i));
+    if (!client->submit_dps(batch_d))
+        return fail("dp_sequence_anti_replay", "submit_dps batch_d failed");
+
+    std::vector<uint32_t> work2_seqs;
+    collect_until(3, work2_seqs, 5000ms);
+    if (work2_seqs.size() < 3) {
+        return fail("dp_sequence_anti_replay",
+                    "batch_d sequences never reached the wire");
+    }
+
+    // Property (b): sequence reset on WORK_ASN. The first sequence under
+    // work_id #2 should be SMALLER than the last sequence emitted under
+    // work_id #1. If the counter did not reset, we'd see continued
+    // monotonic growth and a malicious server could replay a captured
+    // work_id #1 DP under work_id #2 to forge credit.
+    if (!(work2_seqs.front() < work1_seqs.back())) {
+        std::fprintf(stderr,
+            "[debug] dp_sequence_anti_replay: work2 first seq %u >= work1 last seq %u (no reset)\n",
+            work2_seqs.front(), work1_seqs.back());
+        return fail("dp_sequence_anti_replay",
+                    "sequence did NOT reset on WORK_ASN (anti-replay broken)");
+    }
+
+    // Property (a) again for work2: strict monotonicity within the new chunk.
+    for (size_t i = 1; i < work2_seqs.size(); ++i) {
+        if (work2_seqs[i] <= work2_seqs[i-1]) {
+            return fail("dp_sequence_anti_replay",
+                        "work_id #2 sequence is not strictly increasing");
+        }
+    }
+
     return true;
 }
 
@@ -1239,20 +1635,133 @@ const TestCase TESTS[] = {
     {"report_solution",           test_report_solution},
     {"solution_callback_dedup",   test_solution_callback_dedup},
     {"work_callback_dedup",       test_work_callback_dedup},
+    {"dp_sequence_anti_replay",   test_dp_sequence_anti_replay},
 };
 
 }  // namespace
 
+#ifdef _WIN32
+#include <DbgHelp.h>
+#pragma comment(lib, "dbghelp.lib")
+LONG WINAPI test_seh_filter(EXCEPTION_POINTERS* ep) {
+    CONTEXT* ctx_in = ep->ContextRecord;
+    std::fprintf(stderr,
+                 "\n=== UNHANDLED EXCEPTION ===\n"
+                 "tid       = %lu\n"
+                 "code      = 0x%08lX\n"
+                 "addr      = %p\n"
+                 "param[0]  = 0x%016llX (access type)\n"
+                 "param[1]  = 0x%016llX (faulting va)\n"
+                 "RIP       = 0x%016llX\n"
+                 "RSP       = 0x%016llX\n"
+                 "RBP       = 0x%016llX\n",
+                 GetCurrentThreadId(),
+                 ep->ExceptionRecord->ExceptionCode,
+                 ep->ExceptionRecord->ExceptionAddress,
+                 (unsigned long long)(ep->ExceptionRecord->NumberParameters > 0
+                                      ? ep->ExceptionRecord->ExceptionInformation[0] : 0),
+                 (unsigned long long)(ep->ExceptionRecord->NumberParameters > 1
+                                      ? ep->ExceptionRecord->ExceptionInformation[1] : 0),
+                 (unsigned long long)ctx_in->Rip,
+                 (unsigned long long)ctx_in->Rsp,
+                 (unsigned long long)ctx_in->Rbp);
+
+    // Walk the stack starting from the faulting context. When RIP is zero
+    // (execute-at-NULL) StackWalk64 cannot resolve the first frame, so seed
+    // the walk from the return address sitting on top of RSP instead. That
+    // recovers the call site that jumped to the null pointer.
+    HANDLE proc = GetCurrentProcess();
+    SymInitialize(proc, NULL, TRUE);
+
+    CONTEXT ctx = *ctx_in;
+    if (ctx.Rip == 0 && ctx.Rsp != 0) {
+        // Best-effort: peek the qword at RSP. If it lives in committed
+        // memory we treat it as a candidate return address. We swallow
+        // any access fault here so the SEH filter does not recursively
+        // crash on a bad RSP.
+        __try {
+            uint64_t candidate = *reinterpret_cast<uint64_t*>(ctx.Rsp);
+            ctx.Rip = candidate;
+            ctx.Rsp += 8;
+            std::fprintf(stderr,
+                         "(RIP was 0; seeding stack walk from return "
+                         "address 0x%016llX)\n",
+                         (unsigned long long)candidate);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            std::fprintf(stderr,
+                         "(RIP was 0; RSP %p is not readable, cannot seed "
+                         "stack walk)\n", (void*)ctx_in->Rsp);
+        }
+    }
+
+    STACKFRAME64 frame{};
+    frame.AddrPC.Offset    = ctx.Rip;
+    frame.AddrPC.Mode      = AddrModeFlat;
+    frame.AddrFrame.Offset = ctx.Rbp;
+    frame.AddrFrame.Mode   = AddrModeFlat;
+    frame.AddrStack.Offset = ctx.Rsp;
+    frame.AddrStack.Mode   = AddrModeFlat;
+
+    fprintf(stderr, "stack:\n");
+    for (int i = 0; i < 30; ++i) {
+        if (!StackWalk64(IMAGE_FILE_MACHINE_AMD64, proc, GetCurrentThread(),
+                         &frame, &ctx, NULL, SymFunctionTableAccess64,
+                         SymGetModuleBase64, NULL)) break;
+        if (frame.AddrPC.Offset == 0) break;
+
+        DWORD64 disp = 0;
+        char buf[sizeof(SYMBOL_INFO) + 256];
+        SYMBOL_INFO* sym = (SYMBOL_INFO*)buf;
+        sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+        sym->MaxNameLen   = 256;
+        const char* name = "?";
+        if (SymFromAddr(proc, frame.AddrPC.Offset, &disp, sym)) name = sym->Name;
+
+        char modname[MAX_PATH] = "?";
+        HMODULE hmod = NULL;
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               (LPCSTR)frame.AddrPC.Offset, &hmod) && hmod) {
+            GetModuleFileNameA(hmod, modname, MAX_PATH);
+        }
+
+        fprintf(stderr, "  %p  %s+0x%llx  [%s]\n",
+                (void*)frame.AddrPC.Offset, name, (unsigned long long)disp, modname);
+    }
+    std::fflush(stderr);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+#endif
+
 int main() {
 #ifdef _WIN32
     WSAGuard guard;
+    SetUnhandledExceptionFilter(test_seh_filter);
+    // Vectored handler catches exceptions before per-thread handlers, even
+    // for thread shutdown crashes that bypass the unhandled exception filter.
+    AddVectoredExceptionHandler(1, [](EXCEPTION_POINTERS* ep) -> LONG {
+        // Only handle access violations (not breakpoints / single-step).
+        if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
+            return EXCEPTION_CONTINUE_SEARCH;
+        return test_seh_filter(ep);
+    });
 #endif
     std::printf("=== JLP pool protocol tests (mock TCP server) ===\n");
     int failures = 0;
     for (const auto& t : TESTS) {
+        std::fprintf(stderr, "[ ENTER ] %s\n", t.name);
+        std::fflush(stderr);
         std::printf("[ run ] %s\n", t.name);
-        if (t.fn()) {
+        std::fflush(stdout);
+        bool ok = t.fn();  // ALL locals of t.fn() are destructed by the time this returns
+        std::fprintf(stderr, "[ DTORDONE ] %s ok=%d\n", t.name, (int)ok);
+        std::fflush(stderr);
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        std::fprintf(stderr, "[ POSTSLEEP ] %s\n", t.name);
+        std::fflush(stderr);
+        if (ok) {
             std::printf("[ ok  ] %s\n", t.name);
+            std::fflush(stdout);
         } else {
             std::printf("[FAIL ] %s\n", t.name);
             ++failures;

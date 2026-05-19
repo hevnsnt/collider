@@ -12,7 +12,7 @@
 namespace collider {
 namespace gpu {
 
-// v1.4.1 D.2: round primitives now live in ripemd160_device.cuh.
+// round primitives now live in ripemd160_device.cuh.
 using collider::gpu::ripemd160::rotl;
 using collider::gpu::ripemd160::f0;
 using collider::gpu::ripemd160::f1;
@@ -208,23 +208,12 @@ __global__ void ripemd160_batch_kernel(
     ripemd160_hash(in, out);
 }
 
-/**
- * Combined SHA256 + RIPEMD160 for public key to address.
- * Input: 65-byte uncompressed public key (04 || x || y)
- * Output: 20-byte address hash (hash160)
- */
-__device__ void pubkey_to_hash160(
-    const uint8_t* pubkey,  // 65 bytes
-    uint8_t* hash160        // 20 bytes
-) {
-    uint8_t sha256_out[32];
-
-    // First SHA256 of pubkey
-    // (Would call sha256_hash here - simplified for this file)
-
-    // Then RIPEMD160
-    ripemd160_hash(sha256_out, hash160);
-}
+// pubkey_to_hash160 was a never-called stub with the SHA256 step
+// commented out; the actual production address derivation goes
+// through fused_pipeline.cu and h160_bloom_filter.cu. The stub was
+// flagged by the crypto re-audit as dead code with the additional
+// risk that any future caller would silently hash uninitialized
+// stack memory, so it was removed.
 
 // Host wrapper
 extern "C" {

@@ -33,17 +33,14 @@ namespace {
 // Build the 32-window 8-bit-per-window precomputed G table on the CPU. The
 // host computes each entry as `d * 2^(8*w) * G` via cpu::ec_mul +
 // cpu::ec_to_affine, then packs them in the LE-by-limb form the kernel reads.
-//
 // Row 0 of every window (d == 0) is the identity, encoded as all-zero
 // (X=0, Y=0); the kernel skips zero windows so this row is never dereferenced
 // at runtime. We still allocate the row so the indexing math in the kernel
 // (`(w * 256 + d) * 8`) lands in-bounds for every byte value.
-//
 // One-time cost on host: 32 * 255 = 8160 EC scalar multiplications. cpu::ec_mul
 // is a simple double-and-add (~256 doublings + ~128 adds per call). On an M1
 // at ~2us per ec_mul the total table-build time is ~16 ms. That's a one-time
 // init cost, not in the hot path.
-//
 // Production-grade build pattern: instead of N independent k*G calls, we
 // chain incrementally per window:
 //   for w in 0..32:

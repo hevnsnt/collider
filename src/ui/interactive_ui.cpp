@@ -1,14 +1,7 @@
-/**
- * interactive_ui.cpp - Implementation of theCollider's interactive
- * startup flow.
- *
- * Extracted verbatim from src/main.cpp during the v1.4.1 A.3 refactor;
- * no behavior changes. The bodies still depend on a handful of free
- * functions that currently live in main.cpp (format_number*,
- * normalize_path, analyze_puzzle, get_best_puzzle); those are forward-
- * declared below and migrate to runtime/puzzle_solver.cpp in a follow-
- * up commit of the same refactor.
- */
+// interactive_ui.cpp: theCollider's interactive startup flow.
+// Hosts the menu prompts dispatched from main(); the helpers it relies
+// on (format_number_human, normalize_path, analyze_puzzle,
+// get_best_puzzle) live in collider::runtime / core/puzzle_analysis.
 
 // Prevent Windows min/max macros from breaking std::min/std::max.
 #ifndef NOMINMAX
@@ -37,6 +30,7 @@
 
 #include "core/puzzle_analysis.hpp"
 #include "core/puzzle_config.hpp"
+#include "core/version.hpp"
 #include "core/yaml_config.hpp"
 #include "tools/utxo_bloom_builder.hpp"
 #include "ui/banner.hpp"
@@ -47,13 +41,14 @@
 #include "ui/brainwallet_setup.hpp"
 #endif
 
-// Forward declarations for free functions that still live in src/main.cpp.
-// These migrate into runtime/puzzle_solver.cpp (formatters) and
-// runtime/brain_wallet_runner.cpp (normalize_path) in a follow-up commit
-// of the v1.4.1 A.3 refactor.
+#include "runtime/format.hpp"
+
+// format_number is still defined in runtime/puzzle_solver.cpp; forward
+// declare it here so we keep linking against the existing TU.
 std::string format_number(uint64_t n);
-std::string format_number_human(uint64_t n);
-std::string normalize_path(const std::string& path);
+
+using collider::runtime::format_number_human;
+using collider::runtime::normalize_path;
 
 namespace collider::ui {
 
@@ -85,7 +80,7 @@ Arguments run_puzzle_interactive(Arguments base_args, double gpu_speed_mkeys) {
         args.pool_url = pool_url;
         args.pool_worker = worker;
 
-        // v1.4.1: persist the BTC payout address to ~/.collider/config.yml
+        // persist the BTC payout address to ~/.collider/config.yml
         // so the next launch defaults to it (user can still override at the
         // prompt). Only writes when the file doesn't already exist; never
         // overwrites an existing operator-managed config.
@@ -628,7 +623,7 @@ Arguments run_interactive_mode(Arguments base_args, double gpu_speed_mkeys) {
         args.go_back = false;
 
         // Display main menu
-        MainMenuChoice choice = Interactive::display_main_menu("1.4.0");
+        MainMenuChoice choice = Interactive::display_main_menu(collider::kVersion);
 
         switch (choice) {
             case MainMenuChoice::PUZZLE_MODE: {
@@ -678,6 +673,12 @@ Arguments run_interactive_mode(Arguments base_args, double gpu_speed_mkeys) {
 
 void enable_windows_ansi() {
 #ifdef _WIN32
+    // Set console output code page to UTF-8 so Unicode glyphs (arrows,
+    // box-drawing, emoji) render correctly. Without this, the default
+    // CP-437 / CP-1252 console renders our UTF-8 bytes as mojibake
+    // (e.g. "->" written as U+2192 prints as "GammaringAE" on CP-437).
+    SetConsoleOutputCP(65001);
+
     // Enable virtual terminal processing for ANSI escape codes
     HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
     if (hOut != INVALID_HANDLE_VALUE) {

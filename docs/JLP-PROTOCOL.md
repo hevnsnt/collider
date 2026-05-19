@@ -144,6 +144,14 @@ Python `struct.pack` format: `<QI32s32sBB`.
 
 **Sequence rules.** The `sequence` field is per `(worker_name, work_id)`, monotonic, starting at `0` for the first DP of each chunk. The server tracks a sliding window of expected sequence numbers; sequences far below the high-water mark are rejected as replays. A client that abandons a chunk and is reassigned the same `work_id` later starts back at `0`. Out-of-order delivery within the window is acceptable; the window is only used to reject obvious replay attempts.
 
+**Actual replay-defence scheme (v1.4.2).** The reference server (`collision-protocol/src/pool_server.py`, `_check_dp_sequence`) implements the window as: per `(worker_name, work_id)` it tracks `_dp_seq_high`, the highest sequence ever accepted. A new submission is accepted iff `sequence > _dp_seq_high - SEQ_REPLAY_WINDOW` (with `SEQ_REPLAY_WINDOW = 1024`); otherwise it is rejected as `dp_sequence_out_of_window (0x21)`. The server does NOT separately track every individual seen sequence, so:
+
+- **An attacker who replays a captured DP_BATCH_V2 with sequences within 1024 of the current high-water mark is NOT rejected by this check alone.** The server's cryptographic consistency check on the DP fields (X / d / type) is the actual defence against replayed real DPs; the sequence window only defends against very-old captures.
+- **A client that crashes mid-batch and restarts MUST resume its counter from the last persisted value, not from 0.** Reusing earlier sequence values within the window does not collide (server admits `sequence > high - 1024`) but using values below the floor triggers `dp_sequence_out_of_window`. Persisting the counter across restarts is the client-side responsibility implemented by `PoolManager` (v1.4.2 Pool-B1, `~/.collider/pool_dp_seq.dat`).
+- **Out-of-order DPs within the window slip through the same-sequence check.** This is a known limitation. The v1.4.2 dependency map: server's protocol-level guard is the lookback bound; the cryptographic-consistency check is what actually rejects forged DPs; the client-side persistence prevents accidental self-banning on flaky networks.
+
+The pre-1.4.2 client header `src/pool/dp_seq_window.hpp` documented a stricter per-`(work_id)` set-of-seen-sequences scheme. Neither end implemented that scheme; it was a stale spec. The header has been deleted.
+
 **`work_id` rules.** Clients MUST set `work_id` to the most recent `WorkAssignment.work_id` for the chunk this DP came from. Submitting a DP whose `work_id` does not match the worker's currently-assigned chunk is treated as an anti-cheat infraction (see section 9).
 
 ### 5.5 `PoolStats` (36 bytes)

@@ -12,6 +12,9 @@
  */
 #pragma once
 
+#include <set>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include "runtime/runtime_globals.hpp"  // GPUDetectionResult
@@ -29,3 +32,25 @@
  *         backend tag ("CUDA" / "Metal" / "CPU").
  */
 GPUDetectionResult detect_gpus(std::vector<int>& requested_ids);
+
+/**
+ * Parse the compile-time CUDA arch list ("7.5,8.6,8.9,12.0") into a set of
+ * (major, minor) pairs. Exposed so the session log's hardware enumeration
+ * can fire a milestone("sm_mismatch", ...) using the SAME parser that
+ * drives the startup stderr warning in detect_gpus(); duplicating the
+ * parser would risk the two emitting different verdicts after a future
+ * COLLIDER_CUDA_ARCH_LIST format change.
+ *
+ * Returns an empty set when COLLIDER_CUDA_ARCH_LIST is not defined (Metal /
+ * CPU builds). Callers MUST treat an empty set as "no SM check applies"
+ * and skip the membership test rather than treating every device as a
+ * mismatch.
+ */
+std::set<std::pair<int, int>> compile_time_sm_set();
+
+/**
+ * Render a (major, minor) SM set as "{7.5, 8.6, 8.9, 12.0}" for logging.
+ * Shared with detect_gpus() so the startup banner and the session-log
+ * milestone format the same way.
+ */
+std::string sm_set_to_string(const std::set<std::pair<int, int>>& s);

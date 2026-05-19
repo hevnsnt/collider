@@ -101,12 +101,24 @@ public:
 
     // Last error message, or empty if no error has occurred.
     virtual const std::string& error() const = 0;
+
+    // Tier C (v1.4.2 builder-kangaroo): herd state serialization.
+    // save_herd_state writes the backend's current per-kangaroo state to
+    // `path` so a future load_herd_state call can restore the herd
+    // verbatim. Backends that do not own a host-visible kangaroo state
+    // (e.g., the third-party RCKangaroo wrapper, which encapsulates its
+    // own GPU buffers) return false from both methods; the runner then
+    // skips checkpoint persistence for that backend.
+    // The runner-level checkpoint loop (which periodically calls these
+    // methods + handles the file lifecycle) is implemented in the
+    // runner crate; this header just provides the contract.
+    virtual bool save_herd_state(const std::string& /*path*/) { return false; }
+    virtual bool load_herd_state(const std::string& /*path*/) { return false; }
 };
 
 // Factory: returns the appropriate backend for this build configuration.
 // The compile-time choice (CUDA / Metal / CPU) is the only #ifdef left
 // in the pool driver. Caller owns the returned pointer.
-//
 // gpu_ids is consumed by the CUDA backend (which initializes the
 // nominated devices); ignored by Metal and CPU backends.
 std::unique_ptr<IKangarooBackend> create_kangaroo_backend(

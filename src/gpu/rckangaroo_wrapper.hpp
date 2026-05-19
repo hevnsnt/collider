@@ -168,6 +168,33 @@ public:
      */
     uint64_t get_bloom_checks() const;
 
+    /**
+     * kangaroo herd save / load.
+     *
+     * save_herd_state arms the RCGpuKang per-GPU SaveKangsHost hooks
+     * before solve() runs. When solve() returns, the host buffers are
+     * populated; this call serializes them to `path` using the format
+     * documented in third_party/RCKangaroo/.patches/save-load-state.patch.
+     * Returns false if no solve has occurred yet OR if the save buffers
+     * are empty (e.g. init() never called).
+     *
+     * load_herd_state reads the file and arms InitKangsHost on each
+     * RCGpuKang BEFORE solve(). The next solve()'s Start() consumes the
+     * buffer in place of RCKangaroo's random-point generation. Returns
+     * false on any file I/O error, magic mismatch, version mismatch,
+     * GPU-count mismatch, KangCnt mismatch, or config-hash mismatch
+     * (different target pubkey or range_start).
+     *
+     * Lifecycle: load BEFORE solve(); call request_save_on_stop()
+     * BEFORE solve(); write the file AFTER solve() returns by calling
+     * save_herd_state(path).
+     *
+     * These methods are no-ops (return false) if init() has not run.
+     */
+    bool request_save_on_stop();
+    bool save_herd_state(const std::string& path);
+    bool load_herd_state(const std::string& path);
+
 private:
     struct Impl;
     Impl* impl_;

@@ -9,8 +9,10 @@
  *      the pool's TLS posture, not a flaky test.
  *   2. After TLS, the client sends a single AUTH message with the exact
  *      bytes the production JLP client emits: 8-byte header
- *      [magic="KANG", type=0x01, flags=0x00, payload_size LE u16] followed by
- *      sizeof(JLPClientHello) = 76 bytes of payload.
+ *      [magic="KANG", type=0x01, flags=PROTOCOL_VERSION=2, payload_size LE u16]
+ *      followed by sizeof(JLPClientHelloV2) = 120 bytes of payload.
+ *      Pre-v1.4.2 this test asserted the legacy 76-byte v1 payload, which
+ *      had drifted from the production client (audit B.4).
  *   3. The server replies with a well-formed JLP frame: 8-byte header whose
  *      magic == "KANG" and whose payload_size matches the bytes that follow.
  *
@@ -35,10 +37,11 @@
  *   - Header length field disagrees with bytes actually sent before close.
  *
  * Wire format reference: src/pool/jlp_pool_client.hpp
- *   JLPHeader: [4]"KANG", [1]type, [1]flags=0, [2]payload_size LE = 8 bytes.
- *   JLPClientHello: [64]worker_name (NUL-terminated), [4]gpu_count LE u32,
- *                   [8]speed LE u64. = 76 bytes total. Verified at compile
- *                   time below via static_assert.
+ *   JLPHeader: [4]"KANG", [1]type, [1]flags=PROTOCOL_VERSION(2), [2]payload_size LE = 8 bytes.
+ *   JLPClientHelloV2: [64]worker_name + [32]password + [8]timestamp_ms LE
+ *                     + [16]nonce = 120 bytes. Matches IDL AuthPayloadV2
+ *                     (struct format '<64s32sQ16s'). Verified at compile
+ *                     time below via static_assert.
  *
  * This test does NOT link against the production jlp_pool_client; it
  * re-implements the handshake at the byte level so it cannot regress in
@@ -83,6 +86,7 @@
 #include <openssl/err.h>
 #include <openssl/x509v3.h>
 
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -107,15 +111,21 @@ struct JLPHeader {
     uint16_t payload_size;    // little-endian
 };
 
-struct JLPClientHello {
-    char     worker_name[64];
-    uint32_t gpu_count;
-    uint64_t speed;
+// v1.4.2 B.4: production wire layout is JLPClientHelloV2 (120 bytes).
+// Pre-fix this test asserted the OLD 76-byte v1 layout (worker_name +
+// gpu_count + speed), so it could not have been running against the
+// real production client. struct format '<64s32sQ16s' matches IDL
+// AuthPayloadV2 and src/pool/jlp_pool_client.hpp::JLPClientHelloV2.
+struct JLPClientHelloV2 {
+    char     worker_name[64];   // null-padded worker / BTC payout address
+    char     password[32];      // optional pool password, null-padded
+    uint64_t timestamp_ms;      // client wall-clock (LE)
+    uint8_t  nonce[16];         // per-AUTH random
 };
 #pragma pack(pop)
 
-static_assert(sizeof(JLPHeader)      == 8,  "JLPHeader must be exactly 8 bytes");
-static_assert(sizeof(JLPClientHello) == 76, "JLPClientHello must be exactly 76 bytes (64+4+8)");
+static_assert(sizeof(JLPHeader)        ==  8,  "JLPHeader must be exactly 8 bytes");
+static_assert(sizeof(JLPClientHelloV2) == 120, "JLPClientHelloV2 must be exactly 120 bytes");
 
 // JLP message type IDs (subset).
 constexpr uint8_t JLP_AUTH      = 0x01;
@@ -408,19 +418,26 @@ int main() {
     JLPHeader hdr{};
     hdr.magic[0] = 'K'; hdr.magic[1] = 'A'; hdr.magic[2] = 'N'; hdr.magic[3] = 'G';
     hdr.type         = JLP_AUTH;
-    hdr.flags        = 0;
-    hdr.payload_size = (uint16_t)sizeof(JLPClientHello);
+    // v1.4.2 B.5: senders set flags = PROTOCOL_VERSION (2). Servers reject
+    // mismatches with MSG_ERROR/protocol_version_mismatch.
+    hdr.flags        = 2;
+    hdr.payload_size = (uint16_t)sizeof(JLPClientHelloV2);
 
-    JLPClientHello hello{};
-    // Use a syntactically-valid Bech32m-style worker name. The server does NOT
-    // try to spend rewards into this address during the handshake; it just
-    // records the worker identifier. Any value <64 bytes is accepted at the
-    // wire level. We pick a recognizable test string.
+    // v1.4.2 B.4: production wire layout is the 120-byte v2 payload.
+    JLPClientHelloV2 hello{};
     const char* worker = "bc1qtest000000000000000000000000000000qqqqq";
     std::memset(hello.worker_name, 0, sizeof(hello.worker_name));
     std::strncpy(hello.worker_name, worker, sizeof(hello.worker_name) - 1);
-    hello.gpu_count = 1;
-    hello.speed     = 1'000'000ULL;  // 1 MK/s, plausible for a CPU test bot
+    // password optional; leave zero-filled for unauthenticated test pool.
+    std::memset(hello.password, 0, sizeof(hello.password));
+    // Wall-clock in ms since epoch.
+    using namespace std::chrono;
+    hello.timestamp_ms = (uint64_t)duration_cast<milliseconds>(
+        system_clock::now().time_since_epoch()).count();
+    // Deterministic but uncoordinated nonce for the test bot.
+    for (int i = 0; i < 16; ++i) {
+        hello.nonce[i] = (uint8_t)((hello.timestamp_ms >> (i * 3)) ^ (0xA5 + i));
+    }
 
     if (SSL_write(ssl, &hdr, sizeof(hdr)) != (int)sizeof(hdr)) {
         fprintf(stderr, "[fail] short write on header\n");

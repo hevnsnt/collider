@@ -95,12 +95,10 @@ inline bool hex_decode(const char* hex, size_t hex_len,
 // [start=2^(N-1), end=2^N - 1], so size = end - start + 1 = 2^(N-1)
 // and bit_length = N. Without the +1 the function returned N-1 for
 // every puzzle, mis-sizing the kangaroo solver's K-factor budget.
-//
 // Returns 0 if end < start (inverted range) or end == start (a
 // single-key range; the helper rejects that since a 1-key range
 // can't be solved by Kangaroo). Used by CudaRCKangarooBackend::
 // initialize() in place of the pre-1.4 hardcoded 135.
-//
 // KAT coverage: tests/test_range_bits.cpp pins puzzles 75/135/160.
 inline int range_bits_from_be(const uint8_t start_be[32],
                               const uint8_t end_be[32]) {

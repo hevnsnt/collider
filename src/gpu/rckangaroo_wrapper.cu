@@ -9,6 +9,14 @@
 
 #include "rckangaroo_wrapper.hpp"
 #include "../core/byte_codec.hpp"
+// Q-T1.1 inversion (2026-05-17): formerly #include
+// "../runtime/runtime_control.hpp" purely for the kMaxGpus constant used
+// in the static_assert below. The constant is now owned by the gpu layer
+// (gpu_caps.hpp::kMaxDispatchableGpus); runtime_control.hpp pulls it back
+// in and binds RuntimeControlState::kMaxGpus to it via a static_assert,
+// so the two stay locked while this file no longer reaches up into the
+// runtime layer for an integer.
+#include "gpu_caps.hpp"
 #include "hash_rounds.cuh"
 
 #include <iostream>
@@ -19,6 +27,18 @@
 #include <chrono>
 #include <mutex>
 #include <iomanip>
+#include <filesystem>   // T0.2: atomic tmp+rename for save_herd_state
+#include <system_error> // std::error_code on the rename path
+
+#ifdef _WIN32
+    // _commit() is the Windows equivalent of POSIX fsync(): flushes the
+    // OS write cache for a given fd. Only used in save_herd_state() so
+    // a power loss between tmp-write and rename does not leave behind a
+    // .kang.tmp whose tail is in the OS cache but not yet on disk.
+    #include <io.h>
+#else
+    #include <unistd.h>
+#endif
 
 // RCKangaroo headers
 #include "defs.h"
@@ -27,6 +47,16 @@
 #include "utils.h"
 
 #include "cuda_runtime.h"
+
+// T4.8: keep the RCKangaroo upper bound aligned with the runtime's
+// per-GPU phase-array bound. If a future edit nudges either constant,
+// the build fails here rather than silently leaving one of the two
+// array sizes wrong.
+static_assert(MAX_GPU_CNT == ::collider::gpu::kMaxDispatchableGpus,
+              "MAX_GPU_CNT (third_party/RCKangaroo/defs.h) must equal "
+              "gpu::kMaxDispatchableGpus (src/gpu/gpu_caps.hpp). "
+              "RuntimeControlState::kMaxGpus is bound to the same constant; "
+              "update third_party/RCKangaroo/defs.h alongside gpu_caps.hpp.");
 
 // Global variables required by RCKangaroo (defined in RCKangaroo.cpp but we use our wrapper)
 bool gGenMode = false;      // Tames generation mode
@@ -55,7 +85,7 @@ static const uint32_t SHA256_K[64] = {
     0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
 };
 
-// v1.4.1 D.2: rotr now lives in hash_rounds.cuh (host+device).
+// rotr now lives in hash_rounds.cuh (host+device).
 // rotl32 stays local because it's only used by the inline RIPEMD-160
 // implementation below; RIPEMD's left-rotate is unified in
 // ripemd160_device.cuh in a follow-up task.
@@ -345,7 +375,6 @@ static std::function<void(const uint8_t*, const uint8_t*, uint8_t)> s_dp_callbac
 
 // ============================================================================
 // Process-singleton state.
-//
 // RCKangaroo's third_party/RCKangaroo/GpuKang.cpp declares
 // `void AddPointsToList(u32*, int, u64)` as an extern free function at
 // line 16 and calls it from the kernel-completion path at line 472 with
@@ -356,7 +385,6 @@ static std::function<void(const uint8_t*, const uint8_t*, uint8_t)> s_dp_callbac
 //   (a) forking RCKangaroo to add a context pointer to its API, or
 //   (b) routing through a static "active instance" pointer that is
 //       just a global by another name.
-//
 // We instead enforce the implicit singleton contract via
 // g_active_instance_ + an atomic check in RCKangarooManager's
 // constructor: a second instance fails loudly rather than silently
@@ -364,8 +392,7 @@ static std::function<void(const uint8_t*, const uint8_t*, uint8_t)> s_dp_callbac
 // their internal-linkage scope clearer to readers; they remain file-
 // scope because that is the only way to satisfy GpuKang.cpp's link
 // surface.
-//
-// v1.4.0 audit finding: process-globals are a known hazard pattern;
+// audit finding: process-globals are a known hazard pattern;
 // the singleton guard converts that hazard into a deterministic crash
 // on misuse rather than data corruption. Full encapsulation requires
 // patching third_party/RCKangaroo to thread a context pointer through
@@ -667,6 +694,26 @@ struct RCKangarooManager::Impl {
     int current_speed = 0;
     bool initialized = false;
 
+    // herd save/load buffers. save_bufs holds one
+    // host-side cudaMemcpy destination per GPU, sized KangCnt * 96. They
+    // get armed onto s_GpuKangs[i]->SaveKangsHost before solve() runs.
+    // load_bufs holds parsed file contents and gets armed onto
+    // s_GpuKangs[i]->InitKangsHost. Both are cleared after solve()
+    // returns OR after save_herd_state writes the file. Sized for at
+    // most MAX_GPU_CNT entries; only the first num_active_gpus are used.
+    std::vector<std::vector<uint8_t>> save_bufs;
+    std::vector<std::vector<uint8_t>> load_bufs;
+    bool save_armed = false;
+    bool load_armed = false;
+    // Saved at solve() entry for use by save_herd_state's config_hash
+    // field. The hash binds the on-disk state to a specific target so
+    // that loading state from puzzle 75 against puzzle 80 fails fast
+    // rather than silently corrupting the run.
+    int saved_range_bits = 0;
+    int saved_dp_bits = 0;
+    std::string saved_pubkey_hex;
+    std::string saved_start_hex;
+
     ~Impl() {
         cleanup();
     }
@@ -757,6 +804,44 @@ int RCKangarooManager::init(const std::vector<int>& gpu_ids) {
             if (!found) continue;
         }
 
+        // T2.2: cudaSetDeviceFlags MUST run BEFORE any CUDA context
+        // exists on device `i`. Per the CUDA Runtime API contract
+        // (cudaSetDeviceFlags docs): "If the current device has been
+        // set and that device has already been initialized then this
+        // call will fail with the error cudaErrorSetOnActiveProcess."
+        // The pre-fix code called this AFTER cudaSetDevice(i), which
+        // implicitly creates the context, so the flag-set was a no-op
+        // returning cudaErrorSetOnActiveProcess silently (return value
+        // was never checked). Move the flag-set to BEFORE cudaSetDevice
+        // and log any non-success return so the operator sees ordering
+        // violations introduced by future init reordering. We swallow
+        // cudaErrorSetOnActiveProcess (not a hard error -- means some
+        // other init path beat us to creating the context, e.g.
+        // secp256k1_init_table or a bench warmup); any other error is
+        // surfaced as a warning. Schedule policy is not required for
+        // correctness; this is purely a CPU-spin-vs-sleep hint to the
+        // CUDA runtime during synchronous waits. We continue past the
+        // failure either way.
+        cudaError_t flag_status = cudaSetDeviceFlags(
+            cudaDeviceScheduleBlockingSync);
+        if (flag_status != cudaSuccess &&
+            flag_status != cudaErrorSetOnActiveProcess) {
+            std::cerr << "[!] RCKangaroo: cudaSetDeviceFlags(BlockingSync) "
+                         "for GPU " << i << " returned "
+                      << cudaGetErrorString(flag_status)
+                      << "; continuing with default schedule policy.\n";
+            // Clear the sticky last-error so the next CUDA call's
+            // diagnostic isn't muddied by this non-fatal return.
+            cudaGetLastError();
+        } else if (flag_status == cudaErrorSetOnActiveProcess) {
+            // Expected when another init path (secp256k1 setup, a
+            // pre-flight benchmark, an earlier RCKangarooManager
+            // instance, etc.) has already created a context on this
+            // device. Clear the sticky error and move on; the device
+            // keeps whatever schedule flag it was first set with.
+            cudaGetLastError();
+        }
+
         cudaError_t status = cudaSetDevice(i);
         if (status != cudaSuccess) {
             std::cerr << "cudaSetDevice for GPU " << i << " failed" << std::endl;
@@ -776,7 +861,6 @@ int RCKangarooManager::init(const std::vector<int>& gpu_ids) {
             continue;
         }
 
-        cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync);
 
         s_GpuKangs[s_GpuCnt] = new RCGpuKang();
         s_GpuKangs[s_GpuCnt]->CudaIndex = i;
@@ -1116,6 +1200,50 @@ RCKangarooResult RCKangarooManager::solve() {
         }
     }
 
+    // arm herd save / load hooks on each GPU.
+    // Done AFTER Prepare so KangCnt is finalized, and BEFORE the worker
+    // threads start (kang_thr_proc calls Execute which is the only
+    // reader of InitKangsHost / writer of SaveKangsHost). The hooks are
+    // file-pointer hooks; the actual file I/O happens outside solve()
+    // in request_save_on_stop / save_herd_state / load_herd_state.
+    if (impl_->load_armed) {
+        for (int i = 0; i < s_GpuCnt; i++) {
+            const int kc = s_GpuKangs[i]->KangCnt;
+            if (i >= static_cast<int>(impl_->load_bufs.size())) break;
+            if (impl_->load_bufs[i].size() == static_cast<size_t>(kc) * 96) {
+                s_GpuKangs[i]->InitKangsHost = impl_->load_bufs[i].data();
+            } else {
+                std::cerr << "[!] RCKangaroo: load buffer size mismatch on GPU "
+                          << i << " (expected " << (kc * 96)
+                          << ", got " << impl_->load_bufs[i].size() << "). "
+                             "Falling back to random init for this GPU.\n";
+                s_GpuKangs[i]->InitKangsHost = nullptr;
+            }
+        }
+    }
+    if (impl_->save_armed) {
+        // Allocate save buffers sized to each GPU's KangCnt. Each GPU's
+        // KangCnt depends on its mpCnt and IsOldGpu, so they may differ
+        // across heterogeneous configurations; size each buffer
+        // independently rather than assuming uniformity.
+        impl_->save_bufs.resize(s_GpuCnt);
+        for (int i = 0; i < s_GpuCnt; i++) {
+            const int kc = s_GpuKangs[i]->KangCnt;
+            impl_->save_bufs[i].assign(static_cast<size_t>(kc) * 96, 0);
+            s_GpuKangs[i]->SaveKangsHost = impl_->save_bufs[i].data();
+        }
+    }
+    // Capture the config parameters that go into the on-disk fingerprint.
+    impl_->saved_range_bits = Range;
+    impl_->saved_dp_bits = DP;
+    {
+        char pubhex[200];
+        impl_->target_pubkey.x.GetHexStr(pubhex);
+        impl_->saved_pubkey_hex = pubhex;
+        impl_->start_offset.GetHexStr(pubhex);
+        impl_->saved_start_hex = pubhex;
+    }
+
     auto start_time = std::chrono::steady_clock::now();
     std::cout << "GPUs started..." << std::endl;
 
@@ -1291,6 +1419,332 @@ bool RCKangarooManager::load_bloom_filter(const std::string& filename) {
 
 uint64_t RCKangarooManager::get_bloom_checks() const {
     return s_bloom_checks.load();
+}
+
+// ============================================================================
+// herd save / load
+// ============================================================================
+// File format documented in third_party/RCKangaroo/.patches/save-load-state.patch.
+// Reads/writes match the cudaMemcpy device-buffer layout byte-for-byte (96
+// bytes per kangaroo: x[32] || y[32] || priv[32]). The "fingerprint" header
+// fields bind the file to a specific config so that loading a checkpoint
+// from a different puzzle / range / dp_bits fails fast.
+
+namespace {
+
+constexpr char kRckHerdMagic[16] = {
+    'C','O','L','L','I','D','E','R','_','R','C','K','\x01','\x00','\x00','\x00'
+};
+constexpr uint32_t kRckHerdVersion = 1u;
+constexpr size_t   kRckBytesPerKangaroo = 96;
+
+inline void write_u32_le(uint8_t* dst, uint32_t v) {
+    dst[0] = static_cast<uint8_t>(v & 0xFF);
+    dst[1] = static_cast<uint8_t>((v >> 8) & 0xFF);
+    dst[2] = static_cast<uint8_t>((v >> 16) & 0xFF);
+    dst[3] = static_cast<uint8_t>((v >> 24) & 0xFF);
+}
+inline uint32_t read_u32_le(const uint8_t* src) {
+    return static_cast<uint32_t>(src[0])
+         | (static_cast<uint32_t>(src[1]) << 8)
+         | (static_cast<uint32_t>(src[2]) << 16)
+         | (static_cast<uint32_t>(src[3]) << 24);
+}
+
+// Compute 32-byte SHA256 over (pubkey_hex || '|' || start_hex). The
+// '|' separator prevents ambiguity if either field is empty (otherwise
+// "abc" + "" and "ab" + "c" would hash to the same string).
+void compute_config_hash(const std::string& pubkey_hex,
+                         const std::string& start_hex,
+                         uint8_t out[32]) {
+    std::string combined = pubkey_hex;
+    combined.push_back('|');
+    combined += start_hex;
+    cpu_sha256(reinterpret_cast<const uint8_t*>(combined.data()),
+               combined.size(), out);
+}
+
+}  // namespace
+
+bool RCKangarooManager::request_save_on_stop() {
+    if (s_GpuCnt == 0) {
+        std::cerr << "[!] RCKangaroo: request_save_on_stop called before "
+                     "init(); ignored.\n";
+        return false;
+    }
+    impl_->save_armed = true;
+    return true;
+}
+
+bool RCKangarooManager::save_herd_state(const std::string& path) {
+    if (s_GpuCnt == 0) return false;
+    if (!impl_->save_armed) {
+        std::cerr << "[!] RCKangaroo: save_herd_state called without prior "
+                     "request_save_on_stop(); nothing to write.\n";
+        return false;
+    }
+    if (impl_->save_bufs.size() != static_cast<size_t>(s_GpuCnt)) {
+        // solve() never ran to completion; save buffers are not populated.
+        return false;
+    }
+
+    // Validate every per-GPU buffer is properly sized. A zero-size buffer
+    // indicates the GPU was marked Failed during Prepare and the patch's
+    // save hook never fired.
+    for (int i = 0; i < s_GpuCnt; i++) {
+        const int kc = s_GpuKangs[i]->KangCnt;
+        if (impl_->save_bufs[i].size() != static_cast<size_t>(kc) * kRckBytesPerKangaroo) {
+            std::cerr << "[!] RCKangaroo: save buffer for GPU " << i
+                      << " has unexpected size; aborting save.\n";
+            return false;
+        }
+    }
+
+    // T0.2: atomic tmp+rename save. The pre-fix path wrote directly to
+    // `path` with fopen/fwrite/fclose; a SIGINT, power loss, or kernel
+    // panic between the first fwrite() and the final fclose() would
+    // leave a truncated .kang file on disk. load_herd_state() then
+    // rejects it on the header check, the operator restarts, and the
+    // herd starts over from scratch -- potentially throwing away days
+    // of kangaroo work. Mirror BrainWalletStateManager::save_state's
+    // contract:
+    //
+    //   1. Write the full payload to "<path>.tmp".
+    //   2. fflush() + fsync() (POSIX) / _commit() (Windows) so the OS
+    //      cache is on stable storage before the rename.
+    //   3. std::filesystem::rename("<path>.tmp", path). POSIX rename is
+    //      atomic against concurrent readers; Windows rename overwrites
+    //      iff we remove the target first (handled below) and is
+    //      atomic at the filesystem-metadata level.
+    //
+    // On any write/flush/sync failure we close the temp fp, remove the
+    // partial .tmp, and return false. The previous primary .kang (if
+    // any) is unchanged -- load_herd_state will still find it.
+    namespace fs = std::filesystem;
+    const fs::path final_path(path);
+    fs::path tmp_path = final_path;
+    tmp_path += ".tmp";
+
+    FILE* fp = std::fopen(tmp_path.string().c_str(), "wb");
+    if (!fp) {
+        std::cerr << "[!] RCKangaroo: failed to open " << tmp_path.string()
+                  << " for save.\n";
+        return false;
+    }
+
+    // Helper for the unwind path: close fp (if still open) and unlink
+    // the partial tmp so it does not accumulate on disk across retries.
+    auto unwind = [&fp, &tmp_path](const char* where) -> bool {
+        if (fp) {
+            std::fclose(fp);
+            fp = nullptr;
+        }
+        std::error_code rm_ec;
+        fs::remove(tmp_path, rm_ec);
+        std::cerr << "[!] RCKangaroo: " << where << " failed during atomic "
+                     "save; partial " << tmp_path.string() << " removed.\n";
+        return false;
+    };
+
+    // Header.
+    if (std::fwrite(kRckHerdMagic, 1, 16, fp) != 16) {
+        return unwind("magic write");
+    }
+    uint8_t hdr_nums[20];
+    write_u32_le(hdr_nums + 0,  kRckHerdVersion);
+    write_u32_le(hdr_nums + 4,  static_cast<uint32_t>(s_GpuCnt));
+    write_u32_le(hdr_nums + 8,  static_cast<uint32_t>(s_GpuKangs[0]->KangCnt));
+    write_u32_le(hdr_nums + 12, static_cast<uint32_t>(impl_->saved_range_bits));
+    write_u32_le(hdr_nums + 16, static_cast<uint32_t>(impl_->saved_dp_bits));
+    if (std::fwrite(hdr_nums, 1, sizeof(hdr_nums), fp) != sizeof(hdr_nums)) {
+        return unwind("header write");
+    }
+    uint8_t config_hash[32];
+    compute_config_hash(impl_->saved_pubkey_hex, impl_->saved_start_hex,
+                        config_hash);
+    if (std::fwrite(config_hash, 1, 32, fp) != 32) {
+        return unwind("config-hash write");
+    }
+
+    // Per-GPU body.
+    for (int i = 0; i < s_GpuCnt; i++) {
+        uint8_t gpu_hdr[8];
+        write_u32_le(gpu_hdr + 0, static_cast<uint32_t>(s_GpuKangs[i]->CudaIndex));
+        write_u32_le(gpu_hdr + 4, 0);  // reserved
+        if (std::fwrite(gpu_hdr, 1, sizeof(gpu_hdr), fp) != sizeof(gpu_hdr)) {
+            return unwind("gpu header write");
+        }
+        const auto& buf = impl_->save_bufs[i];
+        if (std::fwrite(buf.data(), 1, buf.size(), fp) != buf.size()) {
+            return unwind("gpu body write");
+        }
+    }
+
+    // Flush libc -> OS, then sync OS -> disk before we close fp. Doing
+    // the sync BEFORE fclose() means we still have a usable fd to pass
+    // to fsync / _commit; reopening the file by name to sync (the way
+    // BrainWalletStateManager::save_state does on POSIX) would race
+    // with any concurrent unlink and skipping the sync on Windows
+    // entirely (the way that header used to) leaves a power-loss race
+    // open. Here we always sync before rename.
+    if (std::fflush(fp) != 0) {
+        return unwind("fflush");
+    }
+#ifdef _WIN32
+    // _commit returns 0 on success, -1 on failure. Failure means the
+    // OS cache flush did not complete; aborting the save is the safe
+    // option since the rename below would race with the unflushed
+    // cache on a power-loss restart.
+    if (_commit(_fileno(fp)) != 0) {
+        return unwind("_commit");
+    }
+#else
+    if (::fsync(::fileno(fp)) != 0) {
+        return unwind("fsync");
+    }
+#endif
+
+    std::fclose(fp);
+    fp = nullptr;
+
+    // Atomic rename: tmp -> final. On POSIX rename(2) is atomic against
+    // concurrent readers and replaces an existing target. On Windows
+    // std::filesystem::rename throws if the target exists, so remove it
+    // first; the gap between remove() and rename() is small but not
+    // zero -- a power loss in that window leaves the old .kang gone
+    // and the .kang.tmp still on disk under its tmp name. load_herd_state
+    // will then return false ("file not found"), the operator restarts
+    // herd-from-scratch, and the .kang.tmp can be manually renamed if
+    // the operator wants to recover it. This is strictly better than
+    // the pre-fix behaviour (partial .kang silently rejected at load).
+    std::error_code ec;
+    fs::rename(tmp_path, final_path, ec);
+    if (ec) {
+        // Most-common reason on Windows is "destination exists"; retry
+        // after explicit remove. We accept the small remove+rename
+        // window described above.
+        std::error_code rm_ec;
+        fs::remove(final_path, rm_ec);
+        ec.clear();
+        fs::rename(tmp_path, final_path, ec);
+        if (ec) {
+            std::cerr << "[!] RCKangaroo: rename " << tmp_path.string()
+                      << " -> " << final_path.string()
+                      << " failed: " << ec.message()
+                      << "; previous .kang (if any) may be lost.\n";
+            // Leave .tmp on disk so the operator can manually recover.
+            return false;
+        }
+    }
+
+    // Clear the SaveKangsHost pointers so a subsequent solve() without
+    // a fresh request_save_on_stop() does not silently overwrite the
+    // buffers (they are still owned by impl_ but the hooks are off).
+    for (int i = 0; i < s_GpuCnt; i++) {
+        s_GpuKangs[i]->SaveKangsHost = nullptr;
+    }
+    impl_->save_armed = false;
+    return true;
+}
+
+bool RCKangarooManager::load_herd_state(const std::string& path) {
+    if (s_GpuCnt == 0) {
+        std::cerr << "[!] RCKangaroo: load_herd_state called before init(); "
+                     "ignoring.\n";
+        return false;
+    }
+
+    FILE* fp = std::fopen(path.c_str(), "rb");
+    if (!fp) return false;
+
+    uint8_t magic[16];
+    if (std::fread(magic, 1, 16, fp) != 16) {
+        std::fclose(fp); return false;
+    }
+    if (std::memcmp(magic, kRckHerdMagic, 16) != 0) {
+        std::cerr << "[!] RCKangaroo: " << path << " magic mismatch; not a "
+                     "kangaroo herd checkpoint.\n";
+        std::fclose(fp); return false;
+    }
+
+    uint8_t hdr_nums[20];
+    if (std::fread(hdr_nums, 1, sizeof(hdr_nums), fp) != sizeof(hdr_nums)) {
+        std::fclose(fp); return false;
+    }
+    const uint32_t file_version    = read_u32_le(hdr_nums + 0);
+    const uint32_t file_gpus       = read_u32_le(hdr_nums + 4);
+    const uint32_t file_kang_cnt   = read_u32_le(hdr_nums + 8);
+    const uint32_t file_range_bits = read_u32_le(hdr_nums + 12);
+    const uint32_t file_dp_bits    = read_u32_le(hdr_nums + 16);
+
+    if (file_version != kRckHerdVersion) {
+        std::cerr << "[!] RCKangaroo: checkpoint version " << file_version
+                  << " unsupported (expected " << kRckHerdVersion << ").\n";
+        std::fclose(fp); return false;
+    }
+    if (file_gpus != static_cast<uint32_t>(s_GpuCnt)) {
+        std::cerr << "[!] RCKangaroo: checkpoint has " << file_gpus
+                  << " GPUs but current run has " << s_GpuCnt
+                  << "; refusing to load.\n";
+        std::fclose(fp); return false;
+    }
+    if (file_kang_cnt != static_cast<uint32_t>(s_GpuKangs[0]->KangCnt)) {
+        std::cerr << "[!] RCKangaroo: checkpoint KangCnt " << file_kang_cnt
+                  << " does not match current " << s_GpuKangs[0]->KangCnt
+                  << " (GPU model change?); refusing to load.\n";
+        std::fclose(fp); return false;
+    }
+    if (file_range_bits != static_cast<uint32_t>(range_bits)) {
+        std::cerr << "[!] RCKangaroo: checkpoint range_bits " << file_range_bits
+                  << " does not match current " << range_bits
+                  << "; refusing to load.\n";
+        std::fclose(fp); return false;
+    }
+    if (file_dp_bits != static_cast<uint32_t>(dp_bits)) {
+        std::cerr << "[!] RCKangaroo: checkpoint dp_bits " << file_dp_bits
+                  << " does not match current " << dp_bits
+                  << "; refusing to load.\n";
+        std::fclose(fp); return false;
+    }
+
+    uint8_t file_config_hash[32];
+    if (std::fread(file_config_hash, 1, 32, fp) != 32) {
+        std::fclose(fp); return false;
+    }
+    char pubhex[200], starthex[200];
+    impl_->target_pubkey.x.GetHexStr(pubhex);
+    impl_->start_offset.GetHexStr(starthex);
+    uint8_t expected_config_hash[32];
+    compute_config_hash(pubhex, starthex, expected_config_hash);
+    if (std::memcmp(file_config_hash, expected_config_hash, 32) != 0) {
+        std::cerr << "[!] RCKangaroo: checkpoint config fingerprint does not "
+                     "match current target pubkey + range_start; refusing to "
+                     "load.\n";
+        std::fclose(fp); return false;
+    }
+
+    // Per-GPU body.
+    impl_->load_bufs.assign(s_GpuCnt, std::vector<uint8_t>{});
+    for (int i = 0; i < s_GpuCnt; i++) {
+        uint8_t gpu_hdr[8];
+        if (std::fread(gpu_hdr, 1, sizeof(gpu_hdr), fp) != sizeof(gpu_hdr)) {
+            std::fclose(fp); return false;
+        }
+        // cuda_index in gpu_hdr is informational; GPU renumbering between
+        // runs is tolerated (the order in the file is the order they
+        // appear in s_GpuKangs).
+
+        const size_t body_size = static_cast<size_t>(file_kang_cnt)
+                                 * kRckBytesPerKangaroo;
+        impl_->load_bufs[i].resize(body_size);
+        if (std::fread(impl_->load_bufs[i].data(), 1, body_size, fp) != body_size) {
+            std::fclose(fp); return false;
+        }
+    }
+    std::fclose(fp);
+
+    impl_->load_armed = true;
+    return true;
 }
 
 std::string private_key_to_hex(const std::array<uint64_t, 4>& key) {

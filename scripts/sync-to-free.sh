@@ -56,10 +56,68 @@ PRO_PATHS=(
     "src/license/"
     "src/rules/"            # gpu_rules.hpp lives here in our tree
     "src/scrapers/"         # lyrics/quotes scrapers for brain wallet
-    "src/runtime/brain_wallet_runner.hpp"   # v1.4.1 A.3: PRO-only TU
-    "src/runtime/brain_wallet_runner.cpp"   # v1.4.1 A.3: PRO-only TU
-    "src/gpu/mega_fused_kernel.cu"
-    "src/gpu/mega_fused_kernel.hpp"
+
+    # Brain-wallet state persistence (save/resume across runs). No
+    # #ifdef guard but has no free equivalent and is only included by
+    # brain_wallet_runner (excluded below) and brain_wallet_setup.
+    "src/core/brainwallet_state.hpp"
+
+    "src/runtime/brain_wallet_runner.hpp"
+    "src/runtime/brain_wallet_runner.cpp"
+
+    # First-run brain-wallet setup wizard (runtime variant). Pulls in
+    # src/generators/streaming_brain_wallet.hpp (excluded via generators/)
+    # and src/runtime/scan_state.hpp (excluded below). Shipping either
+    # file to Free would break the Free build on its first inclusion.
+    "src/runtime/brain_wallet_setup.hpp"
+    "src/runtime/brain_wallet_setup.cpp"
+
+    # License gate: pre-dispatch activation + startup validation. Whole
+    # TU is COLLIDER_PRO-only (consumes src/license/license_check.hpp,
+    # which is itself excluded via the src/license/ prefix above). Without
+    # explicit entries here the next sync would publish the orchestration
+    # source AND break the Free build (license_gate.cpp would reference
+    # the missing license_check.hpp).
+    "src/runtime/license_gate.hpp"
+    "src/runtime/license_gate.cpp"
+
+    # First-run brainwallet setup wizard. Pulls in src/generators/pcfg.hpp
+    # (excluded via the src/generators/ prefix), so leaving this in the
+    # Free tree would break Free compilation. Pro-only by content.
+    "src/ui/brainwallet_setup.hpp"
+
+    # Brain-wallet TUI infrastructure (added during brainwallet TUI
+    # overhaul). These are consumed exclusively by brain_wallet_runner;
+    # main.cpp, puzzle_solver.cpp, and pool_solver.cpp do not include
+    # them. Verified by grep at sync-script extension time.
+    "src/runtime/scan_state.hpp"
+    "src/runtime/runtime_control.hpp"
+    "src/runtime/runtime_config_yaml.hpp"
+    "src/runtime/runtime_config_yaml.cpp"
+    "src/runtime/perf_instrumentation.hpp"
+    "src/runtime/perf_instrumentation.cpp"
+    "src/runtime/empty_hit_writer.hpp"
+    "src/runtime/empty_hit_writer.cpp"
+
+    # Subprocess plugin runner: PRO-only feature wired into brain-wallet
+    # pipeline (hit-feed plugins for Slack notify, balance enrich, etc.).
+    "src/plugins/"
+
+    # Brain-wallet multi-panel FTXUI interface
+    "src/ui/tui/"
+
+    # v2 multi-scheme weak-PRNG kernel (Milk Sad, Profanity, Trust Wallet)
+    "src/gpu/v2/"
+
+    # GPU telemetry: NVML wrapper + Metal IOReport reach-around. These
+    # power the brain-wallet GPU panel (fan, power, temp, clock). Not
+    # used by Free puzzle/pool modes.
+    "src/platform/nvml_query.hpp"
+    "src/platform/nvml_query.cpp"
+    "src/platform/gpu_telemetry.hpp"
+    "src/platform/gpu_telemetry_cuda.cpp"
+    "src/platform/gpu_telemetry_metal.mm"
+
     "src/gpu/brain_wallet_gpu.cpp"
     "src/gpu/brain_wallet_gpu.hpp"
     "src/gpu/gpu_rules.cpp"
@@ -69,7 +127,6 @@ PRO_PATHS=(
     "src/gpu/h160_bloom_filter.cu"
     "src/gpu/bloom_filter.cu"
     "src/gpu/fused_pipeline.cu"
-    "src/gpu/pipeline.cu"
 
     # Brain-wallet rule files + scraper outputs at repo root
     "rules/"
@@ -111,6 +168,14 @@ PRO_PATHS=(
     "*_hits.txt"
     "utxodump.csv"
     "funded_addresses.blf"
+
+    # Pro-side CI plumbing: these workflows orchestrate the pro->free
+    # sync itself and the JLP protocol push to collision-protocol.
+    # They have no place in the free repo (no source repo to pull from,
+    # no SYNC_DEPLOY_KEY secret), and leaving them on the free side
+    # would also re-trigger sync-free.yml on every tag pushed to free.
+    ".github/workflows/sync-free.yml"
+    ".github/workflows/sync-protocol.yml"
 )
 
 # -----------------------------------------------------------------------------
@@ -142,6 +207,75 @@ PRESERVE_PATHS=(
 )
 
 # -----------------------------------------------------------------------------
+# Orphan paths -- files that EXIST in the public Free repo today but should
+# NOT be there. Two reasons these survived:
+#
+#   1. The Free repo was bootstrapped in v1.2.0 by a manual upload that
+#      shipped internal planning docs (TODO.md from "thePuzzler" era,
+#      IMPLEMENTATION-PLAN.md from "Superflayer" era, research notes,
+#      strategy memos). None of them are linked from README, and the
+#      content references retired project codenames -- they cannot stay.
+#
+#   2. Some files were deleted from Pro (e.g. src/pool/http_pool_client.*
+#      removed for silently leaking credentials when scheme was https://)
+#      but the deletion never propagated because no prior sync ran.
+#
+# The wipe-and-copy at line ~238 SHOULD remove these implicitly (Free is
+# wiped, only files present in Pro's `git ls-files` get re-copied). This
+# list is defense-in-depth: an explicit kill list of known orphans so
+# (a) the sync's intent is auditable, (b) we get a log line per orphan
+# removed, and (c) any future regression in the wipe step still produces
+# a clean Free tree.
+#
+# Entries are paths relative to the Free repo root. Add to this list
+# rather than silently relying on the wipe; remove an entry only when
+# the orphan no longer exists in Free's HEAD (i.e. a prior sync removed
+# it cleanly).
+# -----------------------------------------------------------------------------
+ORPHAN_PATHS=(
+    # Internal planning docs -- never belonged in public Free repo.
+    # Leak old project codenames "thePuzzler" / "Superflayer" and pre-
+    # launch strategy. Verified 2026-05-17: none are linked from README,
+    # none are in Pro's docs/ tree.
+    "docs/TODO.md"
+    "docs/IMPLEMENTATION-PLAN.md"
+    "docs/RESEARCH.md"
+    "docs/COMPREHENSIVE-ANALYSIS.md"
+    "docs/BITCOIN-PUZZLE-DEEP-RESEARCH.md"
+    "docs/BITCOIN-PUZZLE-STRATEGY.md"
+    "docs/LANGUAGE-DECISION.md"
+    "docs/DEFCON-STRATEGIES.md"
+    "docs/KANGAROO-IMPLEMENTATION-GUIDE.md"
+    "docs/PERFORMANCE-TARGETS.md"
+    "docs/POOL-ECONOMICS.md"
+    "docs/pool-research.md"
+
+    # USAGE.md opens with "thePuzzler" branding and is not part of the
+    # current Pro docs suite (the v1.4.x README links INSTALL.md +
+    # CONFIGURATION.md + POOL.md instead of a monolithic USAGE.md).
+    "docs/USAGE.md"
+
+    # PRO-FEATURES.md was the v1.4.0-era Pro pitch page. Superseded by
+    # Pro's docs/PRO.md (which the sync will copy in). Free's README
+    # already points at PRO.md after the next sync.
+    "docs/PRO-FEATURES.md"
+
+    # Root-level security audit report from a 2026-Q1 internal review.
+    # Not appropriate for the public repo (references unfixed-at-time-of-
+    # writing issues that have since been patched). Tracked in Free HEAD
+    # but already removed from the working tree.
+    "SECURITY-AUDIT-REPORT.md"
+
+    # http_pool_client.{cpp,hpp} were deleted from Pro because the HTTP
+    # transport silently downgraded https:// pool URLs (CHANGELOG entry
+    # for that deletion is correct; the deletion just never reached Free
+    # because no prior sync ran). Listing them explicitly so the kill is
+    # visible in the sync log.
+    "src/pool/http_pool_client.cpp"
+    "src/pool/http_pool_client.hpp"
+)
+
+# -----------------------------------------------------------------------------
 
 if [[ $# -ne 1 ]]; then
     echo "usage: $0 <version-tag>" >&2
@@ -169,6 +303,9 @@ echo "[sync] cloning public free repo (depth 1)..."
 git clone --depth 1 "$PUBLIC_URL" "$WORK/free" >/dev/null 2>&1
 
 cd "$WORK/free"
+
+git config user.email "hevnsnt@gmail.com"
+git config user.name  "Bill Swearingen"
 
 # -----------------------------------------------------------------------------
 # Snapshot the public-only files we must preserve.
@@ -259,6 +396,24 @@ done
 echo "[sync] restored $restored_count public-only path(s)"
 
 # -----------------------------------------------------------------------------
+# Orphan removal: explicitly delete files that should never appear in Free.
+# The wipe-and-copy normally takes care of this implicitly (anything not in
+# Pro's `git ls-files` does not get re-copied), but we run the explicit kill
+# anyway so (1) the sync log shows what was removed by name, (2) we get a
+# loud signal if a known orphan reappears, and (3) defense-in-depth against
+# any future change to the wipe logic.
+# -----------------------------------------------------------------------------
+orphan_removed=0
+for p in "${ORPHAN_PATHS[@]}"; do
+    if [[ -e "$p" ]]; then
+        rm -rf "$p"
+        echo "[sync] removed orphan: $p"
+        orphan_removed=$((orphan_removed + 1))
+    fi
+done
+echo "[sync] removed $orphan_removed orphan path(s) of ${#ORPHAN_PATHS[@]} listed"
+
+# -----------------------------------------------------------------------------
 # Defense-in-depth: prove no Pro source file slipped through. If any
 # survive, abort BEFORE pushing.
 # -----------------------------------------------------------------------------
@@ -285,9 +440,7 @@ git add -A
 if git diff --cached --quiet; then
     echo "[sync] no content changes vs current free HEAD; skipping commit"
 else
-    git -c user.email=hevnsnt@gmail.com \
-        -c user.name="Bill Swearingen" \
-        commit -m "Sync free release $TAG (private $PRIVATE_HEAD_SHORT)
+    git commit -m "Sync free release $TAG (private $PRIVATE_HEAD_SHORT)
 
 Generated by scripts/sync-to-free.sh from private commit
 $PRIVATE_HEAD. Pro-only paths (${#PRO_PATHS[@]} entries) excluded

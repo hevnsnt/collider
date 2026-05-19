@@ -48,11 +48,18 @@
 #include "core/logger.hpp"
 #include "core/puzzle_analysis.hpp"
 #include "core/puzzle_config.hpp"          // PuzzleDatabase (auto-enable smart pick)
+#include "core/session_log.hpp"             // collider::log::{init_session_log,
+                                            //   write_startup_banner,
+                                            //   install_crash_handler,
+                                            //   write_hardware_enum}
+#include "core/version.hpp"                 // collider::kVersion
 #include "core/yaml_config.hpp"
+#include "platform/platform.hpp"            // platform::DeviceInfo for hardware enum
 #include "runtime/gpu_detection.hpp"        // detect_gpus
 #include "runtime/pool_solver.hpp"
 #include "runtime/puzzle_solver.hpp"
 #include "runtime/runtime_globals.hpp"
+#include "ui/interactive.hpp"               // Interactive::display_header
 #include "ui/interactive_ui.hpp"
 #ifdef COLLIDER_PRO
 #include "runtime/brain_wallet_runner.hpp"
@@ -61,12 +68,11 @@
 #endif
 
 // ============================================================================
-// v1.4.1 A.3 refactor (commits 1/6 - 6/6) summary
+// A.3 refactor (commits 1/6 - 6/6) summary
 // ============================================================================
 // theCollider's mode runners and helpers all live in dedicated runtime
 // modules. main.cpp is the thin dispatcher: parse args -> license gate
 // (Pro) -> signal handler / logger init -> GPU detect -> mode dispatch.
-//
 //   - cli_parser.{hpp,cpp}       Arguments / parse_args / print_usage  (1)
 //   - ui/interactive_ui.{hpp,cpp} run_interactive_mode + submenus     (2)
 //   - runtime/pool_solver.{hpp,cpp}        run_pool_mode               (3)
@@ -84,14 +90,14 @@ using namespace collider;
 // event happens from the main thread once it observes g_shutdown == true.
 std::atomic<bool> g_shutdown{false};
 
-// Track-f F-03: captured signal number for delayed reporting from main
+// captured signal number for delayed reporting from main
 // thread. Set inside signal_handler (atomic store is async-signal-safe).
 // Read once after the main loop exits so the LOG_INFO is emitted from
 // non-signal context.
 std::atomic<int> g_shutdown_signal{0};
 std::atomic<bool> g_shutdown_logged{false};
 
-// Track-f F-03: invoked from main-thread context after the loop sees
+// invoked from main-thread context after the loop sees
 // g_shutdown==true. Performs the print + log emission that USED to live
 // in signal_handler (and self-deadlocked on Logger::mutex_ if SIGINT
 // arrived while a worker thread held the lock).
@@ -109,9 +115,17 @@ void emit_shutdown_message_from_main() {
     LOG_INFO("Signal received: " + std::to_string(signum) +
              " (SIGINT=" + std::to_string(SIGINT) +
              ", SIGTERM=" + std::to_string(SIGTERM) + ")");
+    // Session log: record the signal-driven shutdown alongside the
+    // legacy collider.log entry. Calling milestone() here is safe
+    // because emit_shutdown_message_from_main is documented to run
+    // from MAIN-thread context (NOT a signal handler); the runtime
+    // drivers all defer the call until they exit their solve loop.
+    collider::log::milestone(
+        "shutdown",
+        std::string("signal=") + std::to_string(signum));
 }
 
-// Track-f F-03 fix: async-signal-safe handler.
+// fix: async-signal-safe handler.
 // Per POSIX signal-safety(7), almost nothing in the C++ runtime is safe
 // to call from a signal handler. We do nothing but two atomic stores
 // (lock-free for std::atomic<int>/<bool> on every supported platform).
@@ -167,6 +181,14 @@ static void auto_enable_puzzle_mode_if_needed(Arguments& args) {
 int main(int argc, char* argv[]) {
     // Enable ANSI colors on Windows
     ui::enable_windows_ansi();
+
+    // Per-session log: opened BEFORE arg parsing so a parse_args crash
+    // or a malformed argv that triggers the fail-hard path inside the
+    // CLI still produces a session log entry. paths::collider_home()
+    // resolves to ~/.collider/ via env vars; the call is allocation-
+    // only at this point (no file I/O), so it is safe to invoke before
+    // signal handlers / loggers are installed.
+    collider::log::init_session_log();
 
     // Parse arguments. CLIFlags carries explicit per-arg "was set" bits,
     // populated inside parse_args at the moment argv supplied each value
@@ -241,7 +263,7 @@ int main(int argc, char* argv[]) {
     auto& logger = Logger::instance();
     try {
         if (logger.init()) {
-            LOG_INFO("Starting theCollider v1.4.0");
+            LOG_INFO(std::string("Starting theCollider v") + collider::kVersion);
         }
     } catch (const std::exception& e) {
         if (args.debug) std::cerr << "[DEBUG] Logger exception: " << e.what() << "\n" << std::flush;
@@ -250,10 +272,44 @@ int main(int argc, char* argv[]) {
     }
     if (args.debug) std::cout << "[DEBUG] Logger initialized\n" << std::flush;
 
+    // Session log: write the startup banner (version, build flags, argv
+    // with credentials redacted, cwd, config path), then arm the OS
+    // crash handler so a SEGV / SEH from this point on lands in
+    // ~/.collider/crash-<ts>.log with the latest session_state.json
+    // attached. Order matters: banner first because the crash handler
+    // pre-allocates its paths against the boot timestamp the sink
+    // captured at init_session_log().
+    collider::log::write_startup_banner(argc, argv, args);
+    collider::log::install_crash_handler();
+
     // Detect real GPU hardware. Body lives in runtime/gpu_detection.cpp.
     if (args.debug) std::cout << "[DEBUG] Detecting GPUs...\n" << std::flush;
     auto gpu_info = detect_gpus(args.gpu_ids);
     if (args.debug) std::cout << "[DEBUG] GPUs detected: " << gpu_info.device_count << "\n" << std::flush;
+
+    // Session log: capture the post-detection hardware enumeration. We
+    // re-query the platform layer directly rather than reusing the
+    // formatted strings inside GPUDetectionResult because the session
+    // log wants the structured per-device fields (SM major.minor, VRAM
+    // breakdown, multiprocessor count) that the human-facing summary
+    // collapses into a single "Nx Foo GPU" line. Best-effort: if
+    // platform init failed we skip silently; the banner already noted
+    // backend=CPU + device_count=1 in that case.
+    {
+        std::vector<collider::platform::DeviceInfo> devices;
+        try {
+            auto& plat = collider::platform::get_platform();
+            int total = plat.get_device_count();
+            for (int id : args.gpu_ids) {
+                if (id >= 0 && id < total) {
+                    devices.push_back(plat.get_device_info(id));
+                }
+            }
+        } catch (...) {
+            // Platform not initialized (CPU fallback path) -- skip.
+        }
+        collider::log::write_hardware_enum(devices);
+    }
 
     // INTERACTIVE MODE: when no command-line arguments provided.
     if (argc == 1) {
@@ -264,6 +320,11 @@ int main(int argc, char* argv[]) {
 
         if (args.exit_program) return 0;
         if (args.help) { print_usage(); return 0; }
+    } else {
+        // Direct CLI invocation: render the brand header so every mode shows
+        // the version banner, not just the interactive menu.
+        ui::Interactive::display_header("theCollider", collider::kVersion);
+        std::cout << "\n";
     }
 
     // ---- Mode dispatch -----------------------------------------------------

@@ -23,6 +23,12 @@
 #include <cuda_runtime.h>
 #include "../src/core/crypto_cpu.hpp"
 
+// v1.4.2 C-1 KAT: include the canonical MurmurHash3-128 used to BUILD the
+// bloom. The whole point of this test is that the GPU kernel's probe
+// matches the builder's insert. If anyone refactors fused_pipeline.cu's
+// bloom_check_inline back to a raw-bytes scheme, this test will fail.
+#include "../src/tools/utxo_bloom_builder.hpp"
+
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -39,32 +45,27 @@ extern "C" {
         uint32_t stride,
         const uint8_t* d_bloom_filter,
         uint64_t bloom_bits,
+        uint64_t bloom_mask,        // Tier 1 perf F-mask: see brain_wallet_gpu.hpp
         int bloom_hashes,
+        uint32_t bloom_seed,        // v1.4.2 C-1: MurmurHash3-128 seed
         uint32_t* d_match_indices,
         uint32_t* d_match_count,
         uint8_t* d_private_keys,
         size_t count,
-        cudaStream_t stream
+        cudaStream_t stream,
+        uint8_t multi_addr
     );
 }
 
 // =============================================================================
-// Host bloom helpers — MUST match bloom_check_inline in src/gpu/fused_pipeline.cu
-// (h1 = first 8 bytes LE, h2 = next 8 bytes LE, double-hash mod num_bits)
+// Host bloom helpers — use the SAME MurmurHash3-128 implementation that
+// utxo_bloom_builder.hpp uses when it writes a .blf, and that the kernel's
+// bloom_check_inline mirrors. Double-hash scheme: index_i = h1 + i*h2.
 // =============================================================================
 
-static void bloom_h1_h2(const uint8_t* h160, uint64_t& h1, uint64_t& h2) {
-    h1 = 0; h2 = 0;
-    for (int i = 0; i < 8; i++) {
-        h1 |= (uint64_t)h160[i]     << (i * 8);
-        h2 |= (uint64_t)h160[8 + i] << (i * 8);
-    }
-}
-
 static void bloom_insert(uint8_t* bloom, uint64_t bloom_bits, int num_hashes,
-                         const uint8_t* h160) {
-    uint64_t h1, h2;
-    bloom_h1_h2(h160, h1, h2);
+                         uint32_t seed, const uint8_t* h160) {
+    auto [h1, h2] = ::collider::utxo::murmurhash3_128(h160, 20, seed);
     for (int i = 0; i < num_hashes; i++) {
         uint64_t idx = (h1 + (uint64_t)i * h2) % bloom_bits;
         bloom[idx / 8] |= (uint8_t)(1u << (idx % 8));
@@ -72,9 +73,8 @@ static void bloom_insert(uint8_t* bloom, uint64_t bloom_bits, int num_hashes,
 }
 
 static bool bloom_probe_host(const uint8_t* bloom, uint64_t bloom_bits, int num_hashes,
-                             const uint8_t* h160) {
-    uint64_t h1, h2;
-    bloom_h1_h2(h160, h1, h2);
+                             uint32_t seed, const uint8_t* h160) {
+    auto [h1, h2] = ::collider::utxo::murmurhash3_128(h160, 20, seed);
     for (int i = 0; i < num_hashes; i++) {
         uint64_t idx = (h1 + (uint64_t)i * h2) % bloom_bits;
         if (!(bloom[idx / 8] & (1u << (idx % 8)))) return false;
@@ -139,16 +139,23 @@ int main() {
 
     // Step 3: build a bloom filter populated with all expected hash160s.
     // 8192 bits = 1 KB; FP rate negligible at N=16.
+    // v1.4.2 C-1: arbitrary distinctive seed -- the test only requires that
+    // the SAME seed is used for both insert and kernel-side probe. A seed
+    // that is NOT the historic 0x5F3759DF default catches "kernel hardcodes
+    // the old default" regressions.
     constexpr uint64_t BLOOM_BITS = 8192;
     constexpr int BLOOM_HASHES = 8;
+    constexpr uint32_t BLOOM_SEED = 0xDEADBEEFu;
     std::vector<uint8_t> bloom(BLOOM_BITS / 8, 0);
     for (size_t i = 0; i < N; i++) {
-        bloom_insert(bloom.data(), BLOOM_BITS, BLOOM_HASHES, expected_h160[i].data());
+        bloom_insert(bloom.data(), BLOOM_BITS, BLOOM_HASHES, BLOOM_SEED,
+                     expected_h160[i].data());
     }
 
     // Sanity: every expected h160 should now probe true on host
     for (size_t i = 0; i < N; i++) {
-        if (!bloom_probe_host(bloom.data(), BLOOM_BITS, BLOOM_HASHES, expected_h160[i].data())) {
+        if (!bloom_probe_host(bloom.data(), BLOOM_BITS, BLOOM_HASHES, BLOOM_SEED,
+                              expected_h160[i].data())) {
             fprintf(stderr, "INTERNAL ERROR: host bloom probe failed for entry %zu\n", i);
             return 2;
         }
@@ -185,13 +192,21 @@ int main() {
     cudaMemcpy(d_bloom,       bloom.data(),   bloom.size(),          cudaMemcpyHostToDevice);
     cudaMemset(d_match_cnt, 0, sizeof(uint32_t));
 
+    // Tier 1 perf F-mask: BLOOM_BITS == 8192 == 2^13 is a power of two,
+    // so the kernel uses the bitwise-AND fast path. Mask == bits - 1.
+    static_assert((BLOOM_BITS & (BLOOM_BITS - 1)) == 0,
+                  "Test bloom size must remain a power of two; otherwise "
+                  "switch BLOOM_MASK to 0 to exercise the modulo fallback.");
+    constexpr uint64_t BLOOM_MASK = BLOOM_BITS - 1;
     err = fused_brain_wallet_batch_fixed_stride(
         d_passphrases, d_lengths, STRIDE,
-        d_bloom, BLOOM_BITS, BLOOM_HASHES,
+        d_bloom, BLOOM_BITS, BLOOM_MASK, BLOOM_HASHES,
+        BLOOM_SEED,                       // v1.4.2 C-1
         d_match_idx, d_match_cnt,
         /*d_private_keys=*/nullptr,
         N,
-        /*stream=*/0
+        /*stream=*/0,
+        /*multi_addr=*/uint8_t{0}
     );
     if (err != cudaSuccess) {
         fprintf(stderr, "fused_brain_wallet_batch_fixed_stride failed: %s\n",
@@ -212,12 +227,18 @@ int main() {
     cudaFree(d_match_cnt);
 
     // Report
-    printf("=== GPU brain-wallet hash160 oracle test ===\n");
+    printf("=== GPU brain-wallet hash160 oracle test (v1.4.2 C-1 KAT) ===\n");
     printf("Passphrases: %zu\n", N);
-    printf("Matches:     %u (expected %zu)\n", match_count, N);
+    printf("Bloom seed:  0x%08x  (intentionally NOT the historic 0x5F3759DF default;\n"
+           "             catches kernels that ignore the .blf header seed)\n", BLOOM_SEED);
+    printf("Matches:     %u (expected exactly %zu)\n", match_count, N);
 
+    // v1.4.2 C-1: exact equality. match_count > N would indicate the bloom
+    // probe is accepting H160s that were never inserted -- e.g. a kernel
+    // that always returns true, or an off-by-one mask error.
     if ((size_t)match_count == N) {
-        printf("PASS: every passphrase produced the expected hash160 on the GPU.\n");
+        printf("PASS: every passphrase produced the expected hash160 on the GPU,\n"
+               "      and no spurious matches were reported.\n");
         return 0;
     } else {
         printf("FAIL: GPU produced wrong hash160 for %zu passphrases.\n",

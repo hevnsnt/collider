@@ -29,6 +29,7 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <vector>
 #include <atomic>
 #include <mutex>
@@ -41,6 +42,9 @@
 // header opens its own collider::gpu, which would nest if pulled in
 // inside an already-open namespace).
 #include "kangaroo_jump_table_size.hpp"
+
+// T1.6: shared pre-launch context-state probe.
+#include "cuda_helpers.hpp"
 
 // File-scope MSL boundary check: the Metal kernel hard-codes 32 via
 // #define KANGAROO_JUMP_TABLE_SIZE; if the host-side constant is ever
@@ -79,7 +83,20 @@ __device__ const uint64_t SECP256K1_P[4] = {
 #define JUMP_MASK  (NUM_JUMPS - 1)
 
 // DP check interval: batch convert to affine every N steps for correct DP detection
-// Using warp size (32) for efficient warp-cooperative batch inversion
+// Using warp size (32) for efficient warp-cooperative batch inversion.
+// This interval is ONLY consulted by the legacy Jacobian kernel
+// (kangaroo_step_kernel) which is a debug-only path. The production solver
+// uses kangaroo_step_kernel_sota / _jlp which check DP after every step
+// (affine pipeline, no batch-conversion cost).
+// The 32-step coarse interval is a known footgun for the legacy path: if
+// dp_bits is mis-tuned low (say 16) so the expected DP spacing is 2^16
+// steps, then 32 steps misses ~31/32 of the DPs that occur in the middle
+// of an interval. The legacy kernel is kept in tree solely for
+// regression-bisecting Jacobian-vs-affine kernel divergence; production
+// callers must select KernelMode::SOTA_3GROUP (the default) or
+// KernelMode::JLP_AFFINE_BATCH. If you reach for KernelMode::JACOBIAN_WARP_BATCH
+// in a release build you are giving up the per-step DP detection that the
+// SOTA / JLP kernels provide.
 #define DP_CHECK_INTERVAL 32
 #define WARP_SIZE 32
 
@@ -175,13 +192,21 @@ __device__ __forceinline__ int cmp256(const uint64_t* a, const uint64_t* b) {
 }
 
 // Modular reduction: r = a mod p
+// Contract: input `a` MUST already be in [0, 2p). All callers in this TU pass
+// values that have either been folded through reduce_512 (which leaves the
+// result in [0, 2p) per the c-fold bound: low 256 bits + (high * c) where the
+// final acc[4] carry-out has been folded twice) or come from mod_add /
+// mod_sub overflow paths that bound the result the same way. With that
+// precondition, a single conditional subtract is sufficient. The previous
+// `while` loop iterated at most once but the branch-free form is preferable
+// and matches secp256k1.cu::mod_reduce.
 __device__ __forceinline__ void mod_p(uint64_t* r, const uint64_t* a) {
     // Copy
     #pragma unroll
     for (int i = 0; i < 4; i++) r[i] = a[i];
 
-    // Subtract p if >= p
-    while (cmp256(r, SECP256K1_P)) {
+    // Single conditional subtract (input is in [0, 2p) per contract).
+    if (cmp256(r, SECP256K1_P)) {
         sub256(r, r, SECP256K1_P);
     }
 }
@@ -446,7 +471,6 @@ __device__ void mod_inv(uint64_t* r, const uint64_t* a) {
     mod_mul(x220, x220, x44);
 
     // x223 = a^(2^223 - 1).
-    //
     // 2026-05-09 fix: previous code multiplied by x2 (= a^3) here, which
     // produces x223 = a^(2^223 - 5), not a^(2^223 - 1). The libsecp256k1
     // canonical chain uses x3 (= a^7) at this position so that
@@ -579,7 +603,7 @@ __device__ void ec_add_mixed(
 
     // U2 = X2 * Z1^2
     mod_mul(u2, qx, z2);
-    // S2 = Y2 * Z1^3
+    // = Y2 * Z1^3
     mod_mul(s2, qy, z3);
 
     // H = U2 - X1
@@ -668,14 +692,12 @@ __device__ void ec_to_affine(
 // across all 32 threads in a warp. This is critical for efficient DP detection
 // since we MUST use affine X coordinates (Jacobian X has no correlation with
 // affine X low bits due to the Z^2 factor).
-//
 // Algorithm:
 // 1. Each thread stores its Z coordinate to shared memory
 // 2. Lane 0 computes cumulative products: products[i] = Z[0] * Z[1] * ... * Z[i]
 // 3. Lane 0 computes single inversion: inv_all = products[31]^(-1)
 // 4. Lane 0 back-propagates: z_inv[i] = inv_all * products[i-1], inv_all *= Z[i]
 // 5. ALL threads convert to affine in parallel using their z_inv
-//
 // Cost: 1 mod_inv + 3*(N-1) mod_mul for N points (vs N mod_inv without batching)
 // For N=32: 1 mod_inv + 93 mod_mul vs 32 mod_inv (huge savings!)
 
@@ -887,6 +909,34 @@ __device__ void batch_mod_inv(uint64_t dx[GPU_GRP_SIZE][4]) {
     }
 }
 
+// Deterministic per-kangaroo re-randomization: picks a jump-table slot
+// based on (tid, step) and resets the kangaroo to that slot's affine
+// point. Used by the dx==0 fall-out path, the infinity fall-out path,
+// and the same-type DP-collision restart path. Distance is NOT zeroed
+// because the kangaroo retains its identity (tame/wild1/wild2 + its
+// starting offset for wilds); only its position is rebased so it leaves
+// the cycle.
+__device__ __forceinline__ void rerandomize_kangaroo(
+    uint64_t* px, uint64_t* py,
+    size_t tid, int salt,
+    const uint64_t* __restrict__ jump_x,
+    const uint64_t* __restrict__ jump_y
+) {
+    // Same hash mixing as the existing fall-out path (line 1407 pre-fix):
+    // golden-ratio multiplier XOR'd with the step counter, modulo the
+    // jump-table size. Different `salt` values give different slots when
+    // the same kangaroo restarts multiple times in the same kernel
+    // invocation (collision -> dx==0 in the very next step).
+    uint64_t slot = ((uint64_t)tid * 0x9E3779B97F4A7C15ULL
+                     ^ (uint64_t)salt)
+                    % ::collider::gpu::kKangarooJumpTableSize;
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        px[i] = jump_x[slot * 4 + i];
+        py[i] = jump_y[slot * 4 + i];
+    }
+}
+
 // Affine point addition with pre-inverted denominator
 // R = P + Q where slope denominator is already inverted
 // Input: (px, py) = point P, (qx, qy) = point Q, dx_inv = 1/(Qx - Px)
@@ -925,12 +975,25 @@ __device__ void ec_add_affine_with_inv(
 
 // Kernel state structure (structure-of-arrays for coalescing)
 struct KangarooState {
-    uint64_t* x;      // Point X coordinates [N][4]
-    uint64_t* y;      // Point Y coordinates [N][4]
-    uint64_t* z;      // Point Z coordinates [N][4]
-    uint64_t* dist;   // Distances traveled [N][4]
-    uint32_t* flags;  // DP detection flags [N]
-    uint32_t* types;  // 0=tame, 1=wild1, 2=wild2 (SOTA uses 3 groups)
+    uint64_t* x;             // Point X coordinates [N][4]
+    uint64_t* y;             // Point Y coordinates [N][4]
+    uint64_t* z;             // Point Z coordinates [N][4]
+    uint64_t* dist;          // Distances traveled [N][4]
+    uint32_t* flags;         // DP detection flags [N]
+    uint32_t* types;         // 0=tame, 1=wild1, 2=wild2 (SOTA uses 3 groups)
+    // Per-kangaroo wild starting offset. For tame kangaroos this stays 0.
+    // For wild1/wild2 it is the host-generated per-instance random scalar
+    // used to make each wild start at (+/-Q + offset_i * G), with dist_i
+    // initialized to offset_i so the collision algebra
+    // (tame_d - wild_d = priv_key) still produces the recovered key
+    // directly. Stored alongside d_dist for coalescing.
+    uint64_t* wild_offset;   // Per-kangaroo wild starting offset [N][4]
+    // Per-kangaroo flag asking the kernel to re-randomize this kangaroo on
+    // its next step. Set when (a) batch_mod_inv saw dx==0 (same X collision
+    // inside the SIMT lane) or (b) a same-type DP collision was detected
+    // host-side (cycled kangaroo). The kernel reads-and-clears in
+    // atomicExch fashion.
+    uint32_t* restart_pending; // 1 = re-randomize on next kernel step [N]
 };
 
 // ============================================================================
@@ -938,17 +1001,14 @@ struct KangarooState {
 // ============================================================================
 // SOTA method uses 3 kangaroo groups with elliptic curve symmetry to achieve
 // K=1.15 coefficient (45% fewer operations than classic K=2.08)
-//
 // Groups:
 //   - Type 0: Tame kangaroos - start at k*G for random k in [0, sqrt(N))
 //   - Type 1: Wild1 kangaroos - start at Q - (N/2)*G, search positive direction
 //   - Type 2: Wild2 kangaroos - start at -Q + (N/2)*G, search using symmetry
-//
 // Symmetry optimization:
 //   For any point P = (x, y) on secp256k1, -P = (x, -y) = (x, p-y)
 //   When computing P + J (jump), we can cheaply get P - J by negating J's Y
 //   This doubles effective collision probability without doubling work
-//
 // INV_FLAG mechanism:
 //   - Track whether jump was inverted (subtracted) via flag in distance
 //   - When Y coordinate LSB suggests inversion is beneficial, use -J instead of +J
@@ -1013,17 +1073,40 @@ __global__ void kangaroo_step_kernel_jlp(
     // Load all kangaroo states into registers
     uint64_t px[GPU_GRP_SIZE][4], py[GPU_GRP_SIZE][4];
     uint64_t dist[GPU_GRP_SIZE][4];
+    // Per-lane "halt after DP" flag so a DP-hit kangaroo stops stepping for
+    // the remainder of this kernel invocation. Without this, the
+    // second/third/Nth DP overwrites the first via the same state.flags
+    // slot, and the save-final-state guard at the bottom then refuses to
+    // save the last position because flags is set, so the host drops ~50%
+    // of DPs on dense puzzles.
+    bool halted[GPU_GRP_SIZE];
 
     for (int g = 0; g < GPU_GRP_SIZE; g++) {
         size_t idx = base_idx + g;
-        if (idx >= total_kangaroos) break;
+        if (idx >= total_kangaroos) { halted[g] = true; continue; }
 
-        #pragma unroll
-        for (int i = 0; i < 4; i++) {
-            px[g][i] = state.x[idx * 4 + i];
-            py[g][i] = state.y[idx * 4 + i];
-            dist[g][i] = state.dist[idx * 4 + i];
+        // Restart fall-out: if the host or last kernel marked this
+        // kangaroo for restart, re-randomize position before stepping.
+        if (state.restart_pending[idx]) {
+            state.restart_pending[idx] = 0;
+            rerandomize_kangaroo(px[g], py[g], idx, /*salt*/0,
+                                 s_jump_x, s_jump_y);
+            // Distance unchanged: the kangaroo's collision algebra still
+            // relies on its accumulated dist (tame_d / wild_d). Only the
+            // position is rebased to escape the cycle.
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                dist[g][i] = state.dist[idx * 4 + i];
+            }
+        } else {
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                px[g][i] = state.x[idx * 4 + i];
+                py[g][i] = state.y[idx * 4 + i];
+                dist[g][i] = state.dist[idx * 4 + i];
+            }
         }
+        halted[g] = false;
     }
 
     const uint64_t dp_mask = (1ULL << dp_bits) - 1;
@@ -1033,6 +1116,14 @@ __global__ void kangaroo_step_kernel_jlp(
         // Step 1: Select jump points and compute denominators
         int jump_idx[GPU_GRP_SIZE];
         uint64_t dx[GPU_GRP_SIZE][4];  // Denominators to invert
+
+        // Track which lanes had dx==0 so we can rerandomize them after the
+        // batch inversion runs. We CANNOT skip the inversion for those
+        // lanes (batch_mod_inv requires every product chain element to be
+        // invertible) so we substitute dx=1 here, let the inversion
+        // proceed, then discard the bogus EC-add result for the affected
+        // lanes and rerandomize instead.
+        bool dx_was_zero[GPU_GRP_SIZE];
 
         for (int g = 0; g < GPU_GRP_SIZE; g++) {
             // Jump selection based on x-coordinate low bits
@@ -1047,6 +1138,21 @@ __global__ void kangaroo_step_kernel_jlp(
 
             // dx = Jx - Px (denominator for slope)
             mod_sub(dx[g], jx, px[g]);
+
+            // detect dx==0 (the kangaroo landed exactly on its jump
+            // point's X coord). Without this guard the product chain in
+            // batch_mod_inv zeros out, all GPU_GRP_SIZE inverses become 0,
+            // and every kangaroo in this SIMT group walks pure garbage.
+            bool is_zero = halted[g] ||
+                (dx[g][0] == 0 && dx[g][1] == 0 &&
+                 dx[g][2] == 0 && dx[g][3] == 0);
+            dx_was_zero[g] = is_zero;
+            if (is_zero) {
+                // Substitute dx=1 so the batch inversion's product chain
+                // stays multiplicatively invertible. The resulting EC-add
+                // value is bogus but we discard it below.
+                dx[g][0] = 1; dx[g][1] = 0; dx[g][2] = 0; dx[g][3] = 0;
+            }
         }
 
         // Step 2: Batch invert ALL denominators (this is the key optimization!)
@@ -1054,7 +1160,19 @@ __global__ void kangaroo_step_kernel_jlp(
 
         // Step 3: Complete all point additions using inverted denominators
         for (int g = 0; g < GPU_GRP_SIZE; g++) {
+            if (halted[g]) continue;
+
             int j = jump_idx[g];
+
+            if (dx_was_zero[g]) {
+                // fall-out path: rerandomize this kangaroo's position
+                // from the jump table (analogous to the infinity fall-out
+                // path). Distance is preserved. Skip the EC add.
+                rerandomize_kangaroo(px[g], py[g], base_idx + g,
+                                     /*salt*/step + 1, s_jump_x, s_jump_y);
+                continue;
+            }
+
             uint64_t rx[4], ry[4];
 
             // Load jump point from SHARED MEMORY (cached)
@@ -1097,24 +1215,35 @@ __global__ void kangaroo_step_kernel_jlp(
                         state.z[idx * 4 + i] = (i == 0) ? 1 : 0;
                         state.dist[idx * 4 + i] = dist[g][i];
                     }
+                    // halt this lane for the rest of the kernel
+                    // invocation. The host loop will collect this DP, clear
+                    // the flag, and the next kernel launch resumes stepping
+                    // from this saved (px, py, dist).
+                    halted[g] = true;
                 }
             }
         }
     }
 
-    // Save final state back to global memory
+    // Save final state back to global memory. Every non-halted lane must
+    // still be saved here. A prior "if (state.flags[idx] == 0)" gate
+    // skipped saving any kangaroo that hit a DP earlier in this kernel,
+    // but did NOT prevent later DPs from overwriting; the lane would lose
+    // all post-DP work on the next kernel invocation. With halted[]
+    // driving the loop we save exactly the in-register state at the
+    // moment the kangaroo stopped (either after the final step or
+    // immediately after its DP hit).
     for (int g = 0; g < GPU_GRP_SIZE; g++) {
         size_t idx = base_idx + g;
         if (idx >= total_kangaroos) break;
+        if (halted[g]) continue;  // DP-stored kangaroo: state already saved.
 
-        if (state.flags[idx] == 0) {  // Only if not already stored as DP
-            #pragma unroll
-            for (int i = 0; i < 4; i++) {
-                state.x[idx * 4 + i] = px[g][i];
-                state.y[idx * 4 + i] = py[g][i];
-                state.z[idx * 4 + i] = (i == 0) ? 1 : 0;  // Z=1 for affine
-                state.dist[idx * 4 + i] = dist[g][i];
-            }
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            state.x[idx * 4 + i] = px[g][i];
+            state.y[idx * 4 + i] = py[g][i];
+            state.z[idx * 4 + i] = (i == 0) ? 1 : 0;  // Z=1 for affine
+            state.dist[idx * 4 + i] = dist[g][i];
         }
     }
 }
@@ -1127,9 +1256,7 @@ __global__ void kangaroo_step_kernel_jlp(
 // - Exploits point negation: -P = (x, -y) is nearly free to compute
 // - "Cheap second point": when jumping P + J, also consider P - J
 // - Achieves 45% fewer operations (K=1.15 vs K=2.08)
-//
 // Based on RCKangaroo by RetiredC: https://github.com/RetiredC/RCKangaroo
-//
 // Key insight: The Y coordinate's LSB determines whether to use +J or -J
 // This deterministic choice based on current point ensures all kangaroos
 // eventually collide while exploiting symmetry for faster convergence.
@@ -1177,17 +1304,31 @@ __global__ void kangaroo_step_kernel_sota(
     // Load all kangaroo states into registers
     uint64_t px[GPU_GRP_SIZE][4], py[GPU_GRP_SIZE][4];
     uint64_t dist[GPU_GRP_SIZE][4];
+    // per-lane halt flag (see JLP kernel comment).
+    bool halted[GPU_GRP_SIZE];
 
     for (int g = 0; g < GPU_GRP_SIZE; g++) {
         size_t idx = base_idx + g;
-        if (idx >= total_kangaroos) break;
+        if (idx >= total_kangaroos) { halted[g] = true; continue; }
 
-        #pragma unroll
-        for (int i = 0; i < 4; i++) {
-            px[g][i] = state.x[idx * 4 + i];
-            py[g][i] = state.y[idx * 4 + i];
-            dist[g][i] = state.dist[idx * 4 + i];
+        // Restart fall-out: same restart-pending check as JLP kernel.
+        if (state.restart_pending[idx]) {
+            state.restart_pending[idx] = 0;
+            rerandomize_kangaroo(px[g], py[g], idx, /*salt*/0,
+                                 s_jump_x, s_jump_y);
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                dist[g][i] = state.dist[idx * 4 + i];
+            }
+        } else {
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                px[g][i] = state.x[idx * 4 + i];
+                py[g][i] = state.y[idx * 4 + i];
+                dist[g][i] = state.dist[idx * 4 + i];
+            }
         }
+        halted[g] = false;
     }
 
     const uint64_t dp_mask = (1ULL << dp_bits) - 1;
@@ -1199,6 +1340,7 @@ __global__ void kangaroo_step_kernel_sota(
         int jump_idx[GPU_GRP_SIZE];
         uint64_t dx[GPU_GRP_SIZE][4];
         bool use_neg_jump[GPU_GRP_SIZE];  // Track if using -J (negated jump)
+        bool dx_was_zero[GPU_GRP_SIZE];   // see JLP kernel
 
         for (int g = 0; g < GPU_GRP_SIZE; g++) {
             // Jump selection based on x-coordinate low bits (same as classic)
@@ -1219,6 +1361,17 @@ __global__ void kangaroo_step_kernel_sota(
             // dx = Jx - Px (denominator for slope)
             // Note: For -J, the X coordinate is the same (only Y is negated)
             mod_sub(dx[g], jx, px[g]);
+
+            // Detect dx==0. See the matching comment in
+            // kangaroo_step_kernel_jlp above for the SIMT-poison
+            // explanation.
+            bool is_zero = halted[g] ||
+                (dx[g][0] == 0 && dx[g][1] == 0 &&
+                 dx[g][2] == 0 && dx[g][3] == 0);
+            dx_was_zero[g] = is_zero;
+            if (is_zero) {
+                dx[g][0] = 1; dx[g][1] = 0; dx[g][2] = 0; dx[g][3] = 0;
+            }
         }
 
         // Step 2: Batch invert ALL denominators
@@ -1226,7 +1379,16 @@ __global__ void kangaroo_step_kernel_sota(
 
         // Step 3: Complete all point additions with symmetry optimization
         for (int g = 0; g < GPU_GRP_SIZE; g++) {
+            if (halted[g]) continue;
+
             int j = jump_idx[g];
+
+            if (dx_was_zero[g]) {
+                rerandomize_kangaroo(px[g], py[g], base_idx + g,
+                                     /*salt*/step + 1, s_jump_x, s_jump_y);
+                continue;
+            }
+
             uint64_t rx[4], ry[4];
 
             // Load jump point from SHARED MEMORY (cached)
@@ -1284,24 +1446,25 @@ __global__ void kangaroo_step_kernel_sota(
                         state.z[idx * 4 + i] = (i == 0) ? 1 : 0;
                         state.dist[idx * 4 + i] = dist[g][i];
                     }
+                    halted[g] = true;  // halt after DP, see JLP kernel.
                 }
             }
         }
     }
 
-    // Save final state back to global memory
+    // save every non-halted lane (see JLP kernel save-final-state
+    // comment for the full rationale).
     for (int g = 0; g < GPU_GRP_SIZE; g++) {
         size_t idx = base_idx + g;
         if (idx >= total_kangaroos) break;
+        if (halted[g]) continue;
 
-        if (state.flags[idx] == 0) {  // Only if not already stored as DP
-            #pragma unroll
-            for (int i = 0; i < 4; i++) {
-                state.x[idx * 4 + i] = px[g][i];
-                state.y[idx * 4 + i] = py[g][i];
-                state.z[idx * 4 + i] = (i == 0) ? 1 : 0;  // Z=1 for affine
-                state.dist[idx * 4 + i] = dist[g][i];
-            }
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            state.x[idx * 4 + i] = px[g][i];
+            state.y[idx * 4 + i] = py[g][i];
+            state.z[idx * 4 + i] = (i == 0) ? 1 : 0;  // Z=1 for affine
+            state.dist[idx * 4 + i] = dist[g][i];
         }
     }
 }
@@ -1345,21 +1508,6 @@ __global__ void kangaroo_step_kernel(
 
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= count) return;
-
-    // ULTRA SIMPLE DEBUG: unconditionally set flag for thread 0 on EVERY kernel call
-    // This tests if flag collection mechanism works AT ALL
-    // If we STILL see 0 DPs, the problem is in host-side flag reading
-    #define DEBUG_UNCONDITIONAL_FLAG 0
-    #if DEBUG_UNCONDITIONAL_FLAG
-    if (tid == 0) {
-        state.flags[0] = 1;
-        // Also write dummy coordinates so we have something to collect
-        state.x[0] = 0x1234567890ABCDEFULL;
-        state.x[1] = 0;
-        state.x[2] = 0;
-        state.x[3] = 0;
-    }
-    #endif
 
     // Warp identification for shared memory indexing
     const int warp_id = threadIdx.x / WARP_SIZE;
@@ -1407,17 +1555,24 @@ __global__ void kangaroo_step_kernel(
         // Update distance
         add256(dist, dist, jd);
 
-        // Check if point hit infinity (Z = 0) IMMEDIATELY after each EC add
-        // This is extremely rare but causes crashes if not caught before the next step
-        // The kangaroo landed on its inverse point: P + jump = infinity
+        // Check if point hit infinity (Z = 0) IMMEDIATELY after each EC add.
+        // This is extremely rare but causes crashes if not caught before the
+        // next step. The kangaroo landed on its inverse point: P + jump = O.
         bool is_infinity = (pz[0] == 0 && pz[1] == 0 && pz[2] == 0 && pz[3] == 0);
         if (is_infinity) {
-            // Reset kangaroo to first jump point to continue searching
-            // Distance is still tracked correctly for collision detection
+            // don't always rescue to jump slot 0. If a kangaroo
+            // lands on infinity twice in succession (which CAN happen for
+            // adversarially-chosen ranges), resetting to slot 0 each time
+            // produces a closed loop with no progress. Pick a slot derived
+            // from the thread id + step counter so each fall-out kangaroo
+            // resumes on a different jump element. The jump table is large
+            // (>= 32 entries) so collisions are negligible.
+            uint64_t fallback_slot = ((uint64_t)tid * 0x9E3779B97F4A7C15ULL
+                                       ^ (uint64_t)step) % ::collider::gpu::kKangarooJumpTableSize;
             #pragma unroll
             for (int i = 0; i < 4; i++) {
-                px[i] = d_jump_x[i];  // Jump 0, element i
-                py[i] = d_jump_y[i];
+                px[i] = d_jump_x[fallback_slot * 4 + i];
+                py[i] = d_jump_y[fallback_slot * 4 + i];
                 pz[i] = (i == 0) ? 1 : 0;  // Z = 1 (affine)
             }
             continue;  // Skip this step's DP check entirely
@@ -1491,23 +1646,7 @@ __global__ void kangaroo_step_kernel(
             );
             #endif
 
-            // DEBUG TEST: Force thread 0 to report a DP on first check
-            // This tests if flag collection is working at all
-            #define DEBUG_FORCE_DP 0
-            #if DEBUG_FORCE_DP
-            if (tid == 0 && step == DP_CHECK_INTERVAL - 1) {
-                state.flags[tid] = 1;
-                for (int i = 0; i < 4; i++) {
-                    state.x[tid * 4 + i] = affine_x[i];
-                    state.y[tid * 4 + i] = affine_y[i];
-                    state.z[tid * 4 + i] = (i == 0) ? 1 : 0;
-                    state.dist[tid * 4 + i] = dist[i];
-                }
-                return;
-            }
-            #endif
-
-            // NOW check the AFFINE X coordinate for DP property (correct approach!)
+            // Check the AFFINE X coordinate for DP property.
             if ((affine_x[0] & dp_mask) == 0) {
                 // TRUE Distinguished Point found!
                 state.flags[tid] = 1;
@@ -1592,6 +1731,13 @@ public:
         if (err != cudaSuccess) return false;
 
         err = cudaMalloc(&d_types_, size_32);
+        if (err != cudaSuccess) return false;
+
+        // Per-kangaroo wild starting offset (256-bit) and a 32-bit restart
+        // flag.
+        err = cudaMalloc(&d_wild_offset_, size_256);
+        if (err != cudaSuccess) return false;
+        err = cudaMalloc(&d_restart_pending_, size_32);
         if (err != cudaSuccess) return false;
 
         allocated_ = true;
@@ -1700,6 +1846,8 @@ public:
         state.dist = d_dist_;
         state.flags = d_flags_;
         state.types = d_types_;
+        state.wild_offset = d_wild_offset_;
+        state.restart_pending = d_restart_pending_;
 
         if (mode == KernelMode::SOTA_3GROUP) {
             // SOTA kernel: 3-group with symmetry optimization (K=1.15)
@@ -1708,6 +1856,9 @@ public:
             int threads_per_block = 128;  // Lower for register pressure
             int blocks = (num_threads + threads_per_block - 1) / threads_per_block;
 
+            // T1.6: sticky context error attribution.
+            (void)collider::gpu::pre_launch_context_probe(
+                "kangaroo_step_kernel_sota");
             kangaroo_step_kernel_sota<<<blocks, threads_per_block>>>(
                 state, dp_bits, steps_per_kernel, num_kangaroos_,
                 d_jump_x_, d_jump_y_, d_jump_d_
@@ -1719,6 +1870,9 @@ public:
             int threads_per_block = 128;  // Lower for register pressure
             int blocks = (num_threads + threads_per_block - 1) / threads_per_block;
 
+            // T1.6: sticky context error attribution.
+            (void)collider::gpu::pre_launch_context_probe(
+                "kangaroo_step_kernel_jlp");
             kangaroo_step_kernel_jlp<<<blocks, threads_per_block>>>(
                 state, dp_bits, steps_per_kernel, num_kangaroos_,
                 d_jump_x_, d_jump_y_, d_jump_d_  // Pass jump table pointers
@@ -1728,6 +1882,9 @@ public:
             int threads_per_block = 256;
             int blocks = (num_kangaroos_ + threads_per_block - 1) / threads_per_block;
 
+            // T1.6: sticky context error attribution.
+            (void)collider::gpu::pre_launch_context_probe(
+                "kangaroo_step_kernel");
             kangaroo_step_kernel<<<blocks, threads_per_block>>>(
                 state, dp_bits, steps_per_kernel, num_kangaroos_,
                 d_jump_x_, d_jump_y_, d_jump_d_,  // Pass jump table pointers
@@ -1810,6 +1967,8 @@ public:
         if (d_dist_) cudaFree(d_dist_);
         if (d_flags_) cudaFree(d_flags_);
         if (d_types_) cudaFree(d_types_);
+        if (d_wild_offset_) cudaFree(d_wild_offset_);
+        if (d_restart_pending_) cudaFree(d_restart_pending_);
 
         // Free jump table device memory
         if (d_jump_x_) cudaFree(d_jump_x_);
@@ -1817,7 +1976,8 @@ public:
         if (d_jump_d_) cudaFree(d_jump_d_);
 
         d_x_ = d_y_ = d_z_ = d_dist_ = nullptr;
-        d_flags_ = d_types_ = nullptr;
+        d_wild_offset_ = nullptr;
+        d_flags_ = d_types_ = d_restart_pending_ = nullptr;
         d_jump_x_ = d_jump_y_ = d_jump_d_ = nullptr;
         allocated_ = false;
     }
@@ -1835,6 +1995,8 @@ private:
     uint64_t* d_dist_ = nullptr;
     uint32_t* d_flags_ = nullptr;
     uint32_t* d_types_ = nullptr;
+    uint64_t* d_wild_offset_ = nullptr;     // Per-kangaroo wild starting offset
+    uint32_t* d_restart_pending_ = nullptr; // Per-kangaroo restart flag
 
     // Device memory - jump tables (using device memory instead of __constant__)
     // This fixes the "named symbol not found" error with CUDA RDC + LTO
@@ -1852,6 +2014,7 @@ private:
 
 #include "kangaroo_solver_gpu.hpp"
 #include "../core/crypto_cpu.hpp"
+#include "kangaroo_dp_table.hpp"   // full-256 DPKey
 #include <iostream>
 #include <chrono>
 #include <vector>
@@ -1902,6 +2065,9 @@ struct GPUKangarooManager::Impl {
     uint64_t* d_dist = nullptr;
     uint32_t* d_flags = nullptr;
     uint32_t* d_types = nullptr;
+    // Per-kangaroo wild starting offset + restart-pending flag
+    uint64_t* d_wild_offset = nullptr;
+    uint32_t* d_restart_pending = nullptr;
 
     // Device memory - jump tables (using device memory instead of __constant__)
     // This fixes the "named symbol not found" error with CUDA RDC + LTO
@@ -1914,13 +2080,21 @@ struct GPUKangarooManager::Impl {
     uint64_t jump_y[NUM_JUMPS][4];
     uint64_t jump_d[NUM_JUMPS][4];
 
-    // Distinguished points storage
+    // Distinguished points keyed on full 256-bit X via DPKey.
+    // Pre-fix this was keyed on x_low (uint64_t), silently dropping DPs that
+    // collided in the low 64 bits but differed in the upper 192. With DPKey,
+    // two DPs at distinct positions are always retained at distinct slots.
+    // Wild kangaroos carry a per-instance starting offset (their initial
+    // dist = offset). When a wild collides with a tame, the collision
+    // algebra must subtract that offset from the wild's accumulated
+    // distance before computing the private key.
     struct DPEntry {
-        uint64_t x[4];
         uint64_t dist[4];
+        uint64_t wild_offset[4];
         uint32_t type;
+        size_t   kang_idx;        // which kangaroo produced this DP
     };
-    std::unordered_map<uint64_t, DPEntry> dp_table;
+    std::unordered_map<::collider::kangaroo::DPKey, DPEntry> dp_table;
 
     bool init(int dev_id) {
         device_id = dev_id;
@@ -1970,6 +2144,12 @@ struct GPUKangarooManager::Impl {
         err = cudaMalloc(&d_types, size_32);
         if (err != cudaSuccess) return false;
 
+        // Per-kangaroo wild offset + restart-pending buffers.
+        err = cudaMalloc(&d_wild_offset, size_256);
+        if (err != cudaSuccess) return false;
+        err = cudaMalloc(&d_restart_pending, size_32);
+        if (err != cudaSuccess) return false;
+
         allocated = true;
         return true;
     }
@@ -1981,6 +2161,8 @@ struct GPUKangarooManager::Impl {
         if (d_dist) cudaFree(d_dist);
         if (d_flags) cudaFree(d_flags);
         if (d_types) cudaFree(d_types);
+        if (d_wild_offset) cudaFree(d_wild_offset);
+        if (d_restart_pending) cudaFree(d_restart_pending);
 
         // Free jump table device memory
         if (d_jump_x) cudaFree(d_jump_x);
@@ -1988,7 +2170,8 @@ struct GPUKangarooManager::Impl {
         if (d_jump_d) cudaFree(d_jump_d);
 
         d_x = d_y = d_z = d_dist = nullptr;
-        d_flags = d_types = nullptr;
+        d_wild_offset = nullptr;
+        d_flags = d_types = d_restart_pending = nullptr;
         d_jump_x = d_jump_y = d_jump_d = nullptr;
         allocated = false;
     }
@@ -2079,7 +2262,8 @@ struct GPUKangarooManager::Impl {
 
     void init_kangaroos(int num_kangaroos, std::vector<uint64_t>& h_x,
                         std::vector<uint64_t>& h_y, std::vector<uint64_t>& h_z,
-                        std::vector<uint64_t>& h_dist, std::vector<uint32_t>& h_types) {
+                        std::vector<uint64_t>& h_dist, std::vector<uint32_t>& h_types,
+                        std::vector<uint64_t>& h_wild_offset) {
         std::mt19937_64 rng(std::random_device{}());
 
         h_x.resize(num_kangaroos * 4);
@@ -2087,6 +2271,9 @@ struct GPUKangarooManager::Impl {
         h_z.resize(num_kangaroos * 4);
         h_dist.resize(num_kangaroos * 4);
         h_types.resize(num_kangaroos);
+        // Per-kangaroo wild starting offset. Zeroed by default; only
+        // wild1/wild2 get a non-zero value.
+        h_wild_offset.assign(num_kangaroos * 4, 0);
 
         // Compute 256-bit range size: range_size = range_end - range_start
         cpu::uint256_t range_start_256, range_end_256, range_size_256;
@@ -2104,11 +2291,11 @@ struct GPUKangarooManager::Impl {
         // - 1/3 Tame: start at random k*G in range, track k
         // - 1/3 Wild1: start at Q, track distance from Q
         // - 1/3 Wild2: start at -Q (mirror), track distance from -Q
-        //
-        // When collision occurs between different groups:
-        // - Tame-Wild1: k = tame_dist - wild1_dist
-        // - Tame-Wild2: k = tame_dist + wild2_dist (because Wild2 tracks from -Q)
-        // - Wild1-Wild2: k = wild1_dist + wild2_dist (symmetry)
+        // When collision occurs between different groups (see detection site
+        // for the precise algebra and mod_half for W1-W2):
+        // - Tame-Wild1:  k = tame_dist - wild1_dist  mod n
+        // - Tame-Wild2:  k = wild2_dist - tame_dist  mod n  (Wild2 tracks from -Q)
+        // - Wild1-Wild2: k = (wild2_dist - wild1_dist) / 2  mod n  (symmetry)
 
         int third = num_kangaroos / 3;
 
@@ -2117,30 +2304,13 @@ struct GPUKangarooManager::Impl {
                 // TAME kangaroos (Type 0): start at random k*G in range
                 h_types[i] = KANG_TAME;
 
-                // Generate random offset within range
+                // uniform sample in [0, range_size_256) via
+                // bit-masked rejection sampling. Pre-fix: per-limb % was
+                // mathematically nonsensical AND had no branch for ranges
+                // requiring 3 or 4 limbs, so Tame kangaroos on >128-bit
+                // puzzles started anywhere on the curve (not in range).
                 cpu::uint256_t offset;
-                offset.d[0] = rng();
-                offset.d[1] = rng();
-                offset.d[2] = rng();
-                offset.d[3] = rng();
-
-                // Reduce offset mod range_size
-                if (range_size_256.d[3] == 0 && range_size_256.d[2] == 0 &&
-                    range_size_256.d[1] == 0) {
-                    offset.d[0] = offset.d[0] % range_size_256.d[0];
-                    offset.d[1] = 0;
-                    offset.d[2] = 0;
-                    offset.d[3] = 0;
-                } else if (range_size_256.d[3] == 0 && range_size_256.d[2] == 0) {
-                    offset.d[0] = offset.d[0] % (range_size_256.d[0] | 1);
-                    offset.d[1] = offset.d[1] % (range_size_256.d[1] | 1);
-                    offset.d[2] = 0;
-                    offset.d[3] = 0;
-                    if (offset.d[1] > range_size_256.d[1] ||
-                        (offset.d[1] == range_size_256.d[1] && offset.d[0] >= range_size_256.d[0])) {
-                        offset.d[1] = range_size_256.d[1] >> 1;
-                    }
-                }
+                cpu::random_below(offset, [&]() { return rng(); }, range_size_256);
 
                 // dist = range_start + offset
                 cpu::uint256_t dist;
@@ -2162,42 +2332,101 @@ struct GPUKangarooManager::Impl {
                     h_y[i * 4 + j] = py.d[j];
                 }
             } else if (i < 2 * third) {
-                // WILD1 kangaroos (Type 1): start at Q, track distance
+                // WILD1 kangaroos (Type 1): start at Q + offset_i * G, track
+                // distance accumulated from offset_i.
+                // Per-instance random offset replaces the prior shared-start design where
+                // every wild1 began at exactly the same (Q.x, Q.y, dist=0).
+                // Shared X => identical jump_idx => identical trajectory,
+                // so a herd of N wilds did the work of 1; same problem on
+                // multi-GPU and across kernel invocations. Generating a
+                // fresh ~128-bit offset per kangaroo gives each wild a
+                // distinct starting X (and hence trajectory) while the
+                // collision algebra continues to work: a tame at
+                // dist_t * G that meets wild1 at dist_w * G satisfies
+                // tame_d = priv + (wild_d - offset_i)  =>  priv = tame_d - (wild_d - offset_i).
                 h_types[i] = KANG_WILD1;
 
-                // Distance starts at 0
-                h_dist[i * 4 + 0] = 0;
-                h_dist[i * 4 + 1] = 0;
-                h_dist[i * 4 + 2] = 0;
-                h_dist[i * 4 + 3] = 0;
+                // Bound offset by sqrt(range_size) so the wild stays in a
+                // statistically reasonable region (Pollard's analysis
+                // expects wild excursions of that magnitude). We do this
+                // simply by sampling 128 bits from the rng; the range_bits
+                // formula in solve() guarantees this bound is meaningful
+                // for any puzzle <= 256 bits.
+                cpu::uint256_t offset_i;
+                offset_i.d[0] = rng();
+                offset_i.d[1] = rng() & 0x3FFFFFFFFFFFFFFFULL;  // ~126 bits
+                offset_i.d[2] = 0;
+                offset_i.d[3] = 0;
 
-                // Position = target public key Q
+                // Position = Q + offset_i * G. Compute offset_i * G on
+                // the CPU (one ec_mul, ~256 ec_doubles) then ec_add to Q.
+                cpu::ECPoint OG;
+                cpu::ec_mul(OG, offset_i);
+
+                cpu::uint256_t og_x, og_y;
+                cpu::ec_to_affine(og_x, og_y, OG);
+
+                // Q + offset_i*G via CPU EC add (Jacobian internally).
+                // Build a Jacobian Q point then add.
+                cpu::ECPoint QP;
+                QP.X.d[0] = target_pubkey_x[0]; QP.X.d[1] = target_pubkey_x[1];
+                QP.X.d[2] = target_pubkey_x[2]; QP.X.d[3] = target_pubkey_x[3];
+                QP.Y.d[0] = target_pubkey_y[0]; QP.Y.d[1] = target_pubkey_y[1];
+                QP.Y.d[2] = target_pubkey_y[2]; QP.Y.d[3] = target_pubkey_y[3];
+                QP.Z.d[0] = 1; QP.Z.d[1] = 0; QP.Z.d[2] = 0; QP.Z.d[3] = 0;
+
+                cpu::ECPoint W1;
+                cpu::ec_add(W1, QP, og_x, og_y);
+
+                cpu::uint256_t w1_x, w1_y;
+                cpu::ec_to_affine(w1_x, w1_y, W1);
+
                 for (int j = 0; j < 4; j++) {
-                    h_x[i * 4 + j] = target_pubkey_x[j];
-                    h_y[i * 4 + j] = target_pubkey_y[j];
+                    h_x[i * 4 + j] = w1_x.d[j];
+                    h_y[i * 4 + j] = w1_y.d[j];
+                    h_dist[i * 4 + j] = offset_i.d[j];        // dist starts at offset
+                    h_wild_offset[i * 4 + j] = offset_i.d[j]; // remembered for collision
                 }
             } else {
-                // WILD2 kangaroos (Type 2): start at -Q (mirror of target)
-                // -Q = (Q.x, p - Q.y) for secp256k1
+                // WILD2 kangaroos (Type 2): start at -Q + offset_i * G.
+                // Same per-instance offset story as WILD1.
                 h_types[i] = KANG_WILD2;
 
-                // Distance starts at 0
-                h_dist[i * 4 + 0] = 0;
-                h_dist[i * 4 + 1] = 0;
-                h_dist[i * 4 + 2] = 0;
-                h_dist[i * 4 + 3] = 0;
+                cpu::uint256_t offset_i;
+                offset_i.d[0] = rng();
+                offset_i.d[1] = rng() & 0x3FFFFFFFFFFFFFFFULL;
+                offset_i.d[2] = 0;
+                offset_i.d[3] = 0;
 
-                // Position = -Q = (Q.x, p - Q.y)
-                // Negate Y coordinate: neg_y = p - y
+                cpu::ECPoint OG;
+                cpu::ec_mul(OG, offset_i);
+
+                cpu::uint256_t og_x, og_y;
+                cpu::ec_to_affine(og_x, og_y, OG);
+
+                // -Q in affine = (Q.x, p - Q.y).
                 cpu::uint256_t qy, neg_qy;
-                for (int j = 0; j < 4; j++) {
-                    qy.d[j] = target_pubkey_y[j];
-                }
+                for (int j = 0; j < 4; j++) qy.d[j] = target_pubkey_y[j];
                 cpu::sub256(neg_qy, cpu::SECP256K1_P, qy);
 
+                // (-Q) + offset_i * G via CPU EC add.
+                cpu::ECPoint NQP;
+                NQP.X.d[0] = target_pubkey_x[0]; NQP.X.d[1] = target_pubkey_x[1];
+                NQP.X.d[2] = target_pubkey_x[2]; NQP.X.d[3] = target_pubkey_x[3];
+                NQP.Y = neg_qy;
+                NQP.Z.d[0] = 1; NQP.Z.d[1] = 0; NQP.Z.d[2] = 0; NQP.Z.d[3] = 0;
+
+                cpu::ECPoint W2;
+                cpu::ec_add(W2, NQP, og_x, og_y);
+
+                cpu::uint256_t w2_x, w2_y;
+                cpu::ec_to_affine(w2_x, w2_y, W2);
+
                 for (int j = 0; j < 4; j++) {
-                    h_x[i * 4 + j] = target_pubkey_x[j];  // X unchanged
-                    h_y[i * 4 + j] = neg_qy.d[j];         // Y negated
+                    h_x[i * 4 + j] = w2_x.d[j];
+                    h_y[i * 4 + j] = w2_y.d[j];
+                    h_dist[i * 4 + j] = offset_i.d[j];
+                    h_wild_offset[i * 4 + j] = offset_i.d[j];
                 }
             }
 
@@ -2277,7 +2506,21 @@ GPUKangarooResult GPUKangarooManager::solve() {
             break;
         }
     }
-    uint64_t mean_jump = 1ULL << (range_bits / 2 - 4);
+    // mean_jump formula.
+    // A naive `1ULL << (range_bits / 2 - 4)` underflows for range_bits < 8
+    // (shift count becomes negative and wraps to a huge value in unsigned
+    // arithmetic) AND the constant -4 has no theoretical justification.
+    // The standard Pollard kangaroo result says the expected jump
+    // distance should be sqrt(L) / herd_size for an L-wide range with a herd
+    // of N kangaroos. That gives jump_avg = 2^(range_bits/2) / N. Floor
+    // range_bits at 8 so the shift is well-defined; floor N at 1 so the
+    // divisor is non-zero. Matches RCKangaroo's tuning at
+    // third_party/RCKangaroo/RCGpuUtils.h::CalcJumpAvg (which uses the same
+    // sqrt(L)/N formula derived from Pollard's analysis).
+    const uint64_t rb_floor = (range_bits < 8) ? 8 : range_bits;
+    const uint64_t sqrt_l = 1ULL << (rb_floor / 2);
+    const uint64_t herd = (num_kangaroos > 0) ? static_cast<uint64_t>(num_kangaroos) : 1ULL;
+    uint64_t mean_jump = sqrt_l / herd;
     if (mean_jump == 0) mean_jump = 1;
 
     impl_->generate_jump_table(mean_jump);
@@ -2290,9 +2533,9 @@ GPUKangarooResult GPUKangarooManager::solve() {
 
     std::cout << "[*] Uploaded jump table (mean_jump = " << mean_jump << ")\n";
 
-    std::vector<uint64_t> h_x, h_y, h_z, h_dist;
+    std::vector<uint64_t> h_x, h_y, h_z, h_dist, h_wild_offset;
     std::vector<uint32_t> h_types;
-    impl_->init_kangaroos(num_kangaroos, h_x, h_y, h_z, h_dist, h_types);
+    impl_->init_kangaroos(num_kangaroos, h_x, h_y, h_z, h_dist, h_types, h_wild_offset);
 
     size_t size_256 = num_kangaroos * 4 * sizeof(uint64_t);
     size_t size_32 = num_kangaroos * sizeof(uint32_t);
@@ -2302,7 +2545,9 @@ GPUKangarooResult GPUKangarooManager::solve() {
     cudaMemcpy(impl_->d_z, h_z.data(), size_256, cudaMemcpyHostToDevice);
     cudaMemcpy(impl_->d_dist, h_dist.data(), size_256, cudaMemcpyHostToDevice);
     cudaMemcpy(impl_->d_types, h_types.data(), size_32, cudaMemcpyHostToDevice);
+    cudaMemcpy(impl_->d_wild_offset, h_wild_offset.data(), size_256, cudaMemcpyHostToDevice);
     cudaMemset(impl_->d_flags, 0, size_32);
+    cudaMemset(impl_->d_restart_pending, 0, size_32);
 
     std::cout << "[*] Starting GPU Kangaroo solve...\n";
     std::cout << "    DP bits: " << dp_bits << "\n";
@@ -2320,6 +2565,8 @@ GPUKangarooResult GPUKangarooManager::solve() {
         state.dist = impl_->d_dist;
         state.flags = impl_->d_flags;
         state.types = impl_->d_types;
+        state.wild_offset = impl_->d_wild_offset;
+        state.restart_pending = impl_->d_restart_pending;
 
         // Use SOTA 3-group kernel with affine batch inversion (checks DP every step)
         // The old Jacobian kernel only checked DPs every 32 steps, causing ~97% DP misses!
@@ -2327,6 +2574,9 @@ GPUKangarooResult GPUKangarooManager::solve() {
         int threads_per_block = 128;  // Lower for register pressure with batch inversion
         int blocks = (num_threads + threads_per_block - 1) / threads_per_block;
 
+        // T1.6: sticky context error attribution.
+        (void)collider::gpu::pre_launch_context_probe(
+            "kangaroo_step_kernel_sota (single-GPU)");
         kangaroo_step_kernel_sota<<<blocks, threads_per_block>>>(
             state, dp_bits, steps_per_round, num_kangaroos,
             impl_->d_jump_x, impl_->d_jump_y, impl_->d_jump_d
@@ -2352,53 +2602,80 @@ GPUKangarooResult GPUKangarooManager::solve() {
             cudaMemcpy(h_x.data(), impl_->d_x, size_256, cudaMemcpyDeviceToHost);
             cudaMemcpy(h_dist.data(), impl_->d_dist, size_256, cudaMemcpyDeviceToHost);
             cudaMemcpy(h_types.data(), impl_->d_types, size_32, cudaMemcpyDeviceToHost);
+            // /B3: pull wild offsets so the collision algebra has the
+            // per-kangaroo starting-distance correction available.
+            cudaMemcpy(h_wild_offset.data(), impl_->d_wild_offset, size_256,
+                       cudaMemcpyDeviceToHost);
 
             for (size_t idx : dp_indices) {
-                uint64_t x_low = h_x[idx * 4];
+                // key on full 256-bit X. Pre-fix this was x_low only,
+                // silently dropping DPs that collided on low 64 bits but differed
+                // in the upper 192.
+                ::collider::kangaroo::DPKey key{{
+                    h_x[idx * 4 + 0], h_x[idx * 4 + 1],
+                    h_x[idx * 4 + 2], h_x[idx * 4 + 3]
+                }};
 
                 Impl::DPEntry entry;
                 for (int j = 0; j < 4; j++) {
-                    entry.x[j] = h_x[idx * 4 + j];
                     entry.dist[j] = h_dist[idx * 4 + j];
+                    entry.wild_offset[j] = h_wild_offset[idx * 4 + j];
                 }
                 entry.type = h_types[idx];
+                entry.kang_idx = idx;
 
-                auto it = impl_->dp_table.find(x_low);
+                auto it = impl_->dp_table.find(key);
                 if (it != impl_->dp_table.end()) {
-                    // Verify FULL 256-bit X coordinate matches (not just low 64 bits)
-                    bool x_matches = true;
-                    for (int j = 0; j < 4; j++) {
-                        if (it->second.x[j] != entry.x[j]) {
-                            x_matches = false;
-                            break;
-                        }
-                    }
-
-                    if (x_matches && it->second.type != entry.type) {
+                    if (it->second.type != entry.type) {
                         // SOTA 3-Group Collision Detection
                         // True collision: same X coordinate, different kangaroo types
-                        //
                         // Group types:
                         //   0 (KANG_TAME):  Position = dist * G
                         //   1 (KANG_WILD1): Position = Q + dist * G = k*G + dist*G
                         //   2 (KANG_WILD2): Position = -Q + dist * G = -k*G + dist*G
-                        //
                         // Collision formulas:
                         //   Tame-Wild1: dist_t*G = k*G + dist_w1*G  =>  k = dist_t - dist_w1
                         //   Tame-Wild2: dist_t*G = -k*G + dist_w2*G =>  k = dist_w2 - dist_t
                         //   Wild1-Wild2: k*G + dist_w1*G = -k*G + dist_w2*G
                         //               => 2k*G = (dist_w2 - dist_w1)*G
-                        //               => k = (dist_w2 - dist_w1) / 2
-                        //               (only works if dist_w2 - dist_w1 is even)
+                        //               => k = (dist_w2 - dist_w1) / 2 mod n
+                        //               (parity-correct modular halving via cpu::mod_half;
+                        //                see tests/test_mod_half.cpp)
 
                         uint32_t type1 = entry.type;
                         uint32_t type2 = it->second.type;
 
                         cpu::uint256_t d1, d2;
+                        cpu::uint256_t w_off1, w_off2;
                         for (int j = 0; j < 4; j++) {
                             d1.d[j] = entry.dist[j];
                             d2.d[j] = it->second.dist[j];
+                            w_off1.d[j] = entry.wild_offset[j];
+                            w_off2.d[j] = it->second.wild_offset[j];
                         }
+
+                        // Undo a wild's per-instance starting offset before
+                        // plugging it into the collision algebra. For tame
+                        // kangaroos the offset is 0 so the subtraction is a
+                        // no-op. We do this once per side so the type-keyed
+                        // branches below stay readable.
+                        auto undo_offset = [](cpu::uint256_t& dist,
+                                              const cpu::uint256_t& off) {
+                            // dist_real = (dist - off) mod n
+                            if (dist >= off) {
+                                cpu::sub256(dist, dist, off);
+                            } else {
+                                cpu::uint256_t tmp;
+                                cpu::sub256(tmp, off, dist);
+                                cpu::sub256(dist, cpu::SECP256K1_N, tmp);
+                            }
+                        };
+                        // d1 / d2 still hold the raw accumulated dist; subtract
+                        // each kangaroo's recorded starting offset (zero for
+                        // tame) to recover the algebraic distance used in the
+                        // collision formulas below.
+                        undo_offset(d1, w_off1);
+                        undo_offset(d2, w_off2);
 
                         bool collision_valid = false;
 
@@ -2439,8 +2716,11 @@ GPUKangarooResult GPUKangarooManager::solve() {
 
                         } else if ((type1 == KANG_WILD1 && type2 == KANG_WILD2) ||
                                    (type1 == KANG_WILD2 && type2 == KANG_WILD1)) {
-                            // Wild1-Wild2 collision: k = (wild2_dist - wild1_dist) / 2
-                            // This is the "symmetry collision" unique to SOTA
+                            // Wild1-Wild2 collision: k = (wild2_dist - wild1_dist) / 2 mod n.
+                            // This is the "symmetry collision" unique to SOTA 3-group.
+                            // modular halving must handle ODD diff, otherwise
+                            // ~50% of W1-W2 collisions silently produce a wrong key. Use
+                            // cpu::mod_half (parity-correct, KAT'd in test_mod_half.cpp).
                             std::cout << "\n[!] SOTA Collision: Wild1-Wild2 (symmetry)!\n";
 
                             cpu::uint256_t wild1_d = (type1 == KANG_WILD1) ? d1 : d2;
@@ -2455,11 +2735,7 @@ GPUKangarooResult GPUKangarooManager::solve() {
                                 cpu::sub256(diff, cpu::SECP256K1_N, temp);
                             }
 
-                            // Divide by 2 (right shift by 1)
-                            result.private_key.d[0] = (diff.d[0] >> 1) | (diff.d[1] << 63);
-                            result.private_key.d[1] = (diff.d[1] >> 1) | (diff.d[2] << 63);
-                            result.private_key.d[2] = (diff.d[2] >> 1) | (diff.d[3] << 63);
-                            result.private_key.d[3] = diff.d[3] >> 1;
+                            cpu::mod_half(result.private_key, diff, cpu::SECP256K1_N);
                             collision_valid = true;
                         }
 
@@ -2467,10 +2743,32 @@ GPUKangarooResult GPUKangarooManager::solve() {
                             result.found = true;
                             break;
                         }
+                    } else {
+                        // Same-type collision means a kangaroo's trajectory
+                        // cycled through a DP we already saw. A naive
+                        // approach silently overwrites the table entry, so
+                        // the cycled kangaroo keeps producing duplicate DPs
+                        // forever and never contributes a useful cross-type
+                        // collision.
+                        // Instead, tell the kernel to re-randomize whichever
+                        // kangaroo produced the *new* hit (the colliding one).
+                        // The dp_table entry stays at the older identity
+                        // (preserves whichever of the two trajectories has
+                        // been around longer). atomicExch is not available
+                        // in host code, but we hold dp_mutex on this
+                        // unordered_map already (well, here we're in single-
+                        // GPU path so there's no contention) and a single
+                        // 32-bit store is sufficient to flag the kernel.
+                        uint32_t one = 1;
+                        cudaMemcpy(impl_->d_restart_pending + entry.kang_idx,
+                                   &one, sizeof(uint32_t),
+                                   cudaMemcpyHostToDevice);
+                        // Keep the older entry (do NOT overwrite). The newer
+                        // duplicate is discarded after marking its source for
+                        // restart.
                     }
-                    // If x_matches but same type, or x doesn't match: hash collision, ignore
                 } else {
-                    impl_->dp_table[x_low] = entry;
+                    impl_->dp_table[key] = entry;
                 }
             }
 
@@ -2596,14 +2894,21 @@ struct MultiGPUKangarooManager::Impl {
         }
     }
 
-    // Shared DP table (protected by mutex)
+    // Shared DP table keyed on full 256-bit X (DPKey).
+    // Protected by mutex.
+    // Carries the producing kangaroo's wild offset (so we can back-correct
+    // the collision algebra for per-instance offsets) and the
+    // (gpu_idx, kang_idx) pair so the host can flag the kangaroo for
+    // restart on a same-type collision.
     struct DPEntry {
-        uint64_t x[4];
         uint64_t dist[4];
+        uint64_t wild_offset[4];
         uint32_t type;
-        int gpu_id;  // Which GPU found this DP
+        int      gpu_id;     // Which GPU device id found this DP
+        int      gpu_idx;    // Index into gpu_contexts (for d_restart_pending)
+        size_t   kang_idx;   // Index within that GPU's herd
     };
-    std::unordered_map<uint64_t, DPEntry> dp_table;
+    std::unordered_map<::collider::kangaroo::DPKey, DPEntry> dp_table;
     std::mutex dp_mutex;
 
     // Per-GPU state
@@ -2615,6 +2920,9 @@ struct MultiGPUKangarooManager::Impl {
         uint64_t* d_dist = nullptr;
         uint32_t* d_flags = nullptr;
         uint32_t* d_types = nullptr;
+        // Per-kangaroo wild offset + restart-pending flag
+        uint64_t* d_wild_offset = nullptr;
+        uint32_t* d_restart_pending = nullptr;
         // Device memory for jump tables (per-GPU)
         // Using device memory instead of __constant__ fixes RDC + LTO linking issues
         uint64_t* d_jump_x = nullptr;
@@ -2636,6 +2944,19 @@ struct MultiGPUKangarooManager::Impl {
 
     // Result
     std::atomic<bool> found{false};
+    // T1.5 (2026-05-17). Kernel-launch / execution failures previously
+    // overloaded `found = true` to force the per-GPU worker thread to
+    // exit. That tripped the main thread's `impl_->found.load()` check
+    // and made every OTHER GPU bail out as well, producing a silent
+    // "search stopped after N steps" with no diagnostic. Separating
+    // `failed` from `found` lets the workers exit on either condition
+    // while preserving the distinction at the outer caller: the
+    // dispatcher reports a proper "GPU N kernel launch failed" message
+    // when `failed` is set without a `found`, and the result's
+    // `found` field stays accurate.
+    std::atomic<bool> failed{false};
+    std::mutex failure_msg_mutex;
+    std::string failure_msg;
     GPUKangarooResult result;
     std::mutex result_mutex;
 };
@@ -2652,6 +2973,8 @@ MultiGPUKangarooManager::~MultiGPUKangarooManager() {
         if (ctx.d_dist) cudaFree(ctx.d_dist);
         if (ctx.d_flags) cudaFree(ctx.d_flags);
         if (ctx.d_types) cudaFree(ctx.d_types);
+        if (ctx.d_wild_offset) cudaFree(ctx.d_wild_offset);
+        if (ctx.d_restart_pending) cudaFree(ctx.d_restart_pending);
         // Free jump table device memory
         if (ctx.d_jump_x) cudaFree(ctx.d_jump_x);
         if (ctx.d_jump_y) cudaFree(ctx.d_jump_y);
@@ -2765,7 +3088,16 @@ GPUKangarooResult MultiGPUKangarooManager::solve() {
             break;
         }
     }
-    uint64_t mean_jump = 1ULL << (range_bits / 2 - 4);
+    // Multi-GPU herd is num_kangaroos_per_gpu * num_gpus; cap range_bits at
+    // 8 to avoid underflow in the shift. See the matching comment in the
+    // single-GPU solve() above for the full derivation.
+    const uint64_t rb_floor = (range_bits < 8) ? 8 : range_bits;
+    const uint64_t sqrt_l = 1ULL << (rb_floor / 2);
+    const uint64_t total_herd =
+        static_cast<uint64_t>(num_kangaroos_per_gpu) *
+        static_cast<uint64_t>(impl_->gpu_contexts.size());
+    const uint64_t herd = (total_herd > 0) ? total_herd : 1ULL;
+    uint64_t mean_jump = sqrt_l / herd;
     if (mean_jump == 0) mean_jump = 1;
 
     // Generate jump table (same for all GPUs)
@@ -2810,6 +3142,9 @@ GPUKangarooResult MultiGPUKangarooManager::solve() {
         cudaMalloc(&ctx.d_dist, size_256);
         cudaMalloc(&ctx.d_flags, size_32);
         cudaMalloc(&ctx.d_types, size_32);
+        // Per-kangaroo wild offset + restart-pending buffers.
+        cudaMalloc(&ctx.d_wild_offset, size_256);
+        cudaMalloc(&ctx.d_restart_pending, size_32);
         ctx.num_kangaroos = num_kangaroos_per_gpu;
 
         // Upload jump table to this GPU's device memory (not constant - fixes RDC linking)
@@ -2845,32 +3180,64 @@ GPUKangarooResult MultiGPUKangarooManager::solve() {
         }
 
         // SOTA 3-Group initialization for Multi-GPU
-        // 1/3 Tame, 1/3 Wild1 (from Q), 1/3 Wild2 (from -Q)
+        // 1/3 Tame, 1/3 Wild1 (from Q + offset*G), 1/3 Wild2 (from -Q + offset*G)
         std::vector<uint64_t> h_x(num_kangaroos_per_gpu * 4);
         std::vector<uint64_t> h_y(num_kangaroos_per_gpu * 4);
         std::vector<uint64_t> h_z(num_kangaroos_per_gpu * 4);
         std::vector<uint64_t> h_dist(num_kangaroos_per_gpu * 4);
+        std::vector<uint64_t> h_wild_offset(num_kangaroos_per_gpu * 4, 0);
         std::vector<uint32_t> h_types(num_kangaroos_per_gpu);
 
         std::mt19937_64 rng(std::random_device{}() + ctx.device_id);
 
-        // Compute -Q for Wild2 kangaroos
+        // Compute the full 256-bit [range_start, range_end) so Tame
+        // kangaroos can sample uniformly over the actual puzzle range. A
+        // naive loop that ignored range_start and capped scalars at 2^128
+        // (via `1ULL << (range_bits - 64)` plus a 64-bit lower limb)
+        // placed all Tame kangaroos in [0, 2^128) for puzzle 135, i.e.
+        // entirely BELOW the puzzle range. The collision algebra then
+        // returned a "private key" that mathematically existed but lay
+        // outside the puzzle range, and the runner discarded it.
+        cpu::uint256_t mg_range_start_256, mg_range_end_256, mg_range_size_256;
+        mg_range_start_256.d[0] = impl_->range_start.parts[0];
+        mg_range_start_256.d[1] = impl_->range_start.parts[1];
+        mg_range_start_256.d[2] = impl_->range_start.parts[2];
+        mg_range_start_256.d[3] = impl_->range_start.parts[3];
+        mg_range_end_256.d[0] = impl_->range_end.parts[0];
+        mg_range_end_256.d[1] = impl_->range_end.parts[1];
+        mg_range_end_256.d[2] = impl_->range_end.parts[2];
+        mg_range_end_256.d[3] = impl_->range_end.parts[3];
+        cpu::sub256(mg_range_size_256, mg_range_end_256, mg_range_start_256);
+
+        // Compute -Q for Wild2 kangaroos (in affine).
         cpu::uint256_t neg_Qy;
         cpu::sub256(neg_Qy, cpu::SECP256K1_P, impl_->target_pubkey_y);
+
+        // Build a Jacobian point from the affine Q so the wild
+        // add-offset loop can pass it to cpu::ec_add directly.
+        cpu::ECPoint QP, NegQP;
+        QP.X = impl_->target_pubkey_x;
+        QP.Y = impl_->target_pubkey_y;
+        QP.Z.d[0] = 1; QP.Z.d[1] = 0; QP.Z.d[2] = 0; QP.Z.d[3] = 0;
+
+        NegQP.X = impl_->target_pubkey_x;
+        NegQP.Y = neg_Qy;
+        NegQP.Z = QP.Z;
 
         int third = num_kangaroos_per_gpu / 3;
 
         for (int i = 0; i < num_kangaroos_per_gpu; i++) {
             if (i < third) {
-                // TAME (Type 0): start at random k*G in range
+                // TAME (Type 0): start at range_start + offset*G for a
+                // uniform random offset in [0, range_size). Matches the
+                // single-GPU init path.
                 h_types[i] = KANG_TAME;
 
-                uint64_t k = rng() % (1ULL << (range_bits - 64));
+                cpu::uint256_t offset;
+                cpu::random_below(offset, [&]() { return rng(); }, mg_range_size_256);
+
                 cpu::uint256_t scalar;
-                scalar.d[0] = rng();
-                scalar.d[1] = k;
-                scalar.d[2] = 0;
-                scalar.d[3] = 0;
+                cpu::add256(scalar, mg_range_start_256, offset);
 
                 cpu::ECPoint P;
                 cpu::ec_mul(P, scalar);
@@ -2885,27 +3252,63 @@ GPUKangarooResult MultiGPUKangarooManager::solve() {
                 }
 
             } else if (i < 2 * third) {
-                // WILD1 (Type 1): start at Q
+                // WILD1 (Type 1): start at Q + offset_i*G with per-instance
+                // offset. See single-GPU init_kangaroos for the full
+                // motivation.
                 h_types[i] = KANG_WILD1;
 
-                // Distance starts at 0
+                cpu::uint256_t offset_i;
+                offset_i.d[0] = rng();
+                offset_i.d[1] = rng() & 0x3FFFFFFFFFFFFFFFULL;
+                offset_i.d[2] = 0;
+                offset_i.d[3] = 0;
+
+                cpu::ECPoint OG;
+                cpu::ec_mul(OG, offset_i);
+                cpu::uint256_t og_x, og_y;
+                cpu::ec_to_affine(og_x, og_y, OG);
+
+                cpu::ECPoint W1;
+                cpu::ec_add(W1, QP, og_x, og_y);
+
+                cpu::uint256_t w1_x, w1_y;
+                cpu::ec_to_affine(w1_x, w1_y, W1);
+
                 for (int j = 0; j < 4; j++) {
-                    h_x[i * 4 + j] = impl_->target_pubkey_x.d[j];
-                    h_y[i * 4 + j] = impl_->target_pubkey_y.d[j];
+                    h_x[i * 4 + j] = w1_x.d[j];
+                    h_y[i * 4 + j] = w1_y.d[j];
                     h_z[i * 4 + j] = (j == 0) ? 1 : 0;
-                    h_dist[i * 4 + j] = 0;
+                    h_dist[i * 4 + j] = offset_i.d[j];
+                    h_wild_offset[i * 4 + j] = offset_i.d[j];
                 }
 
             } else {
-                // WILD2 (Type 2): start at -Q (mirror)
+                // WILD2 (Type 2): start at -Q + offset_i*G.
                 h_types[i] = KANG_WILD2;
 
-                // Distance starts at 0
+                cpu::uint256_t offset_i;
+                offset_i.d[0] = rng();
+                offset_i.d[1] = rng() & 0x3FFFFFFFFFFFFFFFULL;
+                offset_i.d[2] = 0;
+                offset_i.d[3] = 0;
+
+                cpu::ECPoint OG;
+                cpu::ec_mul(OG, offset_i);
+                cpu::uint256_t og_x, og_y;
+                cpu::ec_to_affine(og_x, og_y, OG);
+
+                cpu::ECPoint W2;
+                cpu::ec_add(W2, NegQP, og_x, og_y);
+
+                cpu::uint256_t w2_x, w2_y;
+                cpu::ec_to_affine(w2_x, w2_y, W2);
+
                 for (int j = 0; j < 4; j++) {
-                    h_x[i * 4 + j] = impl_->target_pubkey_x.d[j];  // X same
-                    h_y[i * 4 + j] = neg_Qy.d[j];                   // Y negated
+                    h_x[i * 4 + j] = w2_x.d[j];
+                    h_y[i * 4 + j] = w2_y.d[j];
                     h_z[i * 4 + j] = (j == 0) ? 1 : 0;
-                    h_dist[i * 4 + j] = 0;
+                    h_dist[i * 4 + j] = offset_i.d[j];
+                    h_wild_offset[i * 4 + j] = offset_i.d[j];
                 }
             }
         }
@@ -2915,7 +3318,9 @@ GPUKangarooResult MultiGPUKangarooManager::solve() {
         cudaMemcpy(ctx.d_z, h_z.data(), size_256, cudaMemcpyHostToDevice);
         cudaMemcpy(ctx.d_dist, h_dist.data(), size_256, cudaMemcpyHostToDevice);
         cudaMemcpy(ctx.d_types, h_types.data(), size_32, cudaMemcpyHostToDevice);
+        cudaMemcpy(ctx.d_wild_offset, h_wild_offset.data(), size_256, cudaMemcpyHostToDevice);
         cudaMemset(ctx.d_flags, 0, size_32);
+        cudaMemset(ctx.d_restart_pending, 0, size_32);
 
         std::cout << "[*] GPU " << ctx.device_id << ": Initialized "
                   << num_kangaroos_per_gpu << " kangaroos\n";
@@ -2924,6 +3329,11 @@ GPUKangarooResult MultiGPUKangarooManager::solve() {
     impl_->total_steps = 0;
     impl_->total_dps = 0;
     impl_->found = false;
+    impl_->failed = false;
+    {
+        std::lock_guard<std::mutex> lk(impl_->failure_msg_mutex);
+        impl_->failure_msg.clear();
+    }
     impl_->result.found = false;
 
     auto last_report = start_time;
@@ -2951,6 +3361,7 @@ GPUKangarooResult MultiGPUKangarooManager::solve() {
 
             std::vector<uint64_t> h_x(ctx.num_kangaroos * 4);
             std::vector<uint64_t> h_dist(ctx.num_kangaroos * 4);
+            std::vector<uint64_t> h_wild_off_per(ctx.num_kangaroos * 4);
             std::vector<uint32_t> h_flags(ctx.num_kangaroos);
             std::vector<uint32_t> h_types(ctx.num_kangaroos);
 
@@ -2958,7 +3369,7 @@ GPUKangarooResult MultiGPUKangarooManager::solve() {
             uint64_t local_rounds = 0;  // Track rounds for work stealing
             uint64_t local_dps = 0;     // Track DPs for productivity
 
-            while (!stop_flag.load() && !impl_->found.load()) {
+            while (!stop_flag.load() && !impl_->found.load() && !impl_->failed.load()) {
                 // =====================================================================
                 // WORK STEALING CHECK
                 // =====================================================================
@@ -2994,6 +3405,8 @@ GPUKangarooResult MultiGPUKangarooManager::solve() {
                 state.dist = ctx.d_dist;
                 state.flags = ctx.d_flags;
                 state.types = ctx.d_types;
+                state.wild_offset = ctx.d_wild_offset;
+                state.restart_pending = ctx.d_restart_pending;
 
                 // Use SOTA 3-group kernel with affine batch inversion (checks DP every step)
                 // The old Jacobian kernel only checked DPs every 32 steps, causing ~97% DP misses!
@@ -3001,14 +3414,31 @@ GPUKangarooResult MultiGPUKangarooManager::solve() {
                 int threads_per_block = 128;  // Lower for register pressure with batch inversion
                 int blocks = (num_threads + threads_per_block - 1) / threads_per_block;
 
+                // T1.6: sticky context error attribution. The probe
+                // distinguishes a fresh launch failure from a cascade
+                // carried over from a prior kernel on this device.
+                (void)collider::gpu::pre_launch_context_probe(
+                    "kangaroo_step_kernel_sota (multi-GPU)");
                 kangaroo_step_kernel_sota<<<blocks, threads_per_block>>>(
                     state, dp_bits, steps_per_round, ctx.num_kangaroos,
                     ctx.d_jump_x, ctx.d_jump_y, ctx.d_jump_d
                 );
                 cudaError_t kernel_err = cudaGetLastError();
                 if (kernel_err != cudaSuccess) {
-                    fprintf(stderr, "\n[CUDA ERROR] Kernel launch failed: %s\n", cudaGetErrorString(kernel_err));
-                    impl_->found = true;  // Force exit
+                    // T1.5: signal failure via the dedicated `failed`
+                    // atomic instead of `found`. Other GPU worker threads
+                    // observe `failed` and exit their loops without their
+                    // result.found bit being flipped, and the outer
+                    // dispatcher reports the actual GPU id + CUDA error.
+                    std::string msg =
+                        "[CUDA ERROR] GPU " + std::to_string(ctx.device_id) +
+                        " kernel launch failed: " + cudaGetErrorString(kernel_err);
+                    fprintf(stderr, "\n%s\n", msg.c_str());
+                    {
+                        std::lock_guard<std::mutex> lk(impl_->failure_msg_mutex);
+                        if (impl_->failure_msg.empty()) impl_->failure_msg = msg;
+                    }
+                    impl_->failed.store(true);
                     break;
                 }
 
@@ -3041,8 +3471,17 @@ GPUKangarooResult MultiGPUKangarooManager::solve() {
                 cudaDeviceSynchronize();
                 kernel_err = cudaGetLastError();
                 if (kernel_err != cudaSuccess) {
-                    fprintf(stderr, "\n[CUDA ERROR] Kernel execution failed: %s\n", cudaGetErrorString(kernel_err));
-                    impl_->found = true;  // Force exit
+                    // T1.5: failure path (see matching comment on the
+                    // post-launch peek above). Set `failed`, not `found`.
+                    std::string msg =
+                        "[CUDA ERROR] GPU " + std::to_string(ctx.device_id) +
+                        " kernel execution failed: " + cudaGetErrorString(kernel_err);
+                    fprintf(stderr, "\n%s\n", msg.c_str());
+                    {
+                        std::lock_guard<std::mutex> lk(impl_->failure_msg_mutex);
+                        if (impl_->failure_msg.empty()) impl_->failure_msg = msg;
+                    }
+                    impl_->failed.store(true);
                     break;
                 }
 
@@ -3068,32 +3507,33 @@ GPUKangarooResult MultiGPUKangarooManager::solve() {
                     cudaMemcpy(h_dist.data(), ctx.d_dist, size_256, cudaMemcpyDeviceToHost);
                     cudaMemcpy(h_types.data(), ctx.d_types, ctx.num_kangaroos * sizeof(uint32_t),
                                cudaMemcpyDeviceToHost);
+                    // /B3: pull per-kangaroo wild offsets for collision algebra.
+                    cudaMemcpy(h_wild_off_per.data(), ctx.d_wild_offset, size_256,
+                               cudaMemcpyDeviceToHost);
 
                     // Process DPs with shared table lock
                     std::lock_guard<std::mutex> lock(impl_->dp_mutex);
 
                     for (size_t idx : dp_indices) {
-                        uint64_t x_low = h_x[idx * 4];
+                        // full-256 DPKey.
+                        ::collider::kangaroo::DPKey key{{
+                            h_x[idx * 4 + 0], h_x[idx * 4 + 1],
+                            h_x[idx * 4 + 2], h_x[idx * 4 + 3]
+                        }};
 
                         Impl::DPEntry entry;
                         for (int j = 0; j < 4; j++) {
-                            entry.x[j] = h_x[idx * 4 + j];
                             entry.dist[j] = h_dist[idx * 4 + j];
+                            entry.wild_offset[j] = h_wild_off_per[idx * 4 + j];
                         }
                         entry.type = h_types[idx];
                         entry.gpu_id = ctx.device_id;
+                        entry.gpu_idx = static_cast<int>(gpu_idx);
+                        entry.kang_idx = idx;
 
-                        auto it = impl_->dp_table.find(x_low);
+                        auto it = impl_->dp_table.find(key);
                         if (it != impl_->dp_table.end()) {
-                            bool x_matches = true;
-                            for (int j = 0; j < 4; j++) {
-                                if (it->second.x[j] != entry.x[j]) {
-                                    x_matches = false;
-                                    break;
-                                }
-                            }
-
-                            if (x_matches && it->second.type != entry.type) {
+                            if (it->second.type != entry.type) {
                                 // SOTA 3-Group Collision on Multi-GPU
                                 std::cout << "\n[!] COLLISION on GPU " << ctx.device_id
                                           << " (with DP from GPU " << it->second.gpu_id << ")\n";
@@ -3102,10 +3542,31 @@ GPUKangarooResult MultiGPUKangarooManager::solve() {
                                 uint32_t type2 = it->second.type;
 
                                 cpu::uint256_t d1, d2;
+                                cpu::uint256_t w_off1, w_off2;
                                 for (int j = 0; j < 4; j++) {
                                     d1.d[j] = entry.dist[j];
                                     d2.d[j] = it->second.dist[j];
+                                    w_off1.d[j] = entry.wild_offset[j];
+                                    w_off2.d[j] = it->second.wild_offset[j];
                                 }
+
+                                // /B3: undo each kangaroo's recorded
+                                // starting offset (zero for tames) before
+                                // plugging the distances into the collision
+                                // algebra. See single-GPU collision handler
+                                // for the full motivation.
+                                auto undo_offset = [](cpu::uint256_t& dist,
+                                                      const cpu::uint256_t& off) {
+                                    if (dist >= off) {
+                                        cpu::sub256(dist, dist, off);
+                                    } else {
+                                        cpu::uint256_t tmp;
+                                        cpu::sub256(tmp, off, dist);
+                                        cpu::sub256(dist, cpu::SECP256K1_N, tmp);
+                                    }
+                                };
+                                undo_offset(d1, w_off1);
+                                undo_offset(d2, w_off2);
 
                                 std::lock_guard<std::mutex> rlock(impl_->result_mutex);
                                 bool collision_valid = false;
@@ -3142,6 +3603,9 @@ GPUKangarooResult MultiGPUKangarooManager::solve() {
 
                                 } else if ((type1 == KANG_WILD1 && type2 == KANG_WILD2) ||
                                            (type1 == KANG_WILD2 && type2 == KANG_WILD1)) {
+                                    // parity-correct modular halving (see
+                                    // cpu::mod_half + tests/test_mod_half.cpp). Pre-fix
+                                    // right-shift silently produced wrong keys on odd diff.
                                     std::cout << "[!] SOTA: Wild1-Wild2 symmetry collision\n";
                                     cpu::uint256_t wild1_d = (type1 == KANG_WILD1) ? d1 : d2;
                                     cpu::uint256_t wild2_d = (type1 == KANG_WILD2) ? d1 : d2;
@@ -3155,11 +3619,7 @@ GPUKangarooResult MultiGPUKangarooManager::solve() {
                                         cpu::sub256(diff, cpu::SECP256K1_N, temp);
                                     }
 
-                                    // Divide by 2
-                                    impl_->result.private_key.d[0] = (diff.d[0] >> 1) | (diff.d[1] << 63);
-                                    impl_->result.private_key.d[1] = (diff.d[1] >> 1) | (diff.d[2] << 63);
-                                    impl_->result.private_key.d[2] = (diff.d[2] >> 1) | (diff.d[3] << 63);
-                                    impl_->result.private_key.d[3] = diff.d[3] >> 1;
+                                    cpu::mod_half(impl_->result.private_key, diff, cpu::SECP256K1_N);
                                     collision_valid = true;
                                 }
 
@@ -3168,9 +3628,23 @@ GPUKangarooResult MultiGPUKangarooManager::solve() {
                                     impl_->found = true;
                                     return;
                                 }
+                            } else {
+                                // Same-type collision = cycled kangaroo.
+                                // Flag the colliding kangaroo for restart
+                                // and keep the older entry. The kernel
+                                // reads d_restart_pending at the top of its
+                                // next launch and rerandomizes the
+                                // position. See single-GPU branch for full
+                                // rationale.
+                                uint32_t one = 1;
+                                cudaSetDevice(ctx.device_id);
+                                cudaMemcpy(
+                                    ctx.d_restart_pending + entry.kang_idx,
+                                    &one, sizeof(uint32_t),
+                                    cudaMemcpyHostToDevice);
                             }
                         } else {
-                            impl_->dp_table[x_low] = entry;
+                            impl_->dp_table[key] = entry;
                         }
                     }
 
@@ -3181,7 +3655,7 @@ GPUKangarooResult MultiGPUKangarooManager::solve() {
     }
 
     // Main thread: report progress
-    while (!stop_flag.load() && !impl_->found.load()) {
+    while (!stop_flag.load() && !impl_->found.load() && !impl_->failed.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
         auto now = std::chrono::high_resolution_clock::now();
@@ -3215,6 +3689,21 @@ GPUKangarooResult MultiGPUKangarooManager::solve() {
     if (impl_->found.load()) {
         std::lock_guard<std::mutex> lock(impl_->result_mutex);
         result = impl_->result;
+    } else if (impl_->failed.load()) {
+        // T1.5: dispatcher path. A GPU kernel failed. Make sure
+        // result.found is NOT set, surface the captured failure message,
+        // and let the caller distinguish a clean stop from a failure.
+        result.found = false;
+        std::string msg;
+        {
+            std::lock_guard<std::mutex> lk(impl_->failure_msg_mutex);
+            msg = impl_->failure_msg;
+        }
+        if (!msg.empty()) {
+            fprintf(stderr, "[!] Multi-GPU kangaroo solve aborted: %s\n", msg.c_str());
+        } else {
+            fprintf(stderr, "[!] Multi-GPU kangaroo solve aborted: a GPU kernel failed\n");
+        }
     }
 
     result.total_steps = impl_->total_steps.load();
@@ -3230,9 +3719,380 @@ GPUKangarooResult MultiGPUKangarooManager::solve() {
         if (ctx.d_dist) { cudaFree(ctx.d_dist); ctx.d_dist = nullptr; }
         if (ctx.d_flags) { cudaFree(ctx.d_flags); ctx.d_flags = nullptr; }
         if (ctx.d_types) { cudaFree(ctx.d_types); ctx.d_types = nullptr; }
+        if (ctx.d_wild_offset) { cudaFree(ctx.d_wild_offset); ctx.d_wild_offset = nullptr; }
+        if (ctx.d_restart_pending) { cudaFree(ctx.d_restart_pending); ctx.d_restart_pending = nullptr; }
     }
 
     return result;
+}
+
+// ============================================================================
+// Herd state serialization
+// ============================================================================
+// The on-disk format and motivation live in the kangaroo_solver_gpu.hpp
+// header doc-comment. This implementation:
+//   1. computes a 32-byte SHA256 of [range_start_be || range_end_be] for
+//      the config-fingerprint header field;
+//   2. for each GPU, downloads (d_x, d_y, d_dist, d_wild_offset, d_types)
+//      to host memory and writes them sequentially to the file;
+//   3. on load, performs the reverse plus a header validation that
+//      refuses to apply state from a different puzzle / herd shape.
+// Notes:
+//   * The d_z buffer is omitted from the saved file because the affine
+//     pipeline (SOTA / JLP kernels) sets Z=1 implicitly on every save.
+//     On load, the kernel's per-step batch inversion reconstructs the
+//     correct Z without any external help.
+//   * The d_flags and d_restart_pending buffers are NOT saved either:
+//     flags are cleared every host loop iteration, and restart_pending
+//     is a transient signal that becomes meaningless across a restart.
+//   * No protection is provided against the file being corrupted on
+//     disk; the header check guards against config mismatch but not
+//     against bit-flips in the body. A future revision can add a
+//     trailing SHA256 of the body if the runner team wants that.
+
+namespace tierc_helpers {
+
+constexpr const char kHerdMagic[16] = {
+    'C','O','L','L','I','D','E','R','_','K','A','N','G','\x01','\x00','\x00'
+};
+constexpr uint32_t kHerdVersion = 1u;
+constexpr size_t   kBytesPerKangaroo = 32 /*x*/ + 32 /*y*/ + 32 /*dist*/
+                                     + 32 /*wild_off*/ + 4 /*type*/ + 4 /*pad*/;
+
+// Build the 32-byte range fingerprint that goes into the header. Both
+// range_start and range_end are serialized big-endian 32-byte limbs.
+static void compute_range_hash(const UInt256& range_start,
+                               const UInt256& range_end,
+                               uint8_t out_sha[32]) {
+    uint8_t buf[64];
+    // range_start big-endian
+    for (int limb = 3; limb >= 0; --limb) {
+        const uint64_t v = range_start.parts[limb];
+        const size_t off = (3 - limb) * 8;
+        for (int b = 0; b < 8; ++b) {
+            buf[off + b] = static_cast<uint8_t>(v >> (56 - b * 8));
+        }
+    }
+    // range_end big-endian
+    for (int limb = 3; limb >= 0; --limb) {
+        const uint64_t v = range_end.parts[limb];
+        const size_t off = 32 + (3 - limb) * 8;
+        for (int b = 0; b < 8; ++b) {
+            buf[off + b] = static_cast<uint8_t>(v >> (56 - b * 8));
+        }
+    }
+    auto h = cpu::SHA256::hash(buf, 64);
+    std::memcpy(out_sha, h.data(), 32);
+}
+
+}  // namespace tierc_helpers
+
+bool MultiGPUKangarooManager::save_herd_state(const std::string& path) {
+    if (!impl_ || impl_->gpu_contexts.empty()) return false;
+
+    const size_t num_gpus = impl_->gpu_contexts.size();
+    if (num_gpus == 0) return false;
+
+    // All GPU contexts share the same kangaroo count post-init.
+    const int n = impl_->gpu_contexts[0].num_kangaroos;
+    if (n <= 0) return false;
+    for (size_t g = 1; g < num_gpus; ++g) {
+        if (impl_->gpu_contexts[g].num_kangaroos != n) return false;
+    }
+
+    FILE* fp = std::fopen(path.c_str(), "wb");
+    if (!fp) return false;
+
+    // Header
+    if (std::fwrite(tierc_helpers::kHerdMagic, 1, 16, fp) != 16) {
+        std::fclose(fp); return false;
+    }
+    const uint32_t version = tierc_helpers::kHerdVersion;
+    const uint32_t gpus_u32 = static_cast<uint32_t>(num_gpus);
+    const uint32_t n_u32 = static_cast<uint32_t>(n);
+    const uint32_t dp_u32 = dp_bits;
+
+    auto write_u32 = [&](uint32_t v) {
+        uint8_t b[4] = {
+            static_cast<uint8_t>(v & 0xFF),
+            static_cast<uint8_t>((v >> 8) & 0xFF),
+            static_cast<uint8_t>((v >> 16) & 0xFF),
+            static_cast<uint8_t>((v >> 24) & 0xFF)
+        };
+        return std::fwrite(b, 1, 4, fp) == 4;
+    };
+    if (!write_u32(version) || !write_u32(gpus_u32)
+        || !write_u32(n_u32) || !write_u32(dp_u32)) {
+        std::fclose(fp); return false;
+    }
+
+    uint8_t range_hash[32];
+    tierc_helpers::compute_range_hash(impl_->range_start, impl_->range_end, range_hash);
+    if (std::fwrite(range_hash, 1, 32, fp) != 32) {
+        std::fclose(fp); return false;
+    }
+
+    // Per-GPU per-kangaroo records.
+    // Q11: the prior implementation re-downloaded the full x/y/dist/
+    // wild_offset/type device buffers ONCE PER KANGAROO inside the inner
+    // loop. That made the persistence path O(n^2) in cudaMemcpy bytes:
+    // for n = 64K kangaroos and 32 B per limb the inner loop transferred
+    // ~512 GiB of identical data per save_herd_state() call. Resolution
+    // by inspection (no profiler needed): the device buffers are immutable
+    // for the duration of a save (no other thread is touching them; this
+    // is called between scan iterations), so each buffer is downloaded
+    // exactly once per GPU and then indexed for each record. The new
+    // shape is O(n) cudaMemcpy bytes: 4 * n * 32 + n * 4 = (128 n + 4 n)
+    // bytes per GPU, independent of the inner record loop.
+    std::vector<uint64_t> h_x(n * 4);
+    std::vector<uint64_t> h_y(n * 4);
+    std::vector<uint64_t> h_dist(n * 4);
+    std::vector<uint64_t> h_wild_offset(n * 4);
+    std::vector<uint32_t> h_types(n);
+    for (auto& ctx : impl_->gpu_contexts) {
+        cudaSetDevice(ctx.device_id);
+
+        auto download_256 = [&](uint64_t* d_src, uint64_t* h_dst) {
+            return cudaMemcpy(h_dst, d_src,
+                              n * 4 * sizeof(uint64_t),
+                              cudaMemcpyDeviceToHost) == cudaSuccess;
+        };
+
+        // Download each buffer exactly once per GPU. Order in the
+        // file: x, y, dist, wild_offset, type.
+        if (!download_256(ctx.d_x,           h_x.data()))           { std::fclose(fp); return false; }
+        if (!download_256(ctx.d_y,           h_y.data()))           { std::fclose(fp); return false; }
+        if (!download_256(ctx.d_dist,        h_dist.data()))        { std::fclose(fp); return false; }
+        if (!download_256(ctx.d_wild_offset, h_wild_offset.data())) { std::fclose(fp); return false; }
+        if (cudaMemcpy(h_types.data(), ctx.d_types,
+                       n * sizeof(uint32_t),
+                       cudaMemcpyDeviceToHost) != cudaSuccess) {
+            std::fclose(fp); return false;
+        }
+
+        for (int i = 0; i < n; ++i) {
+            // Per-kangaroo record (136 bytes).
+            uint8_t rec[tierc_helpers::kBytesPerKangaroo];
+            auto write_limb = [&](const uint64_t* src, size_t off) {
+                std::memcpy(rec + off, src, 32);
+            };
+
+            write_limb(&h_x[i * 4],           0);
+            write_limb(&h_y[i * 4],           32);
+            write_limb(&h_dist[i * 4],        64);
+            write_limb(&h_wild_offset[i * 4], 96);
+
+            const uint32_t t = h_types[i];
+            rec[128] = static_cast<uint8_t>(t & 0xFF);
+            rec[129] = static_cast<uint8_t>((t >> 8) & 0xFF);
+            rec[130] = static_cast<uint8_t>((t >> 16) & 0xFF);
+            rec[131] = static_cast<uint8_t>((t >> 24) & 0xFF);
+            rec[132] = 0; rec[133] = 0; rec[134] = 0; rec[135] = 0;
+
+            if (std::fwrite(rec, 1, sizeof(rec), fp) != sizeof(rec)) {
+                std::fclose(fp); return false;
+            }
+        }
+    }
+
+    std::fflush(fp);
+    std::fclose(fp);
+    return true;
+}
+
+bool MultiGPUKangarooManager::load_herd_state(const std::string& path) {
+    if (!impl_ || impl_->gpu_contexts.empty()) return false;
+
+    FILE* fp = std::fopen(path.c_str(), "rb");
+    if (!fp) return false;
+
+    // Header
+    char magic[16];
+    if (std::fread(magic, 1, 16, fp) != 16) { std::fclose(fp); return false; }
+    if (std::memcmp(magic, tierc_helpers::kHerdMagic, 16) != 0) {
+        std::fclose(fp); return false;
+    }
+
+    auto read_u32 = [&](uint32_t& v) {
+        uint8_t b[4];
+        if (std::fread(b, 1, 4, fp) != 4) return false;
+        v = static_cast<uint32_t>(b[0])
+          | (static_cast<uint32_t>(b[1]) << 8)
+          | (static_cast<uint32_t>(b[2]) << 16)
+          | (static_cast<uint32_t>(b[3]) << 24);
+        return true;
+    };
+
+    uint32_t file_version = 0, file_gpus = 0, file_n = 0, file_dp = 0;
+    if (!read_u32(file_version) || !read_u32(file_gpus)
+        || !read_u32(file_n) || !read_u32(file_dp)) {
+        std::fclose(fp); return false;
+    }
+    if (file_version != tierc_helpers::kHerdVersion) {
+        std::fclose(fp); return false;
+    }
+
+    // Validate config matches.
+    if (file_gpus != static_cast<uint32_t>(impl_->gpu_contexts.size())
+        || file_n != static_cast<uint32_t>(num_kangaroos_per_gpu)
+        || file_dp != dp_bits) {
+        std::fclose(fp); return false;
+    }
+
+    uint8_t file_range_hash[32];
+    if (std::fread(file_range_hash, 1, 32, fp) != 32) {
+        std::fclose(fp); return false;
+    }
+    uint8_t expected_range_hash[32];
+    tierc_helpers::compute_range_hash(impl_->range_start, impl_->range_end,
+                                      expected_range_hash);
+    if (std::memcmp(file_range_hash, expected_range_hash, 32) != 0) {
+        std::fclose(fp); return false;
+    }
+
+    // Per-GPU body.
+    const int n = static_cast<int>(file_n);
+    std::vector<uint64_t> h_x(n * 4), h_y(n * 4), h_dist(n * 4), h_wild(n * 4);
+    std::vector<uint32_t> h_types(n);
+    size_t size_256 = n * 4 * sizeof(uint64_t);
+    size_t size_32  = n * sizeof(uint32_t);
+
+    for (auto& ctx : impl_->gpu_contexts) {
+        for (int i = 0; i < n; ++i) {
+            uint8_t rec[tierc_helpers::kBytesPerKangaroo];
+            if (std::fread(rec, 1, sizeof(rec), fp) != sizeof(rec)) {
+                std::fclose(fp); return false;
+            }
+            std::memcpy(&h_x[i * 4],    rec + 0,  32);
+            std::memcpy(&h_y[i * 4],    rec + 32, 32);
+            std::memcpy(&h_dist[i * 4], rec + 64, 32);
+            std::memcpy(&h_wild[i * 4], rec + 96, 32);
+            const uint32_t t =
+                static_cast<uint32_t>(rec[128])
+              | (static_cast<uint32_t>(rec[129]) << 8)
+              | (static_cast<uint32_t>(rec[130]) << 16)
+              | (static_cast<uint32_t>(rec[131]) << 24);
+            h_types[i] = t;
+        }
+
+        cudaSetDevice(ctx.device_id);
+        cudaMemcpy(ctx.d_x, h_x.data(), size_256, cudaMemcpyHostToDevice);
+        cudaMemcpy(ctx.d_y, h_y.data(), size_256, cudaMemcpyHostToDevice);
+        cudaMemcpy(ctx.d_dist, h_dist.data(), size_256, cudaMemcpyHostToDevice);
+        cudaMemcpy(ctx.d_wild_offset, h_wild.data(), size_256, cudaMemcpyHostToDevice);
+        cudaMemcpy(ctx.d_types, h_types.data(), size_32, cudaMemcpyHostToDevice);
+        // Z is implicitly 1 in the affine pipeline; the kernel's first
+        // batch inversion step will write Z=1 on its first DP store and
+        // the host loop never reads Z prior to that. Reset flags +
+        // restart_pending so a saved-mid-step DP isn't reprocessed.
+        cudaMemset(ctx.d_flags, 0, size_32);
+        cudaMemset(ctx.d_restart_pending, 0, size_32);
+    }
+
+    std::fclose(fp);
+    return true;
+}
+
+// ============================================================================
+// T3.3 (2026-05-17). Test-only kernel-driver entry point for the dx==0
+// SIMT guard. The CPU mirror in tests/test_kangaroo_dxz_fuzz.cpp pins the
+// algebraic property of the guard but does NOT exercise the actual CUDA
+// kernel path. A refactor that drops the guard from
+// kangaroo_step_kernel_jlp / kangaroo_step_kernel_sota while leaving the
+// CPU mirror intact would still pass the existing test.
+//
+// This entry point mirrors the dx==0 detection + dx=1 substitution +
+// batch_mod_inv pre-process from kangaroo_step_kernel_sota lines
+// ~1340-1374 inside a single launch. The host test:
+//   1. Builds a dx[GPU_GRP_SIZE][4] batch with random non-zero limbs.
+//   2. Injects a zero at one or more lanes.
+//   3. Launches this kernel with one thread (one SIMT group).
+//   4. Reads back the inverted dx values + the dx_was_zero flag mask.
+//   5. Verifies for every non-injected lane: dx_inv * dx_original == 1
+//      (mod p) and for every injected lane: dx_was_zero[g] == 1 plus
+//      dx_inv == 1 (since the substituted dx=1 inverts to 1).
+//
+// Without the guard the product chain would zero out at the injected
+// lane, every back-propagated inverse would be 0, and the verification
+// would fail on every non-injected lane, a strict witness that the
+// guard is present in the kernel binary actually shipping. The kernel
+// launches with one thread because the guard runs entirely within one
+// SIMT group (per-thread); covering multiple groups is identical work.
+// ============================================================================
+
+__global__ void test_only_kangaroo_dxz_guard_kernel(
+    const uint64_t* __restrict__ d_input_dx,   // [GPU_GRP_SIZE * 4] LE limbs
+    uint64_t* __restrict__       d_output_dx,  // [GPU_GRP_SIZE * 4] inverted
+    uint8_t* __restrict__        d_dx_was_zero // [GPU_GRP_SIZE] flag mask
+) {
+    // Single thread per launch: this exercises one SIMT group, which is
+    // the unit at which the guard operates.
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+
+    uint64_t dx[GPU_GRP_SIZE][4];
+    bool was_zero[GPU_GRP_SIZE];
+
+    // Load input.
+    for (int g = 0; g < GPU_GRP_SIZE; ++g) {
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            dx[g][i] = d_input_dx[g * 4 + i];
+        }
+    }
+
+    // Apply the EXACT guard logic from kangaroo_step_kernel_sota lines
+    // ~1361-1370 (kangaroo_step_kernel_jlp uses the same pattern). If
+    // this loop is ever removed from production, the test will detect
+    // poisoned back-propagated inverses on every non-zero lane.
+    for (int g = 0; g < GPU_GRP_SIZE; ++g) {
+        bool is_zero =
+            (dx[g][0] == 0 && dx[g][1] == 0 && dx[g][2] == 0 && dx[g][3] == 0);
+        was_zero[g] = is_zero;
+        if (is_zero) {
+            dx[g][0] = 1; dx[g][1] = 0; dx[g][2] = 0; dx[g][3] = 0;
+        }
+    }
+
+    // Run the same batch inversion the kernel uses. If the guard is
+    // dropped, this would invert a zero element and back-propagate 0
+    // across every lane.
+    batch_mod_inv(dx);
+
+    // Write results back.
+    for (int g = 0; g < GPU_GRP_SIZE; ++g) {
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            d_output_dx[g * 4 + i] = dx[g][i];
+        }
+        d_dx_was_zero[g] = was_zero[g] ? 1 : 0;
+    }
+}
+
+// Host-callable C entry point. Mirrors the puzzle_optimized.cu
+// test_only_* convention. Allocates no device memory itself; the caller
+// supplies device pointers sized for GPU_GRP_SIZE elements.
+extern "C" cudaError_t test_only_kangaroo_dxz_guard_launch(
+    const void* d_input_dx,
+    void*       d_output_dx,
+    uint8_t*    d_dx_was_zero,
+    int*        out_gpu_grp_size,
+    cudaStream_t stream
+) {
+    if (out_gpu_grp_size) *out_gpu_grp_size = GPU_GRP_SIZE;
+    if (!d_input_dx || !d_output_dx || !d_dx_was_zero) {
+        return cudaErrorInvalidValue;
+    }
+    // T1.6: sticky context error attribution. Skip the launch entirely
+    // when the context is already poisoned so the test sees the actual
+    // probe diagnostic rather than a confusing post-launch failure.
+    cudaError_t pre = collider::gpu::pre_launch_context_probe(
+        "test_only_kangaroo_dxz_guard_kernel");
+    if (pre != cudaSuccess) return pre;
+    test_only_kangaroo_dxz_guard_kernel<<<1, 1, 0, stream>>>(
+        reinterpret_cast<const uint64_t*>(d_input_dx),
+        reinterpret_cast<uint64_t*>(d_output_dx),
+        d_dx_was_zero);
+    return cudaGetLastError();
 }
 
 }  // namespace gpu

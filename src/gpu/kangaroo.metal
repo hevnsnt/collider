@@ -287,7 +287,6 @@ inline void mod_mul(thread ulong r[4], thread const ulong a[4], thread const ulo
     // Reduction: split into hi (w[4..7]) + lo (w[0..3]); compute
     //   r_init = lo + hi*K0 + hi*2^32   (since 2^256 = 2^32+977 mod p)
     // We do this as r = lo + hi*K0  where K0 = 2^32 + 977.
-    //
     // hi*K0 is 256x65 -> 320 bits. We do hi[i] * K0 row by row.
     // Then fold any 257th-bit carry once more.
 
@@ -473,11 +472,9 @@ inline void set4(thread ulong dst[4], ulong v0, ulong v1, ulong v2, ulong v3) {
 
 // ---------------------------------------------------------------------------
 // Jacobian secp256k1 point operations.
-//
 // A Jacobian point (X, Y, Z) represents the affine point (X / Z^2, Y / Z^3).
 // secp256k1 has curve parameter a = 0, which simplifies the doubling
 // formulas. The infinity point is encoded as Z = 0.
-//
 // Affine point -> Jacobian: (x, y) -> (x, y, 1).
 // Jacobian point -> Affine: requires one modular inversion (x = X*Z^-2,
 // y = Y*Z^-3). Inversion is the expensive operation, so the kangaroo
@@ -542,7 +539,7 @@ inline void jac_double(thread ulong rx[4], thread ulong ry[4], thread ulong rz[4
 // R = P + Q where P is Jacobian (px, py, pz) and Q is affine (qx, qy).
 // Mixed-coordinate addition formula:
 //   U2 = X2 * Z1^2
-//   S2 = Y2 * Z1^3
+//   = Y2 * Z1^3
 //   H  = U2 - X1
 //   R  = S2 - Y1
 //   if H == 0:
@@ -571,7 +568,7 @@ inline void jac_add_mixed(thread ulong rx[4], thread ulong ry[4], thread ulong r
     mod_sqr(z2, pz);                 // Z1^2
     mod_mul(z3, z2, pz);             // Z1^3
     mod_mul(u2, qx, z2);             // U2 = X2 * Z1^2
-    mod_mul(s2, qy, z3);             // S2 = Y2 * Z1^3
+    mod_mul(s2, qy, z3);             // = Y2 * Z1^3
     mod_sub(h,  u2, px);             // H = U2 - X1
     mod_sub(rr, s2, py);             // R = S2 - Y1
 
@@ -742,12 +739,10 @@ inline bool is_distinguished(thread const ulong x[4], int dp_bits) {
 
 // ---------------------------------------------------------------------------
 // Threadgroup-cooperative Montgomery batch inversion.
-//
 // Each of the 32 threads in a threadgroup contributes its Jacobian Z. Lane 0
 // builds prefix products, computes ONE mod_inv on the final product, then
 // walks backwards to recover per-thread inverses. All 32 threads then
 // compute their affine X = X * z_inv^2 in parallel.
-//
 // Threadgroup memory layout (caller passes in pointers):
 //   tg_z_coords [BATCH * 4]  - original Z per lane (input to the inversion)
 //   tg_products [BATCH * 4]  - prefix products (lane 0 only writes)
@@ -853,15 +848,12 @@ inline void tg_batch_jac_to_affine(
 
 // ---------------------------------------------------------------------------
 // Kangaroo step kernel.
-//
 // State buffers (one slot per kangaroo, 4 ulong each):
 //   x_buf, y_buf, z_buf : Jacobian point coordinates
 //   dist_buf            : walked distance (256-bit, no mod)
 //   type_buf            : 0 = tame, 1 = wild
-//
 // Threadgroup contract: KANGAROO_BATCH_SIZE = 32 threads per group.
 // Host enforces num_kangaroos % 32 == 0 and threadsPerThreadgroup = 32.
-//
 // DP detection runs every DP_CHECK_INTERVAL steps OR on the last step.
 // On detection, the kernel atomically reserves a slot in dp_records[],
 // emits a 74-byte JLPDistinguishedPointV2-shaped record, and CONTINUES
