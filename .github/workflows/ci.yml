@@ -54,6 +54,7 @@ jobs:
         run: cmake --build build_free --config ${{ env.BUILD_TYPE }} -j4
 
       - name: Configure (PRO)
+        if: hashFiles('src/generators/pcfg.hpp') != ''
         run: |
           cmake -B build_pro -G Ninja \
             -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
@@ -64,6 +65,7 @@ jobs:
             -DCMAKE_CUDA_ARCHITECTURES="75;86;89;120"
 
       - name: Build (PRO)
+        if: hashFiles('src/generators/pcfg.hpp') != ''
         run: cmake --build build_pro --config ${{ env.BUILD_TYPE }} -j4
 
   # ---------------------------------------------------------------------------
@@ -106,6 +108,7 @@ jobs:
         run: cmake --build build_free --config ${{ env.BUILD_TYPE }} -j4
 
       - name: Configure (PRO)
+        if: hashFiles('src/generators/pcfg.hpp') != ''
         env:
           VCPKG_ROOT: 'C:\vcpkg'
         run: |
@@ -118,6 +121,7 @@ jobs:
             -DCMAKE_CUDA_ARCHITECTURES="75;86;89;120"
 
       - name: Build (PRO)
+        if: hashFiles('src/generators/pcfg.hpp') != ''
         run: cmake --build build_pro --config ${{ env.BUILD_TYPE }} -j4
 
   # ---------------------------------------------------------------------------
