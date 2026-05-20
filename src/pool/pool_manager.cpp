@@ -849,6 +849,18 @@ void PoolManager::supervisor_loop() {
             continue;
         }
         if (!client_->authenticate(config_.worker_name, config_.password)) {
+            // Check for IP ban BEFORE disconnecting the client so the
+            // ban flag (set by handle_auth_fail) is still readable.
+            if (jlp_raw->is_ip_banned()) {
+                std::cerr << "[PoolManager] Server has banned this IP. "
+                          << "Reconnecting would only extend the ban.\n"
+                          << "             " << jlp_raw->ban_reason() << "\n"
+                          << "             Giving up. Restart when the ban expires."
+                          << std::endl;
+                client_->disconnect();
+                supervisor_gave_up_.store(true, std::memory_order_release);
+                return;
+            }
             client_->disconnect();
             ++consecutive_failures;
             ++consecutive_auth_failures;
@@ -866,6 +878,30 @@ void PoolManager::supervisor_loop() {
             }
             backoff_ms = std::min(MAX_RECONNECT_BACKOFF_MS, backoff_ms * 2);
             continue;
+        }
+
+        // Send WORK_REQ and wait for WORK_ASN before marking the
+        // connection live. Without this, the sender thread immediately
+        // dequeues buffered DPs (tagged with the old work_id) before
+        // the server-side WorkerConnection has current_work set. Every
+        // such DP is logged as "submitted without an active work
+        // assignment" and counts toward the 100-in-60m invalid-DP ban.
+        {
+            WorkAssignment fresh_work;
+            if (!client_->request_work(fresh_work)) {
+                client_->disconnect();
+                ++consecutive_failures;
+                backoff_ms =
+                    std::min(MAX_RECONNECT_BACKOFF_MS, backoff_ms * 2);
+                continue;
+            }
+            {
+                std::lock_guard<std::mutex> lock(work_mutex_);
+                current_work_ = fresh_work;
+                has_work_     = true;
+            }
+            current_dp_bits_.store(fresh_work.dp_bits,
+                                   std::memory_order_release);
         }
 
         connected_.store(true);

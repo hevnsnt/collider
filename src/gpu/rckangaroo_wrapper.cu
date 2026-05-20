@@ -613,9 +613,10 @@ static void CheckNewPoints() {
     for (int i = 0; i < cnt; i++) {
         DBRec nrec;
         u8* p = s_pPntList2 + i * GPU_DP_SIZE;
+        // GPU_DP_SIZE=64 layout: 0-15 x LS 128b, 16-31 x MS 128b, 32-53 d, 56 type
         memcpy(nrec.x, p, 12);
-        memcpy(nrec.d, p + 16, 22);
-        nrec.type = s_GenMode ? TAME : p[40];
+        memcpy(nrec.d, p + 32, 22);
+        nrec.type = s_GenMode ? TAME : p[56];
 
         // Check bloom filter for this DP (opportunistic address scan)
         if (s_bloom_filter.loaded && !s_GenMode) {
@@ -626,12 +627,33 @@ static void CheckNewPoints() {
 
         // Export DP to pool via callback (if in pool mode)
         if (s_dp_callback && !s_GenMode) {
-            uint8_t x_full[32] = {0};
-            uint8_t d_full[32] = {0};
-            // x is 12 bytes, d is 22 bytes in the DB record
-            memcpy(x_full, nrec.x, 12);
-            memcpy(d_full, nrec.d, 22);
-            s_dp_callback(x_full, d_full, nrec.type);
+            // x: GPU stores 4 u64s in little-endian; reverse to big-endian so
+            // the server sees leading zeros at byte 0 (secp256k1 x is < 2^256).
+            uint8_t x_be[32];
+            for (int j = 0; j < 32; j++) x_be[j] = p[31 - j];
+
+            // d: GPU stores 22-byte two's complement in little-endian (nrec.d[0]
+            // = LSByte, nrec.d[21] = MSByte / sign bit).  The wire protocol and
+            // server both expect a 32-byte big-endian field where the 22-byte
+            // value sits in the LOW (rightmost) 22 bytes and the HIGH 10 bytes
+            // are zero (d < 2^176 == _D_MOD_22).  Reverse to achieve this layout.
+            uint8_t d_be[32] = {0};
+            for (int j = 0; j < 22; j++) d_be[10 + j] = nrec.d[21 - j];
+
+            // Pool server only accepts types 0 (tame) and 1 (wild).
+            // RCKangaroo uses type 2 (WILD2) for kangaroos starting from -PntA.
+            // The server's type-1 math check already covers both wild branches:
+            // branch-1 checks (PntA+d*G).x==X, branch-2 checks (PntA-d*G).x==X.
+            // Since WILD2 walks from -PntA, its DP satisfies (-PntA+d*G).x==X
+            // which equals (PntA-d*G).x==X, matching branch-2. Map to 1.
+            const uint8_t pool_type = (nrec.type == 2) ? 1 : nrec.type;
+            s_dp_callback(x_be, d_be, pool_type);
+            // Pool mode: the server owns collision detection.
+            // Skip the local FindOrAddDataBlock / s_Solved path so the
+            // solve loop runs indefinitely rather than exiting on the
+            // first internal collision (which happens within milliseconds
+            // for small puzzles like 41-bit with 2M kangaroos).
+            continue;
         }
 
         if (s_GenMode)

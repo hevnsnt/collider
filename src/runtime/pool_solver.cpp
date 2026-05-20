@@ -272,16 +272,9 @@ int run_pool_mode(const Arguments& args, const GPUDetectionResult& gpu_info) {
     // backend-agnostic.
     auto backend = ::collider::kangaroo::create_kangaroo_backend(args.gpu_ids);
 
-    // Initial header (rendered once; the per-chunk header would re-render
-    // every reassignment, which is too noisy for a long-running worker).
-    std::cout << "\n";
-    ::collider::ui::ProfessionalUI::render_section("Pool Solving - " + backend->name());
-    ::collider::ui::ProfessionalUI::render_kv("Pool",
-        pool_config.host + ":" + std::to_string(pool_config.port));
-    ::collider::ui::ProfessionalUI::render_kv("Worker", pool_config.worker_name);
-    ::collider::ui::ProfessionalUI::render_kv("Device", backend->device_summary());
-    std::cout << "\n";
-    ::collider::ui::ProfessionalUI::render_footer("Press Ctrl+C to stop");
+    // Header is rendered after the first initialize() call so that
+    // device_summary() reflects the actual GPU count (num_gpus_ is 0
+    // until rc_.init() runs inside initialize()).
 
     // Wire the backend callbacks. Pool-side baseline capture for the
     // session-share % is owned by PoolProgressDisplay; the lambdas here
@@ -399,6 +392,17 @@ int run_pool_mode(const Arguments& args, const GPUDetectionResult& gpu_info) {
                       << " initialization failed: " << backend->error() << "\n";
             exit_code = 1;
             break;
+        }
+
+        if (first_chunk) {
+            std::cout << "\n";
+            ::collider::ui::ProfessionalUI::render_section("Pool Solving - " + backend->name());
+            ::collider::ui::ProfessionalUI::render_kv("Pool",
+                pool_config.host + ":" + std::to_string(pool_config.port));
+            ::collider::ui::ProfessionalUI::render_kv("Worker", pool_config.worker_name);
+            ::collider::ui::ProfessionalUI::render_kv("Device", backend->device_summary());
+            std::cout << "\n";
+            ::collider::ui::ProfessionalUI::render_footer("Press Ctrl+C to stop");
         }
 
 #ifdef COLLIDER_PRO

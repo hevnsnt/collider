@@ -25,8 +25,8 @@
 #include <cstddef>
 #include <functional>
 #include <limits>
-#include <vector>      // retry_threads_ storage for std::jthread uploaders
-#include <stop_token>  // std::stop_token for cooperative cancellation
+#include <memory>
+#include <vector>
 
 // TLS support via OpenSSL
 #ifdef COLLIDER_HAS_OPENSSL
@@ -266,6 +266,13 @@ public:
     static void warn_if_plaintext(const std::string& url_scheme_or_host,
                                   uint16_t port);
 
+    // Returns true if the last authenticate() failure was an IP ban
+    // (server sent AUTH_FAIL with an "IP banned:" payload). When true,
+    // ban_reason() holds the server's ban message. The supervisor uses
+    // this to give up immediately instead of burning through retries.
+    bool is_ip_banned() const { return ip_banned_; }
+    const std::string& ban_reason() const { return ban_reason_; }
+
     // pre-load DPs that were on disk from a prior shutdown.
     // Called by PoolManager BEFORE authenticate() so the first DP_BATCH_V2
     // includes the persisted backlog. The vector is moved in to avoid an
@@ -286,6 +293,12 @@ public:
 
 private:
     bool debug_mode_ = false;
+
+    // Set by handle_auth_fail() when the server's AUTH_FAIL payload begins
+    // with "IP banned:". Checked by the supervisor to short-circuit retries.
+    bool ip_banned_ = false;
+    std::string ban_reason_;
+
     // Network
     socket_t socket_;
     std::string host_;
@@ -403,17 +416,36 @@ private:
     std::thread receiver_thread_;
     void receiver_loop();
 
+    // Portable stop-and-join wrapper for solution-upload retry threads.
+    // Bundles the thread handle with a stop flag and CV so cancellation is
+    // interruptible on every platform (replaces std::jthread / std::stop_token
+    // which are unavailable under Apple libc++ prior to the availability gate
+    // opening, even when CMAKE_OSX_DEPLOYMENT_TARGET=15.0).
+    struct RetryThread {
+        std::atomic<bool>       stop_flag{false};
+        std::mutex              cv_mutex;
+        std::condition_variable cv;
+        std::thread             thread;
+
+        RetryThread() = default;
+        ~RetryThread() { request_stop(); if (thread.joinable()) thread.join(); }
+        RetryThread(const RetryThread&)            = delete;
+        RetryThread& operator=(const RetryThread&) = delete;
+        RetryThread(RetryThread&&)                 = delete;
+        RetryThread& operator=(RetryThread&&)      = delete;
+
+        void request_stop() {
+            stop_flag.store(true, std::memory_order_release);
+            cv.notify_all();
+        }
+    };
+
     // Solution-upload retry threads. Each successful recovered key spawns one
-    // background uploader that retries for up to 24 hours. Previously the
-    // thread was std::thread.detach()'d capturing `this`, which is undefined
-    // behaviour if the JLPPoolClient is destroyed before the thread observes
-    // running_ == false. std::jthread owns its handle, requests stop on
-    // destruction, and joins; the lambda watches its stop_token and bails
-    // out of the backoff sleep + outer loop as soon as cancellation is
-    // requested. The vector is appended to under retry_threads_mutex_ from
-    // upload_solution() and is cleared on disconnect() so destructors run
-    // BEFORE the socket / TLS state we depend on is torn down.
-    std::vector<std::jthread> retry_threads_;
+    // background uploader that retries for up to 24 hours. The vector is
+    // appended to under retry_threads_mutex_ from report_solution() and is
+    // cleared on disconnect() so all threads join BEFORE socket / TLS state
+    // is torn down.
+    std::vector<std::unique_ptr<RetryThread>> retry_threads_;
     std::mutex retry_threads_mutex_;
 
     // DP queue for batched submission. std::deque is used (vs

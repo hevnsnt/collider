@@ -180,8 +180,9 @@ __global__ void KernelA(const TKparams Kparams)
 				u32 kang_ind = (THREAD_X + BLOCK_X * BLOCK_SIZE) * PNT_GROUP_CNT + group;
 				u32 ind = atomicAdd(Kparams.DPTable + kang_ind, 1);
 				ind = min(ind, DPTABLE_MAX_CNT - 1);
-				int4* dst = (int4*)(Kparams.DPTable + Kparams.KangCnt + (kang_ind * DPTABLE_MAX_CNT + ind) * 4);
+				int4* dst = (int4*)(Kparams.DPTable + Kparams.KangCnt + (kang_ind * DPTABLE_MAX_CNT + ind) * 8);
 				dst[0] = ((int4*)x)[0];
+				dst[1] = ((int4*)x)[1];
 				jmp_ind |= DP_FLAG;
 			}
 
@@ -427,8 +428,9 @@ __global__ void KernelA(const TKparams Kparams)
 				u32 kang_ind = (THREAD_X + BLOCK_X * BLOCK_SIZE) * PNT_GROUP_CNT + group;
 				u32 ind = atomicAdd(Kparams.DPTable + kang_ind, 1);
 				ind = min(ind, DPTABLE_MAX_CNT - 1);
-				int4* dst = (int4*)(Kparams.DPTable + Kparams.KangCnt + (kang_ind * DPTABLE_MAX_CNT + ind) * 4);
+				int4* dst = (int4*)(Kparams.DPTable + Kparams.KangCnt + (kang_ind * DPTABLE_MAX_CNT + ind) * 8);
 				dst[0] = ((int4*)x)[0];
+				dst[1] = ((int4*)x)[1];
 				jmp_ind |= DP_FLAG;
 			}
 
@@ -514,14 +516,17 @@ __device__ __forceinline__ void BuildDP(const TKparams& Kparams, int kang_ind, u
 	ind >>= 16;
 	if (ind >= DPTABLE_MAX_CNT)
 		return;
-	int4 rx = *(int4*)(Kparams.DPTable + Kparams.KangCnt + (kang_ind * DPTABLE_MAX_CNT + ind) * 4);
+	int4* src = (int4*)(Kparams.DPTable + Kparams.KangCnt + (kang_ind * DPTABLE_MAX_CNT + ind) * 8);
+	int4 rx0 = src[0];
+	int4 rx1 = src[1];
 	u32 pos = atomicAdd(Kparams.DPs_out, 1);
 	pos = min(pos, MAX_DP_CNT - 1);
 	u32* DPs = Kparams.DPs_out + 4 + pos * GPU_DP_SIZE / 4;
-	*(int4*)&DPs[0] = rx;
-	*(int4*)&DPs[4] = ((int4*)d)[0];
-	*(u64*)&DPs[8] = d[2];
-	DPs[10] = 3 * kang_ind / Kparams.KangCnt; //kang type
+	*(int4*)&DPs[0] = rx0;
+	*(int4*)&DPs[4] = rx1;
+	*(int4*)&DPs[8] = ((int4*)d)[0];
+	*(u64*)&DPs[12] = d[2];
+	DPs[14] = 3 * kang_ind / Kparams.KangCnt; //kang type
 }
 
 __device__ __forceinline__ bool ProcessJumpDistance(u32 step_ind, u32 d_cur, u64* d, u32 kang_ind, u64* jmp1_d, u64* jmp2_d, const TKparams& Kparams, u64* table, u32* cur_ind, u8 iter)

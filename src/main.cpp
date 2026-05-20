@@ -33,6 +33,9 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <io.h>      // _write (async-signal-safe stderr write)
+#else
+#include <unistd.h>  // write (async-signal-safe stderr write)
 #endif
 
 #include <atomic>
@@ -105,13 +108,9 @@ void emit_shutdown_message_from_main() {
     if (g_shutdown_logged.exchange(true)) return;
     int signum = g_shutdown_signal.load(std::memory_order_acquire);
     if (signum == 0) return;  // shutdown set without a signal (e.g. found key)
-    if (signum == SIGINT) {
-        std::cout << "\n[!] CTRL-C detected, shutting down gracefully...\n";
-        std::cout << "    Saving checkpoint state and draining in-flight DPs...\n";
-    } else {
-        std::cout << "\n[!] Signal " << signum << " received, shutting down gracefully...\n";
-        std::cout << "    Saving checkpoint state and draining in-flight DPs...\n";
-    }
+    // The signal handler already printed the immediate acknowledgment via
+    // write(). Print the follow-up from main-thread context where cout is safe.
+    std::cout << "[*] Saving checkpoint state and draining in-flight DPs...\n";
     LOG_INFO("Signal received: " + std::to_string(signum) +
              " (SIGINT=" + std::to_string(SIGINT) +
              ", SIGTERM=" + std::to_string(SIGTERM) + ")");
@@ -127,13 +126,21 @@ void emit_shutdown_message_from_main() {
 
 // fix: async-signal-safe handler.
 // Per POSIX signal-safety(7), almost nothing in the C++ runtime is safe
-// to call from a signal handler. We do nothing but two atomic stores
-// (lock-free for std::atomic<int>/<bool> on every supported platform).
-// The actual print+log happens from the main thread via
-// emit_shutdown_message_from_main() once it observes the flag.
+// to call from a signal handler. Atomic stores are safe. write()/_write()
+// is safe. cout/cerr are NOT safe (may hold their mutex at signal time).
+// The full shutdown message is emitted from main-thread context via
+// emit_shutdown_message_from_main() once the solve loop exits.
 void signal_handler(int signum) {
     g_shutdown_signal.store(signum, std::memory_order_release);
     g_shutdown.store(true, std::memory_order_release);
+    // Immediate acknowledgment so the user knows the keypress landed.
+    // write()/_write() is async-signal-safe; the literal size avoids strlen().
+    static const char kMsg[] = "\n[!] Ctrl-C caught - stopping...\n";
+#ifdef _WIN32
+    (void)_write(2, kMsg, static_cast<unsigned>(sizeof(kMsg) - 1));
+#else
+    (void)write(2, kMsg, sizeof(kMsg) - 1);
+#endif
 }
 
 /**

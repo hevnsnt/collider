@@ -156,4 +156,27 @@ inline int range_bits_from_be(const uint8_t start_be[32],
     return 0;
 }
 
+// Compute bit_length(v) for a 32-byte big-endian value v.
+// Returns 0 if v is zero, otherwise the index of the MSB + 1
+// (e.g., bit_length_be32(2^134) = 135, bit_length_be32(1) = 1).
+//
+// This is distinct from range_bits_from_be(), which computes
+// bit_length(end - start + 1) (the chunk WIDTH). bit_length_be32()
+// computes bit_length(start) itself, which equals the PUZZLE's range_bits
+// for any chunk: for puzzle N, range_start = 2^(N-1), so
+// bit_length_be32(range_start) = N regardless of chunk width.
+inline int bit_length_be32(const uint8_t v_be[32]) {
+    uint64_t limbs[4];
+    be32_to_limbs_le(v_be, limbs);
+    for (int i = 3; i >= 0; --i) {
+        if (limbs[i] != 0) {
+            uint64_t v = limbs[i];
+            int msb = 0;
+            while (v >>= 1) ++msb;
+            return i * 64 + msb + 1;
+        }
+    }
+    return 0;
+}
+
 }  // namespace collider

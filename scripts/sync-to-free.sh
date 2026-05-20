@@ -177,7 +177,7 @@ PRO_PATHS=(
     ".github/workflows/sync-free.yml"
     ".github/workflows/sync-protocol.yml"
 
-    # Pro's build-release.yml builds Pro binaries (COLLIDER_EDITION_PRO=ON).
+    # Pro's build-release.yml builds Pro binaries (-DCOLLIDER_PRO=ON).
     # The free repo needs its own variant. It lives in scripts/templates/ and
     # is installed by the sync script below as .github/workflows/build-release.yml.
     # Exclude the pro version so it never lands in the free tree.

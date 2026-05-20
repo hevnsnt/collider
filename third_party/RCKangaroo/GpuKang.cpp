@@ -138,7 +138,7 @@ bool RCGpuKang::Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP* _EcJump
 		return false;
 	}
 
-	size = (u64)KangCnt * (16 * DPTABLE_MAX_CNT + sizeof(u32)); //we store 16bytes of X
+	size = (u64)KangCnt * (32 * DPTABLE_MAX_CNT + sizeof(u32)); //we store 32bytes of X
 	total_mem += size;
 	err = cudaMalloc((void**)&Kparams.DPTable, size);
 	if (err != cudaSuccess)

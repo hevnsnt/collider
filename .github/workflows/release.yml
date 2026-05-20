@@ -30,6 +30,10 @@ jobs:
   # ---------------------------------------------------------------------------
   linux-cuda:
     name: Linux x64 (CUDA)
+    # Only run in the public free repo. sync-free.yml pushes this file to
+    # hevnsnt/collider; if a v* tag is also pushed to collider-pro it would
+    # fire here too and create a duplicate free release on the private repo.
+    if: github.repository == 'hevnsnt/collider'
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout (no submodules -- Pro lives in a private repo)
@@ -81,6 +85,7 @@ jobs:
   # ---------------------------------------------------------------------------
   windows-cuda:
     name: Windows x64 (CUDA)
+    if: github.repository == 'hevnsnt/collider'
     runs-on: windows-2022
     steps:
       - name: Checkout (no submodules -- Pro lives in a private repo)
@@ -145,6 +150,7 @@ jobs:
   # ---------------------------------------------------------------------------
   macos-metal:
     name: macOS arm64 (Metal)
+    if: github.repository == 'hevnsnt/collider'
     runs-on: macos-15
     steps:
       - name: Checkout (no submodules -- Pro lives in a private repo)

@@ -54,7 +54,7 @@ jobs:
         run: |
           cmake -B build \
             -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} \
-            -DCOLLIDER_EDITION_PRO=OFF \
+            -DCOLLIDER_PRO=OFF \
             -DCOLLIDER_USE_CUDA=ON \
             -DCOLLIDER_BUILD_TESTS=OFF \
             -DCOLLIDER_BUILD_BENCHMARKS=OFF \
@@ -105,7 +105,7 @@ jobs:
         run: |
           cmake -B build -G "Visual Studio 17 2022" -A x64 `
             -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} `
-            -DCOLLIDER_EDITION_PRO=OFF `
+            -DCOLLIDER_PRO=OFF `
             -DCOLLIDER_USE_CUDA=ON `
             -DCOLLIDER_BUILD_TESTS=OFF `
             -DCOLLIDER_BUILD_BENCHMARKS=OFF `
@@ -152,7 +152,7 @@ jobs:
           cmake -B build \
             -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
-            -DCOLLIDER_EDITION_PRO=OFF \
+            -DCOLLIDER_PRO=OFF \
             -DCOLLIDER_USE_CUDA=OFF \
             -DCOLLIDER_USE_METAL=ON \
             -DCOLLIDER_BUILD_TESTS=OFF \

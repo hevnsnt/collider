@@ -22,15 +22,21 @@ bool CudaRCKangarooBackend::initialize(const collider::pool::WorkAssignment& wor
     error_.clear();
 
     rc_.dp_bits    = work.dp_bits;
-    // Derive range_bits from the work assignment's [range_start, range_end)
-    // span. A pool-issued chunk for puzzle 135 will give 135 here, but the
-    // protocol does not pin us to that puzzle -- a chunk for puzzle 75 or
-    // a custom range will yield the correct value. Pre-1.4 builds hard-
-    // coded 135, which mis-budgeted DP rate and walk size on every other
-    // puzzle. range_bits_from_be returns 0 on inverted/empty ranges.
-    const int rb = ::collider::range_bits_from_be(work.range_start, work.range_end);
-    if (rb <= 0) {
-        error_ = "pool work assignment has empty or inverted range";
+    // Pool range_bits = bit_length(range_start), NOT bit_length(chunk_size).
+    //
+    // The pool server fixes PntA = Q - range_start*G using the PUZZLE's
+    // range_start (e.g., 2^134 for puzzle 135) -- not the chunk's start.
+    // RCKangaroo computes PntA = PntToSolve - 2^(range_bits-1)*G, so we need
+    // 2^(range_bits-1) = puzzle_range_start, i.e. range_bits = puzzle_bits.
+    //
+    // For any chunk of puzzle 135: chunk_start >= 2^134, so
+    //   bit_length_be32(chunk_start) = 135  =>  HalfRange = 2^134  =>  PntA correct.
+    //
+    // Using range_bits_from_be(start, end) would give the CHUNK WIDTH instead:
+    //   bit_length(2^40) = 41  =>  HalfRange = 2^40  =>  PntA 94 bits off.
+    const int rb = ::collider::bit_length_be32(work.range_start);
+    if (rb == 0) {
+        error_ = "pool work assignment has zero range_start";
         return false;
     }
     if (rb < 32 || rb > 170) {
@@ -58,17 +64,12 @@ bool CudaRCKangarooBackend::initialize(const collider::pool::WorkAssignment& wor
         return false;
     }
 
-    // Forward the chunk's range_start offset to RCKangaroo. Without this,
-    // the solver hunts in [0, 2^range_bits) instead of [range_start,
-    // range_start + 2^range_bits) and every DP it produces is mapped to
-    // the wrong slice of the global keyspace. The standalone puzzle path
-    // (puzzle_solver.cpp ~line 1551) already does this; the pool path
-    // regressed during the IKangarooBackend refactor. range_start is BE
-    // bytes on the wire; RCKangaroo's set_start_offset takes a lowercase
-    // hex string of arbitrary length and parses it as a big integer.
-    char start_hex[67];
-    ::collider::hex_encode_lower(work.range_start, 32, start_hex);
-    rc_.set_start_offset(std::string(start_hex));
+    // Do NOT call set_start_offset in pool mode. The server uses a FIXED
+    // PntA = Q - puzzle_range_start*G (e.g. Q - 2^134*G for puzzle 135).
+    // With range_bits=135 and no offset, PntToSolve=Q and
+    // PntA = Q - 2^134*G -- an exact match. Calling set_start_offset
+    // (chunk_start) would shift PntToSolve to Q - chunk_start*G, making
+    // PntA = Q - (chunk_start + 2^134)*G, which the server rejects.
 
     initialized_ = true;
     return true;

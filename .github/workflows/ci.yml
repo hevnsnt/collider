@@ -1,9 +1,8 @@
 name: CI Build
 
-# Build-only validation for PRs and pushes to main / full-opto.
-# Mirrors the toolchain matrix in release.yml but skips packaging
-# and artifact upload -- this is a "does it compile + link on each
-# platform" gate, not a release pipeline.
+# Build-only validation for PRs and pushes to main.
+# Builds BOTH the Free and Pro editions on each platform so regressions
+# in either are caught before a release tag is pushed.
 
 on:
   pull_request:
@@ -21,7 +20,7 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Linux x64 + CUDA
+  # Linux x64 + CUDA  (Free + Pro)
   # ---------------------------------------------------------------------------
   linux-cuda:
     name: Linux x64 (CUDA)
@@ -41,9 +40,9 @@ jobs:
           method: "network"
           sub-packages: '["nvcc", "cudart"]'
 
-      - name: Configure (FREE build, COLLIDER_PRO=OFF)
+      - name: Configure (FREE)
         run: |
-          cmake -B build -G Ninja \
+          cmake -B build_free -G Ninja \
             -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
             -DCOLLIDER_PRO=OFF \
             -DCOLLIDER_USE_CUDA=ON \
@@ -51,11 +50,24 @@ jobs:
             -DCOLLIDER_BUILD_BENCHMARKS=OFF \
             -DCMAKE_CUDA_ARCHITECTURES="75;86;89;120"
 
-      - name: Build
-        run: cmake --build build --config ${{ env.BUILD_TYPE }} -j4
+      - name: Build (FREE)
+        run: cmake --build build_free --config ${{ env.BUILD_TYPE }} -j4
+
+      - name: Configure (PRO)
+        run: |
+          cmake -B build_pro -G Ninja \
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+            -DCOLLIDER_PRO=ON \
+            -DCOLLIDER_USE_CUDA=ON \
+            -DCOLLIDER_BUILD_TESTS=OFF \
+            -DCOLLIDER_BUILD_BENCHMARKS=OFF \
+            -DCMAKE_CUDA_ARCHITECTURES="75;86;89;120"
+
+      - name: Build (PRO)
+        run: cmake --build build_pro --config ${{ env.BUILD_TYPE }} -j4
 
   # ---------------------------------------------------------------------------
-  # Windows x64 + CUDA
+  # Windows x64 + CUDA  (Free + Pro)
   # ---------------------------------------------------------------------------
   windows-cuda:
     name: Windows x64 (CUDA)
@@ -78,11 +90,11 @@ jobs:
       - name: Install Ninja
         run: choco install ninja -y
 
-      - name: Configure (FREE build, COLLIDER_PRO=OFF)
+      - name: Configure (FREE)
         env:
           VCPKG_ROOT: 'C:\vcpkg'
         run: |
-          cmake -B build -G Ninja `
+          cmake -B build_free -G Ninja `
             -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} `
             -DCOLLIDER_PRO=OFF `
             -DCOLLIDER_USE_CUDA=ON `
@@ -90,14 +102,32 @@ jobs:
             -DCOLLIDER_BUILD_BENCHMARKS=OFF `
             -DCMAKE_CUDA_ARCHITECTURES="75;86;89;120"
 
-      - name: Build
-        run: cmake --build build --config ${{ env.BUILD_TYPE }} -j4
+      - name: Build (FREE)
+        run: cmake --build build_free --config ${{ env.BUILD_TYPE }} -j4
+
+      - name: Configure (PRO)
+        env:
+          VCPKG_ROOT: 'C:\vcpkg'
+        run: |
+          cmake -B build_pro -G Ninja `
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} `
+            -DCOLLIDER_PRO=ON `
+            -DCOLLIDER_USE_CUDA=ON `
+            -DCOLLIDER_BUILD_TESTS=OFF `
+            -DCOLLIDER_BUILD_BENCHMARKS=OFF `
+            -DCMAKE_CUDA_ARCHITECTURES="75;86;89;120"
+
+      - name: Build (PRO)
+        run: cmake --build build_pro --config ${{ env.BUILD_TYPE }} -j4
 
   # ---------------------------------------------------------------------------
-  # macOS arm64 + Metal
+  # macOS arm64 + Metal  (Free + Pro)
+  # Tags, PRs, and manual only -- skipped on plain main pushes to avoid
+  # burning 10x-multiplier minutes on routine commits.
   # ---------------------------------------------------------------------------
   macos-metal:
     name: macOS arm64 (Metal)
+    if: github.ref_type == 'tag' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
@@ -105,9 +135,9 @@ jobs:
       - name: Install build tooling
         run: brew install cmake ninja
 
-      - name: Configure (FREE build, COLLIDER_PRO=OFF, Metal backend)
+      - name: Configure (FREE)
         run: |
-          cmake -B build -G Ninja \
+          cmake -B build_free -G Ninja \
             -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
             -DCOLLIDER_PRO=OFF \
@@ -117,23 +147,9 @@ jobs:
             -DCOLLIDER_BUILD_BENCHMARKS=OFF
 
       - name: Build (FREE)
-        run: cmake --build build --config ${{ env.BUILD_TYPE }} -j4
+        run: cmake --build build_free --config ${{ env.BUILD_TYPE }} -j4
 
-      # v1.4.0: Pro build coverage on Mac. The free build above doesn't
-      # exercise brain_wallet_gpu.hpp (the Pro brain-wallet pipeline)
-      # or rckangaroo_wrapper.cu, both of which include cuda* type
-      # references that need correct stubs in the !COLLIDER_USE_CUDA
-      # path. Without this job, regressions like the cudaEvent_t stub
-      # miss in fed3c05 would only surface when an operator tried to
-      # build Pro on Mac. Separate build dir so the FREE configure/build
-      # cache stays clean.
-      #
-      # The hashFiles() gate means these steps run only when the Pro
-      # generator headers are present in the checkout. On the public
-      # `collider` repo, sync-to-free.sh strips src/generators/, so the
-      # gate evaluates to '' and the Pro steps skip cleanly instead of
-      # turning the FREE-repo CI red on a missing-include.
-      - name: Configure (PRO build, COLLIDER_PRO=ON, Metal backend)
+      - name: Configure (PRO)
         if: hashFiles('src/generators/pcfg.hpp') != ''
         run: |
           cmake -B build_pro -G Ninja \

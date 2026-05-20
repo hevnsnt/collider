@@ -26,8 +26,7 @@
 #include <algorithm>
 #include <random>
 #include <mutex>                    // for std::once_flag, std::call_once
-#include <condition_variable>       // std::condition_variable_any for jthread retry
-#include <stop_token>               // std::stop_token / std::stop_callback (Q6)
+#include <condition_variable>
 #include <filesystem>               // persistence paths
 #include <fstream>                  // atomic file write
 #include <sstream>                  // timestamp + filename
@@ -791,16 +790,16 @@ void JLPPoolClient::disconnect() {
     // touches ssl_; they MUST be joined before Step 7 frees ssl_. We do this
     // after closesocket() so any in-flight send_message returns promptly.
     // Move the vector out under the lock so we drop the mutex before
-    // destroying the jthreads (their destructors block on join, and the
-    // lambda may briefly need to publish through the local cv unrelated to
-    // retry_threads_mutex_).
-    std::vector<std::jthread> retries_to_join;
+    // joining the threads (RetryThread destructors block on join, and the
+    // lambda may briefly need the RetryThread cv_mutex).
+    std::vector<std::unique_ptr<RetryThread>> retries_to_join;
     {
         std::lock_guard<std::mutex> guard(retry_threads_mutex_);
         retries_to_join.swap(retry_threads_);
     }
-    // jthread destructor requests stop + joins. The lambda's stop_callback
-    // notifies its local cv so the backoff sleep wakes immediately.
+    // Signal all threads to stop (wakes the interruptible backoff sleep),
+    // then clear so RetryThread destructors join each thread.
+    for (auto& rt : retries_to_join) { rt->request_stop(); }
     retries_to_join.clear();
 
     // Step 7: free TLS objects (both I/O threads have exited).
@@ -847,6 +846,8 @@ bool JLPPoolClient::is_connected() const {
 
 bool JLPPoolClient::authenticate(const std::string& worker_name,
                                  const std::string& password) {
+    ip_banned_  = false;
+    ban_reason_.clear();
     worker_name_ = worker_name;
     // AUTH wire format (JLPClientHelloV2) carries a real
     // password slot. Pre-1.4.1 we logged a warning that --pool-password
@@ -1140,15 +1141,13 @@ bool JLPPoolClient::report_solution(const uint8_t* private_key) {
         return true;
     }
 
-    // Step 3: spawn an owned retry thread (std::jthread). The thread runs
-    // for up to 24h retrying the SOLUTION upload with exponential backoff.
-    // Cancellation: ~JLPPoolClient (via disconnect()) clears retry_threads_,
-    // which destroys each jthread; the destructor requests stop and joins.
-    // The lambda uses condition-variable waits keyed on the stop_token so
-    // the cancellation interrupts the backoff sleep immediately instead of
-    // waiting up to MAX_RECONNECT_BACKOFF_MS. running_/connected_ are also
-    // monitored to short-circuit when the client has been torn down by some
-    // other path (the receiver loop, supervisor reconnect, ...).
+    // Step 3: spawn an owned retry thread. The thread runs for up to 24h
+    // retrying the SOLUTION upload with exponential backoff. Cancellation:
+    // disconnect() swaps retry_threads_ out and calls request_stop() on
+    // each RetryThread, which sets the stop_flag and notifies the CV so
+    // the backoff sleep wakes immediately; the RetryThread destructor then
+    // joins. running_/connected_ are also monitored to short-circuit when
+    // the client has been torn down by some other path.
     //
     // Key handling: stage the 32-byte recovered private key in a
     // SecureBuffer<uint8_t> instead of a std::array<uint8_t, 32>. The
@@ -1165,36 +1164,27 @@ bool JLPPoolClient::report_solution(const uint8_t* private_key) {
 
     {
         std::lock_guard<std::mutex> guard(retry_threads_mutex_);
-        retry_threads_.emplace_back(
-            [this, key_buf = std::move(key_buf), persisted_path]
-            (std::stop_token st) {
+        auto rt = std::make_unique<RetryThread>();
+        auto* rt_raw = rt.get();  // safe: rt lives in retry_threads_ for the thread's lifetime
+        rt->thread = std::thread(
+            [this, key_buf = std::move(key_buf), persisted_path, rt_raw]() mutable {
                 constexpr auto MAX_TOTAL = std::chrono::hours(24);
                 const auto deadline = std::chrono::steady_clock::now() + MAX_TOTAL;
                 uint32_t backoff_ms = 1000;
                 uint32_t attempt = 0;
 
-                // Local cv + mutex so the backoff sleep is interruptible by
-                // stop_token via std::condition_variable_any::wait_for with
-                // a stop callback. Allocating per-thread is fine; retry
-                // threads are rare (one per recovered key).
-                std::mutex local_mu;
-                std::condition_variable_any local_cv;
-                std::stop_callback stop_cb(st, [&]() {
-                    std::lock_guard<std::mutex> lk(local_mu);
-                    local_cv.notify_all();
-                });
-
-                while (!st.stop_requested()
+                while (!rt_raw->stop_flag.load(std::memory_order_acquire)
                        && running_.load(std::memory_order_acquire)
                        && std::chrono::steady_clock::now() < deadline) {
-                    // Interruptible sleep. Wakes immediately on stop_request.
+                    // Interruptible sleep: wakes immediately when stop_flag is set.
                     {
-                        std::unique_lock<std::mutex> lk(local_mu);
-                        local_cv.wait_for(lk, st,
-                                          std::chrono::milliseconds(backoff_ms),
-                                          [&] { return st.stop_requested(); });
+                        std::unique_lock<std::mutex> lk(rt_raw->cv_mutex);
+                        rt_raw->cv.wait_for(lk,
+                                            std::chrono::milliseconds(backoff_ms),
+                                            [&] { return rt_raw->stop_flag.load(
+                                                             std::memory_order_relaxed); });
                     }
-                    if (st.stop_requested()
+                    if (rt_raw->stop_flag.load(std::memory_order_acquire)
                         || !running_.load(std::memory_order_acquire)) {
                         break;
                     }
@@ -1217,7 +1207,7 @@ bool JLPPoolClient::report_solution(const uint8_t* private_key) {
                               << "ms (persisted at " << persisted_path << ")"
                               << std::endl;
                 }
-                if (st.stop_requested()) {
+                if (rt_raw->stop_flag.load(std::memory_order_acquire)) {
                     std::cerr << "[Pool] Solution upload retry thread cancelled; "
                                  "manual recovery file: " << persisted_path
                               << std::endl;
@@ -1228,8 +1218,9 @@ bool JLPPoolClient::report_solution(const uint8_t* private_key) {
                 }
                 // key_buf destructor runs here (after every return path),
                 // wiping the 32-byte private key from the closure storage
-                // via OPENSSL_cleanse before the std::jthread frame frees.
+                // via OPENSSL_cleanse before the thread frame frees.
             });
+        retry_threads_.push_back(std::move(rt));
     }
 
     // First synchronous attempt failed; the persisted file is the source
@@ -2241,20 +2232,37 @@ void JLPPoolClient::handle_auth_ok(const JLPHeader& /*header*/,
 }
 
 void JLPPoolClient::handle_auth_fail(const JLPHeader& /*header*/,
-                                     const std::vector<uint8_t>& /*payload*/) {
-    std::cerr << "[Pool] Authentication failed" << std::endl;
+                                     const std::vector<uint8_t>& payload) {
+    // Decode payload as printable ASCII (same safe approach as handle_msg_error:
+    // cap length and replace control characters to prevent ANSI injection).
+    constexpr size_t MAX_PRINT = 256;
+    std::string reason;
+    reason.reserve(std::min(payload.size(), MAX_PRINT));
+    for (size_t i = 0; i < payload.size() && i < MAX_PRINT; ++i) {
+        unsigned char c = payload[i];
+        reason.push_back((c >= 0x20 && c < 0x7F) ? static_cast<char>(c) : '.');
+    }
+
+    if (reason.rfind("IP banned:", 0) == 0) {
+        ip_banned_  = true;
+        ban_reason_ = reason;
+        std::cerr << "[Pool] Your IP is BANNED by the pool server.\n"
+                  << "       Reason: " << reason << "\n"
+                  << "       Wait for the ban to expire, then restart."
+                  << std::endl;
+        ::collider::log::milestone("auth_fail", "ip_banned: " + reason);
+    } else {
+        std::cerr << "[Pool] Authentication rejected by server";
+        if (!reason.empty()) std::cerr << ": " << reason;
+        std::cerr << std::endl;
+        ::collider::log::milestone("auth_fail", reason.empty()
+                                       ? "server rejected credentials"
+                                       : reason);
+    }
+
     auth_state_.store(AuthState::AUTH_FAILED);
     auth_cv_.notify_all();
-    // Mark connection unhealthy so the PoolManager supervisor
-    // can react. The supervisor enforces MAX_AUTH_FAIL_ATTEMPTS
-    // (pool_config.hpp) via its own consecutive_failures counter.
     connected_ = false;
-    // Session log: the reason string is intentionally generic
-    // (server-side AUTH_FAIL does not include a structured
-    // reason on the JLP wire; the operator-facing detail lives
-    // in the MSG_ERROR that the server sometimes follows up
-    // with, handled by the MSG_ERROR case below).
-    ::collider::log::milestone("auth_fail", "server rejected credentials");
 }
 
 void JLPPoolClient::handle_dp_ack(const JLPHeader& /*header*/,
