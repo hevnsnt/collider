@@ -951,8 +951,26 @@ endif()
 # ============================================================================
 # Pro License Check Library (Pro build only, requires libcurl + OpenSSL)
 # ============================================================================
-if(COLLIDER_PRO AND CURL_FOUND AND OPENSSL_FOUND AND
-   EXISTS "${CMAKE_SOURCE_DIR}/src/license/license_check.cpp")
+# COLLIDER_PRO=ON is a hard contract: license_gate.cpp is unconditionally
+# compiled into the Pro build (see CORE_SOURCES append at line ~700) and
+# unconditionally calls collider::license::validate / cache_path. If
+# CURL_FOUND or OPENSSL_FOUND is false the link silently failed with
+# undefined-reference errors -- the failure mode we hit on v1.4.4's first
+# Linux release build, where libcurl4-openssl-dev was not in the apt
+# install list. Fail at configure-time with an actionable error so CI and
+# operators see the missing dep immediately instead of after a 30-minute
+# compile.
+if(COLLIDER_PRO AND EXISTS "${CMAKE_SOURCE_DIR}/src/license/license_check.cpp")
+    if(NOT CURL_FOUND OR NOT OPENSSL_FOUND)
+        message(FATAL_ERROR
+            "COLLIDER_PRO=ON requires libcurl and OpenSSL "
+            "(CURL_FOUND=${CURL_FOUND}, OPENSSL_FOUND=${OPENSSL_FOUND}). "
+            "Ubuntu/Debian: apt-get install libcurl4-openssl-dev libssl-dev. "
+            "macOS: brew install curl openssl. "
+            "Windows: vcpkg.json declares both deps; ensure CMake "
+            "bootstraps the toolchain (the in-tree CMakeLists auto-uses "
+            "VCPKG_ROOT or downloads vcpkg on demand).")
+    endif()
     add_library(collider_license STATIC src/license/license_check.cpp)
     target_include_directories(collider_license PUBLIC ${CMAKE_SOURCE_DIR}/src/license)
     target_link_libraries(collider_license

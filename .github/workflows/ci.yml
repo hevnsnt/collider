@@ -31,7 +31,7 @@ jobs:
       - name: Install build tooling
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build
+          sudo apt-get install -y cmake ninja-build libssl-dev libcurl4-openssl-dev
 
       - name: Install CUDA Toolkit 12.8
         uses: Jimver/cuda-toolkit@v0.2.22

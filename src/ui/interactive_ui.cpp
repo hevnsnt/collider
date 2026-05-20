@@ -52,6 +52,139 @@ using collider::runtime::normalize_path;
 
 namespace collider::ui {
 
+#ifdef COLLIDER_PRO
+// Auto-detect a funded-address bloom filter for opportunistic scanning in
+// pool / standalone-puzzle modes (the on-DP H160 probe described in PRO.md).
+//
+// Behavior diverges from the brain-wallet flow's bloom block in one key
+// way: opportunistic scanning is optional. Brain-wallet mode REQUIRES a
+// bloom (the entire pipeline is built around the probe); pool/puzzle
+// modes work fine without one (you just don't get the side-channel scan).
+// So when no .blf is found here we print a brief note and continue,
+// rather than blocking the user with a UTXO-build wizard.
+//
+// Search order matches BrainWalletRunner::auto_detect_bloom_files: CWD,
+// CWD parent, well-known Windows roots; then the canonical
+// funded_addresses.blf name from PRO.md before the historical seen.blf.
+static void maybe_pick_opportunistic_bloom(Arguments& args,
+                                           const std::string& mode_label) {
+    if (!args.bloom_file.empty()) {
+        // Already set via CLI flag or ~/.collider/config.yml; respect
+        // the operator's explicit choice without re-prompting.
+        return;
+    }
+
+    std::vector<std::string> search_dirs;
+    search_dirs.emplace_back(".");
+    search_dirs.emplace_back("..");
+#ifdef _WIN32
+    search_dirs.emplace_back("D:\\theCollider");
+    search_dirs.emplace_back("C:\\theCollider");
+    search_dirs.emplace_back("D:\\");
+    search_dirs.emplace_back("C:\\");
+#endif
+
+    // Probe the canonical names first; a found_blooms scan catches any
+    // operator-renamed file in the same directories.
+    static const char* const kCanonicalNames[] = {
+        "funded_addresses.blf",
+        "seen.blf",
+        "seen_tight.blf",
+    };
+    for (const auto& dir : search_dirs) {
+        std::error_code ec;
+        if (!std::filesystem::exists(dir, ec) || ec) continue;
+        for (const char* name : kCanonicalNames) {
+            auto candidate = std::filesystem::path(dir) / name;
+            if (std::filesystem::exists(candidate, ec) && !ec) {
+                args.bloom_file = candidate.string();
+                Interactive::status_message(
+                    "Found bloom filter for opportunistic scanning: "
+                    + args.bloom_file, true);
+                return;
+            }
+        }
+    }
+
+    // Wider sweep: any *.blf in the search roots. Useful when the
+    // operator built a custom bloom from their own UTXO dump.
+    std::vector<std::pair<std::string, size_t>> found;
+    for (const auto& dir : search_dirs) {
+        std::error_code ec;
+        if (!std::filesystem::exists(dir, ec) || ec) continue;
+        try {
+            for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+                if (!entry.is_regular_file()) continue;
+                auto ext = entry.path().extension().string();
+                std::transform(ext.begin(), ext.end(), ext.begin(),
+                               [](unsigned char c) {
+                                   return static_cast<char>(std::tolower(c));
+                               });
+                if (ext == ".blf") {
+                    found.emplace_back(entry.path().string(),
+                                       entry.file_size());
+                }
+            }
+        } catch (const std::exception&) {
+            // Skip unreadable directories silently.
+        }
+    }
+    // Deduplicate by canonical path.
+    {
+        std::set<std::string> seen;
+        found.erase(std::remove_if(found.begin(), found.end(),
+            [&](const auto& p) {
+                std::string canon;
+                try { canon = std::filesystem::canonical(p.first).string(); }
+                catch (...) { canon = p.first; }
+                return !seen.insert(canon).second;
+            }), found.end());
+    }
+
+    if (found.empty()) {
+        Interactive::info_message(
+            mode_label + ": no bloom filter detected; "
+            "opportunistic address scanning disabled. "
+            "Drop funded_addresses.blf next to the binary "
+            "or pass --bloom <path> to enable.");
+        return;
+    }
+
+    if (found.size() == 1) {
+        args.bloom_file = found[0].first;
+        Interactive::status_message(
+            "Found bloom filter for opportunistic scanning: "
+            + args.bloom_file, true);
+        return;
+    }
+
+    // Multiple custom blooms: let the operator pick or skip.
+    std::cout << "\n";
+    Interactive::status_message(
+        "Found " + std::to_string(found.size())
+            + " bloom filter(s) for opportunistic scanning:", true);
+    std::cout << "\n";
+    for (size_t i = 0; i < found.size(); ++i) {
+        double size_mb = found[i].second / (1024.0 * 1024.0);
+        std::cout << "  [" << (i + 1) << "] " << found[i].first
+                  << " (" << std::fixed << std::setprecision(1)
+                  << size_mb << " MB)\n";
+    }
+    std::cout << "  [" << (found.size() + 1)
+              << "] Continue without opportunistic scanning\n\n";
+    int choice = Interactive::prompt_menu_choice(
+        1, static_cast<int>(found.size() + 1));
+    if (choice >= 1 && choice <= static_cast<int>(found.size())) {
+        args.bloom_file = found[choice - 1].first;
+        Interactive::status_message(
+            "Using bloom filter: " + args.bloom_file, true);
+    } else {
+        Interactive::info_message(
+            "Continuing without opportunistic scanning.");
+    }
+}
+#endif  // COLLIDER_PRO
+
 Arguments run_puzzle_interactive(Arguments base_args, double gpu_speed_mkeys) {
     using namespace ::collider::ui;
     Arguments args = base_args;
@@ -95,6 +228,12 @@ Arguments run_puzzle_interactive(Arguments base_args, double gpu_speed_mkeys) {
         // Pre-1.4.1 the runner waited on Enter here, which forced an extra
         // keystroke after the user had ALREADY confirmed the pool/worker
         // pair in prompt_pool_config above. Just connect.
+#ifdef COLLIDER_PRO
+        // Pro: offer the opportunistic-bloom side-channel before connecting.
+        // Skipped silently for Free; --bloom is Pro-gated at the CLI parser.
+        std::cout << "\n";
+        maybe_pick_opportunistic_bloom(args, "Pool mode");
+#endif
         std::cout << "\n";
         Interactive::info_message("Pool mode: Work will be assigned by the pool server. Connecting...");
         return args;
@@ -204,6 +343,19 @@ Arguments run_puzzle_interactive(Arguments base_args, double gpu_speed_mkeys) {
             return args;
         }
     }
+
+#ifdef COLLIDER_PRO
+    // Pro: same opportunistic-bloom side-channel for standalone puzzle
+    // solving as for pool mode. Only meaningful when the RCKangaroo
+    // backend ends up handling the puzzle (it's the only backend that
+    // currently wires the bloom probe; MultiGPU/CPU kangaroo and the
+    // bruteforce path ignore the flag today). Offering the prompt
+    // anyway lets a user who switches backends mid-development still
+    // pick up the bloom, and makes the feature reachable through the
+    // standard interactive entry path per docs/PRO.md.
+    std::cout << "\n";
+    maybe_pick_opportunistic_bloom(args, "Standalone puzzle mode");
+#endif
 
     return args;
 }
@@ -597,12 +749,41 @@ Arguments run_brainwallet_interactive(Arguments base_args) {
         }
     }
 
+    // Pro multi-address derivation: scan each candidate pubkey against
+    // all three H160 paths (compressed P2PKH / P2WPKH, uncompressed
+    // P2PKH, P2SH-P2WPKH / BIP-49) per docs/PRO.md. The CLI surface for
+    // this is --brainwallet-v2; expose it in the interactive flow so the
+    // capability is reachable without reading the CLI docs. Default ON
+    // to match docs/PRO.md's "multi-address derivation" Pro promise; an
+    // operator who specifically wants single-address can opt out.
+    Interactive::display_section("Address-Type Coverage");
+    std::cout << "Pro probes each candidate pubkey against three Bitcoin H160 paths:\n"
+              << "  - Compressed P2PKH / P2WPKH (BIP-84)\n"
+              << "  - Uncompressed P2PKH\n"
+              << "  - P2SH-P2WPKH (BIP-49)\n\n"
+              << "Multi-address mode adds two extra per-pubkey hashes for the\n"
+              << "uncompressed-P2PKH and P2SH-P2WPKH paths inside the fused kernel.\n\n";
+    if (Interactive::prompt_yes_no(
+            "Enable multi-address derivation (recommended)?", true)) {
+        args.brainwallet_v2_mode = true;
+        Interactive::status_message(
+            "Multi-address derivation enabled (--brainwallet-v2)", true);
+    } else {
+        args.brainwallet_v2_mode = false;
+        Interactive::info_message(
+            "Single-address mode (compressed P2PKH / P2WPKH only).");
+    }
+    std::cout << "\n";
+
     Interactive::display_section("Ready to Scan");
 
     std::cout << colors::BRIGHT_WHITE << "Configuration Summary:\n" << colors::RESET;
     std::cout << "  Wordlist:     " << ::normalize_path(args.wordlist_file) << "\n";
     std::cout << "  Bloom filter: " << args.bloom_file << "\n";
     std::cout << "  Entries:      " << BrainwalletSetup::format_number(config.total_unique_lines) << " passphrases\n";
+    std::cout << "  Address mode: " << (args.brainwallet_v2_mode
+                                            ? "multi (3 H160 paths)"
+                                            : "single (compressed P2PKH)") << "\n";
     std::cout << "\n";
 
     if (!Interactive::prompt_yes_no("Start brain wallet scan?", true)) {

@@ -4,9 +4,11 @@
 
 #include "cuda_rckangaroo_backend.hpp"
 #include "../core/byte_codec.hpp"
+#include "../core/secure_write.hpp"  // secure_open_ofstream for bloom_hits.txt
 
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <ostream>
 #include <sstream>
 
@@ -76,7 +78,27 @@ bool CudaRCKangarooBackend::initialize(const collider::pool::WorkAssignment& wor
 }
 
 bool CudaRCKangarooBackend::try_set_bloom_filter(const std::string& path) {
-    return rc_.load_bloom_filter(path);
+    if (!rc_.load_bloom_filter(path)) return false;
+    // Match the standalone-kangaroo path's hit-log contract: every bloom
+    // positive appends a line to bloom_hits.txt (owner-only DACL/0600).
+    // Without this, pool-mode operators observed bloom_checks ticking on
+    // the GPU counter while no file ever appeared, which made the
+    // "opportunistic address checking" feature look broken even when it
+    // was running. See puzzle_solver_kangaroo.cpp:maybe_load_rckangaroo_
+    // bloom_filter for the original pattern; this is the pool-side mirror.
+    rc_.bloom_hit_callback = [](const gpu::BloomHit& hit) {
+        std::ofstream hitlog =
+            ::collider::secure_open_ofstream("bloom_hits.txt", std::ios::app);
+        if (hitlog) {
+            char h160_hex[41];
+            for (int i = 0; i < 20; i++) {
+                std::snprintf(h160_hex + i*2, 3, "%02x", hit.hash160[i]);
+            }
+            hitlog << "H160: " << h160_hex
+                   << " at ops " << hit.ops_at_hit << "\n";
+        }
+    };
+    return true;
 }
 
 void CudaRCKangarooBackend::solve(BackendCallbacks cb) {
