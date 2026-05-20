@@ -148,52 +148,13 @@ jobs:
   # ---------------------------------------------------------------------------
   # macOS arm64 + Metal (no CUDA on Apple)
   # ---------------------------------------------------------------------------
-  macos-metal:
-    name: macOS arm64 (Metal)
-    if: github.repository == 'hevnsnt/collider'
-    runs-on: macos-15
-    steps:
-      - name: Checkout (no submodules -- Pro lives in a private repo)
-        uses: actions/checkout@v4
-
-      - name: Install build tooling
-        run: brew install cmake ninja
-
-      - name: Configure (FREE build, COLLIDER_PRO=OFF, Metal backend)
-        run: |
-          cmake -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
-            -DCOLLIDER_PRO=OFF \
-            -DCOLLIDER_USE_CUDA=OFF \
-            -DCOLLIDER_USE_METAL=ON \
-            -DCOLLIDER_BUILD_TESTS=OFF \
-            -DCOLLIDER_BUILD_BENCHMARKS=OFF
-
-      - name: Build
-        run: cmake --build build --config ${{ env.BUILD_TYPE }} -j4
-
-      - name: Package
-        run: |
-          mkdir -p release
-          cp build/collider release/
-          if [ -f build/build_bloom ]; then cp build/build_bloom release/; fi
-          cp README.md release/
-          cp -r docs release/
-          if [ -d rules ]; then cp -r rules release/; fi
-          tar -czvf collider-macos-arm64.tar.gz -C release .
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: collider-macos-arm64
-          path: collider-macos-arm64.tar.gz
-
   # ---------------------------------------------------------------------------
-  # Publish a GitHub Release with all three artifacts
+  # Publish a GitHub Release with Linux + Windows artifacts
+  # macOS users build from source: cmake -DCOLLIDER_USE_METAL=ON
   # ---------------------------------------------------------------------------
   create-release:
     name: Publish GitHub Release
-    needs: [linux-cuda, windows-cuda, macos-metal]
+    needs: [linux-cuda, windows-cuda]
     runs-on: ubuntu-latest
     permissions:
       contents: write
