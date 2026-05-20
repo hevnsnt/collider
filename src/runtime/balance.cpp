@@ -13,7 +13,6 @@
 #include <memory>
 #include <mutex>
 #include <sstream>
-#include <stop_token>
 #include <string>
 #include <thread>
 #include <utility>
@@ -33,18 +32,22 @@ namespace {
 // begun shutdown. The TUI render thread also writes to std::cout, so the
 // detached probe was racy on the terminal as well as the process lifetime.
 //
-// BalanceFetcher owns every spawned probe as a std::jthread. The probes
+// BalanceFetcher owns every spawned probe as a std::thread. The probes
 // remain "fire-and-forget" from the caller's perspective (the public API
 // is unchanged) but on process exit the static destructor requests stop
 // on every in-flight probe and joins them. Successful prints are gated
-// on the stop_token so a cancelled probe stays silent.
+// on an atomic stop flag so a cancelled probe stays silent.
+//
+// std::jthread would be more ergonomic here, but Apple's libc++ ships
+// without it through at least Xcode 16.4, so this file uses std::thread
+// + atomic stop flag and joins explicitly on shutdown.
 //
 // Reaping: each new spawn walks the in-flight vector and drops slots
 // whose lambda has set its per-slot done flag to true. A previous
 // implementation reaped "the first N entries" where N was the delta of a
 // global done counter; that erased the WRONG slots when probes finished
 // out of order (a fast probe completing before a slow one would cause
-// the reaper to call erase() on the slow slot, whose ~jthread blocks on
+// the reaper to call erase() on the slow slot, whose ~thread blocks on
 // join() until that slow probe's HTTP call returns, freezing the spawn
 // caller for up to the curl timeout). The per-slot flag fixes this so
 // the reaper only erases slots that are actually safe to join now.
@@ -65,19 +68,18 @@ public:
     void spawn(std::string address, std::string passphrase) {
         std::lock_guard<std::mutex> lk(mu_);
         prune_finished_locked();
-        // Construct the slot in place so the per-slot done flag has a
-        // stable address before the worker thread starts. emplace_back
-        // returns a reference to the new slot; we capture a pointer to
-        // its done flag for the lambda, which is safe because Slot is
+        // Construct the slot in place so the per-slot done and stop flags
+        // have stable addresses before the worker thread starts. Slot is
         // held by std::unique_ptr (the vector relocates the unique_ptr,
-        // not the Slot itself, so the flag's address never moves).
+        // not the Slot itself, so the flag addresses never move).
         auto slot = std::make_unique<Slot>();
         std::atomic<bool>* done_flag = &slot->done;
-        slot->thread = std::jthread(
-            [done_flag, this,
+        std::atomic<bool>* stop_flag = &slot->stop_requested;
+        slot->thread = std::thread(
+            [done_flag, stop_flag, this,
              address = std::move(address),
-             passphrase = std::move(passphrase)](std::stop_token st) {
-                run_probe(st, address, passphrase);
+             passphrase = std::move(passphrase)]() {
+                run_probe(*stop_flag, address, passphrase);
                 // Mark this slot finished. Release ordering pairs with
                 // the acquire load in prune_finished_locked so the
                 // reaper sees a true here only after the probe body and
@@ -90,13 +92,19 @@ public:
     }
 
     ~BalanceFetcher() {
-        // jthread destructor calls request_stop() then join(). With the
+        // Request stop on every slot first, then join. With the
         // libcurl/curl-cli backend the HTTP call is bounded by its own
         // CONNECT_TIMEOUT (curl default 300s) and we cannot interrupt
         // popen() mid-read. In practice mempool.space responds in <1s
         // so the join is fast; on shutdown we accept a short wait
         // rather than leaking a detached process state.
         std::lock_guard<std::mutex> lk(mu_);
+        for (auto& s : slots_) {
+            s->stop_requested.store(true, std::memory_order_release);
+        }
+        for (auto& s : slots_) {
+            if (s->thread.joinable()) s->thread.join();
+        }
         slots_.clear();
     }
 
@@ -105,25 +113,27 @@ private:
     BalanceFetcher(const BalanceFetcher&) = delete;
     BalanceFetcher& operator=(const BalanceFetcher&) = delete;
 
-    // Owning record for one in-flight probe. The done flag is in a
-    // separately-allocated Slot so its address is stable across vector
-    // reallocation and the worker lambda's stored pointer stays valid.
+    // Owning record for one in-flight probe. Both flags live in a
+    // separately-allocated Slot so their addresses are stable across
+    // vector reallocation and the worker lambda's stored pointers stay
+    // valid.
     struct Slot {
         std::atomic<bool> done{false};
-        std::jthread      thread;
+        std::atomic<bool> stop_requested{false};
+        std::thread       thread;
     };
 
     // Drop slots whose lambda has set done=true. Caller holds mu_.
     // Walks the whole vector and only erases entries that have actually
     // finished, so out-of-order completion (fast probe behind a slow
     // probe in the vector) does NOT cause the reaper to block joining
-    // a still-running slot.
+    // a still-running slot. Before erasing we join the finished thread
+    // so the OS-level handle is released cleanly (std::thread does NOT
+    // auto-join on destruction).
     void prune_finished_locked() {
         for (auto it = slots_.begin(); it != slots_.end();) {
             if ((*it)->done.load(std::memory_order_acquire)) {
-                // Lambda has already returned, so the jthread's join
-                // inside ~unique_ptr<Slot>'s destruction of the embedded
-                // jthread is effectively a no-op.
+                if ((*it)->thread.joinable()) (*it)->thread.join();
                 it = slots_.erase(it);
             } else {
                 ++it;
@@ -132,12 +142,13 @@ private:
     }
 
     // The actual probe body. Pulled out of the lambda so the spawn site
-    // stays compact and so the stop_token gating is visible.
-    void run_probe(std::stop_token st,
+    // stays compact and so the stop-flag gating is visible.
+    void run_probe(std::atomic<bool>& stop_requested,
                    const std::string& address,
                    const std::string& passphrase) {
         using namespace collider::ui::ansi;
-        if (st.stop_requested()) return;
+        auto stop = [&] { return stop_requested.load(std::memory_order_acquire); };
+        if (stop()) return;
         try {
             std::string cmd;
 #ifdef _WIN32
@@ -158,7 +169,7 @@ private:
             if (!pipe) return;
 
             while (fgets(buffer.data(), buffer.size(), pipe) != nullptr) {
-                if (st.stop_requested()) break;
+                if (stop()) break;
                 result += buffer.data();
             }
 
@@ -171,7 +182,7 @@ private:
             // Gate the post-HTTP printing: if stop was requested while
             // we were blocked in curl, we drop the result rather than
             // racing the TUI render thread on std::cout during shutdown.
-            if (st.stop_requested()) return;
+            if (stop()) return;
 
             // Parse JSON for chain_stats.funded_txo_sum / spent_txo_sum.
             int64_t funded = 0;
@@ -192,7 +203,7 @@ private:
             const int64_t balance_sats = funded - spent;
             const double balance_btc = balance_sats / 100000000.0;
 
-            if (st.stop_requested()) return;
+            if (stop()) return;
 
             std::cout << "\n";
             if (balance_sats > 0) {
@@ -221,7 +232,7 @@ private:
             }
 
         } catch (const std::exception& e) {
-            if (st.stop_requested()) return;
+            if (stop()) return;
             std::cout << BRIGHT_RED << "[!] " << RESET << "Balance check failed for " << address << ": " << DIM << e.what() << RESET << "\n";
         }
     }

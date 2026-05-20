@@ -2,6 +2,6 @@
 
 namespace collider {
 
-inline constexpr const char* kVersion = "1.4.3";
+inline constexpr const char* kVersion = "1.4.4";
 
 }
