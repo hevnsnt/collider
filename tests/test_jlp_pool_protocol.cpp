@@ -23,8 +23,9 @@
 //    8.  Pre-auth message gating (Wave 4 D-H4): WORK_ASN before AUTH_OK is
 //        ignored (work callback NOT invoked); the same WORK_ASN after AUTH_OK
 //        IS dispatched.
-//    9.  WORK_ASN parsing: 109-byte JLPServerConfig payload populates the
-//        WorkAssignment fields exactly.
+//    9.  WORK_ASN parsing: 126-byte JLPServerConfig payload populates the
+//        WorkAssignment fields exactly (v1.5: extended from 109 to 126
+//        by the asymmetric tame/wild fields at the tail).
 //   10.  STATS_RSP parsing: 24-byte payload is decoded as three uint64 LE
 //        fields (Wave 4 B-MED-1: pool_speed must NOT be a double).
 //   11.  MSG_ERROR handling: Wave 4 D-L3 says payloads are capped + control
@@ -94,9 +95,22 @@ using namespace std::chrono_literals;
 namespace {
 
 #ifdef _WIN32
+// task #34: WSACleanup() in the destructor raced with ntdll's
+// process-exit cleanup of any sockets a JLPPoolClient's receiver
+// thread still held a reference to. Even though each test fully
+// destructs its client (which joins the receiver and closes the
+// socket), Windows' kernel-level socket-handle release can lag the
+// closesocket() call by a few microseconds; if WSACleanup() fires in
+// that gap the ntdll RtlpFreezeTimeBias cleanup path access-violates
+// from a stale per-thread WinSock state. Per MSDN, "WSACleanup()
+// should be called only if WSAStartup completes successfully" and
+// "an application is not required to call WSACleanup; the system
+// releases all per-process WinSock state at process exit." Dropping
+// the explicit WSACleanup() lets the OS do the right thing without
+// the cross-thread race.
 struct WSAGuard {
     WSAGuard()  { WSADATA w; WSAStartup(MAKEWORD(2, 2), &w); }
-    ~WSAGuard() { WSACleanup(); }
+    ~WSAGuard() { /* see above; intentionally no WSACleanup() */ }
 };
 #endif
 
@@ -122,10 +136,14 @@ constexpr uint8_t TYPE_PONG      = 0x51;
 constexpr uint8_t TYPE_MSG_ERROR = 0xFF;
 
 // Build [magic=KANG][type][flags=PROTOCOL_VERSION][len:LE u16][payload].
-// v1.4.2 B.5: flags now carries PROTOCOL_VERSION (=2). The client rejects
-// non-matching flags as a protocol version mismatch, so mock-server frames
-// must use the same value.
-constexpr uint8_t MOCK_PROTOCOL_VERSION = 2;
+// v1.4.2 B.5: flags now carries PROTOCOL_VERSION. The client rejects
+// non-matching flags as a protocol version mismatch, so mock-server
+// frames must use the same value.
+// v1.5 (protocol_version=3): bumped from 2 to 3 to track
+// jlp_wire::PROTOCOL_VERSION; the tests below verify behaviors that
+// are protocol-version agnostic once the handshake completes (work
+// callback firing, dedup, dp_sequence anti-replay, etc.).
+constexpr uint8_t MOCK_PROTOCOL_VERSION = 3;
 std::vector<uint8_t> build_frame(uint8_t type, const void* payload, uint16_t len) {
     std::vector<uint8_t> out;
     out.reserve(8 + len);
@@ -281,6 +299,32 @@ public:
             int n = ::send(client_, p + sent, static_cast<int>(total - sent), 0);
             if (n <= 0) return false;
             sent += static_cast<size_t>(n);
+        }
+        return true;
+    }
+
+    // TP-10 regression aid: send the same frame byte-by-byte with a
+    // short inter-byte delay. Stresses the stream-resync helper
+    // (jlp_pool_client::receive_message + header_partial_ buffer) by
+    // GUARANTEEING the receiver hits SO_RCVTIMEO partial-read in the
+    // middle of every multi-byte field. If the resync code is wrong,
+    // this test misaligns the stream and the receiver eventually
+    // tries to dispatch garbage.
+    bool send_frame_fragmented(uint8_t type, const void* payload,
+                               uint16_t len,
+                               std::chrono::microseconds inter_byte_delay =
+                                   std::chrono::microseconds(500)) {
+        if (!wait_for_client()) return false;
+        auto bytes = build_frame(type, payload, len);
+        std::lock_guard<std::mutex> lk(client_mu_);
+        if (client_ == INVALID_SOCK_T) return false;
+        const char* p = reinterpret_cast<const char*>(bytes.data());
+        for (size_t i = 0; i < bytes.size(); ++i) {
+            int n = ::send(client_, p + i, 1, 0);
+            if (n <= 0) return false;
+            // Brief pause so the client's recv() drains the single byte
+            // and tries again, hitting SO_RCVTIMEO mid-frame.
+            std::this_thread::sleep_for(inter_byte_delay);
         }
         return true;
     }
@@ -594,7 +638,15 @@ std::unique_ptr<JLPPoolClient> make_connected(uint16_t port) {
     auto c = std::make_unique<JLPPoolClient>();
     c->set_use_tls(false);
     c->set_reconnect(false);
-    c->set_timeout(1);
+    // task #34: was set_timeout(1). The 1ms tight loop on recv timeouts
+    // combined with the 1ms partial-read window on Windows
+    // SO_RCVTIMEO+MSG_WAITALL corrupted stream alignment downstream.
+    // The wire-side fix is in jlp_pool_client::receive_message
+    // (stream-resync helper), but matching the test's timeout to a
+    // realistic 50ms also removes the per-test high-frequency
+    // teardown-race window so the matching wire-side guard does not
+    // have to do all the work alone.
+    c->set_timeout(50);
     if (!c->connect("127.0.0.1", port)) {
         std::fprintf(stderr, "[helper] connect to 127.0.0.1:%u failed\n",
                      (unsigned)port);
@@ -798,7 +850,7 @@ bool test_authenticate_silent_server() {
     auto client = std::make_unique<JLPPoolClient>();
     client->set_use_tls(false);
     client->set_reconnect(true);   // <-- needed so receiver notifies cv on disconnect
-    client->set_timeout(1);        // mirror make_connected: short recv timeout
+    client->set_timeout(50);       // mirror make_connected: see task #34 rationale
     if (!client->connect("127.0.0.1", server.port()))
         return fail("authenticate_silent_server", "connect failed");
 
@@ -904,15 +956,20 @@ bool test_pre_auth_work_gated() {
 
     client->set_work_callback([&](const WorkAssignment&) { callback_count++; });
 
-    // Build a 109-byte JLPServerConfig payload with a recognizable work_id.
+    // v1.5: JLPServerConfig is now 126 bytes (was 109 in v1.4.x). The
+    // pre-auth gate fires before the payload is parsed, so the test
+    // outcome is unchanged; just update the sizeof contract.
     JLPServerConfig cfg{};
     for (int i = 0; i < 33; ++i) cfg.public_key[i]  = 0x10 + i;
     for (int i = 0; i < 32; ++i) cfg.range_start[i] = 0x20 + i;
     for (int i = 0; i < 32; ++i) cfg.range_end[i]   = 0x30 + i;
     cfg.dp_bits = 24;
     cfg.work_id = 0xCAFE'BABE'1234'5678ULL;
-    static_assert(sizeof(JLPServerConfig) == 109,
-                  "JLPServerConfig must be 109 bytes on the wire");
+    cfg.kangaroo_type  = 1;   // TAME_ONLY (any non-zero satisfies v1.5)
+    cfg.start_offset_a = 0;
+    cfg.start_offset_b = 0;
+    static_assert(sizeof(JLPServerConfig) == 126,
+                  "v1.5: JLPServerConfig must be 126 bytes on the wire");
 
     // Start authenticate so the receiver thread is dispatching messages.
     bool auth_result = false;
@@ -961,8 +1018,10 @@ bool test_pre_auth_work_gated() {
 }
 
 // ---------------------------------------------------------------------------
-// 9. WORK_ASN parsing: 109-byte payload yields a correctly populated
-//    WorkAssignment in the callback.
+// 9. WORK_ASN parsing: 126-byte v1.5 payload yields a correctly populated
+//    WorkAssignment in the callback. Pre-v1.5 the payload was 109 bytes;
+//    the trailing 17 bytes carry kangaroo_type + start_offset_a +
+//    start_offset_b.
 // ---------------------------------------------------------------------------
 bool test_work_asn_parsing() {
     // Callback captures (`captured`, `got`) must outlive `client`. See the
@@ -988,12 +1047,20 @@ bool test_work_asn_parsing() {
     // the validated [8..32] window (the WORK_ASN handler drops the message
     // otherwise; see tests/test_jlp_pool_dp_bits_validation.cpp). Use 26 --
     // mid-range, still byte-distinctive (it is 0x0000001A on the wire).
+    //
+    // v1.5: the WORK_ASN payload now carries kangaroo_type +
+    // start_offset_a/_b at the tail. Fill them with byte-distinctive
+    // values so the round-trip assertions below catch any drift in the
+    // wire decode path.
     JLPServerConfig cfg{};
     for (int i = 0; i < 33; ++i) cfg.public_key[i]  = static_cast<uint8_t>(0x80 + i);
     for (int i = 0; i < 32; ++i) cfg.range_start[i] = static_cast<uint8_t>(0x01 + i);
     for (int i = 0; i < 32; ++i) cfg.range_end[i]   = static_cast<uint8_t>(0xC0 + i);
-    cfg.dp_bits = 26u;
-    cfg.work_id = 0x1122'3344'5566'7788ULL;
+    cfg.dp_bits        = 26u;
+    cfg.work_id        = 0x1122'3344'5566'7788ULL;
+    cfg.kangaroo_type  = 2;                                // WILD_ONLY
+    cfg.start_offset_a = 0x0123'4567'89AB'CDEFULL;
+    cfg.start_offset_b = 0x0123'4567'89AB'CDEFULL + 4096ULL;
 
     server.send_frame(TYPE_WORK_ASN, &cfg, sizeof(cfg));
 
@@ -1011,6 +1078,12 @@ bool test_work_asn_parsing() {
         return fail("work_asn_parsing", "dp_bits mismatch");
     if (captured.work_id != cfg.work_id)
         return fail("work_asn_parsing", "work_id mismatch");
+    if (captured.kangaroo_type != cfg.kangaroo_type)
+        return fail("work_asn_parsing", "v1.5 kangaroo_type mismatch");
+    if (captured.start_offset_a != cfg.start_offset_a)
+        return fail("work_asn_parsing", "v1.5 start_offset_a mismatch");
+    if (captured.start_offset_b != cfg.start_offset_b)
+        return fail("work_asn_parsing", "v1.5 start_offset_b mismatch");
     // Explicit teardown: clear the callback first (so no late dispatch
     // can touch the `captured`/`got` captures even via a copied
     // std::function inside fire_work_callback) and then reset the
@@ -1219,36 +1292,19 @@ bool test_dp_backpressure() {
 }
 
 // ---------------------------------------------------------------------------
-// 15. report_solution: 32-byte private key arrives as a SOLUTION frame.
+// 15. report_solution: DELETED in v1.5.
+//
+// The v1.4.x client-to-server SOLUTION upload path was the theft surface
+// v1.5 was designed to eliminate (worker self-solved, key in worker
+// memory + on disk for up to 24h before pool ever saw it). The
+// JLPPoolClient::report_solution() method, the PoolClient interface
+// declaration, the PoolManager wrapper, the recovered_keys/<ts>.json
+// persistence, the 24-hour retry uploader thread, and the SecureBuffer
+// key staging were all removed together. SOLUTION is now strictly
+// server-to-client (the broadcast path is still covered by
+// test_solution_callback_dedup below). See
+// .claude/tasks/v1.5-asymmetric-kangaroo.md.
 // ---------------------------------------------------------------------------
-bool test_report_solution() {
-    MockJlpServer server;
-    auto client = make_connected(server.port());
-    if (!client) return fail("report_solution", "connect failed");
-
-    if (!drive_auth_ok(server, *client, "report_solution")) return false;
-
-    uint8_t key[32];
-    for (int i = 0; i < 32; ++i) key[i] = static_cast<uint8_t>(0xF0 ^ i);
-    if (!client->report_solution(key))
-        return fail("report_solution", "report_solution returned false");
-
-    auto bytes = server.wait_recv_pop(8 + 32, 5000ms);
-    if (bytes.size() != 8 + 32) {
-        std::fprintf(stderr, "[debug] report_solution: got %zu bytes\n", bytes.size());
-        return fail("report_solution", "did not receive 40 bytes for SOLUTION");
-    }
-
-    if (bytes[4] != TYPE_SOLUTION) {
-        std::fprintf(stderr, "[debug] report_solution: type 0x%02x (want 0x%02x); first bytes: %02x %02x %02x %02x %02x %02x %02x %02x\n",
-                     bytes[4], TYPE_SOLUTION,
-                     bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]);
-        return fail("report_solution", "SOLUTION frame type wrong");
-    }
-    if (std::memcmp(bytes.data() + 8, key, 32) != 0)
-        return fail("report_solution", "SOLUTION payload != private key");
-    return true;
-}
 
 // ---------------------------------------------------------------------------
 // 16. v1.4.1 C.3: SOLUTION callback dedup. Sending the same SOLUTION
@@ -1319,8 +1375,11 @@ bool test_work_callback_dedup() {
     for (int i = 0; i < 33; ++i) cfg.public_key[i]  = 0x70 + i;
     for (int i = 0; i < 32; ++i) cfg.range_start[i] = 0x80 + i;
     for (int i = 0; i < 32; ++i) cfg.range_end[i]   = 0x90 + i;
-    cfg.dp_bits = 24;
-    cfg.work_id = 0xDEADBEEF'CAFE0001ULL;
+    cfg.dp_bits        = 24;
+    cfg.work_id        = 0xDEADBEEF'CAFE0001ULL;
+    cfg.kangaroo_type  = 1;   // TAME_ONLY (v1.5 requires non-zero)
+    cfg.start_offset_a = 0;
+    cfg.start_offset_b = 0;
 
     server.send_frame(TYPE_WORK_ASN, &cfg, sizeof(cfg));
     if (!wait_for([&] { return fire_count.load() >= 1; }, 2000ms)) {
@@ -1398,8 +1457,11 @@ bool test_dp_sequence_anti_replay() {
     for (int i = 0; i < 33; ++i) cfg.public_key[i]  = 0x40 + i;
     for (int i = 0; i < 32; ++i) cfg.range_start[i] = 0x50 + i;
     for (int i = 0; i < 32; ++i) cfg.range_end[i]   = 0x60 + i;
-    cfg.dp_bits = 24;
-    cfg.work_id = 0xAAAA'BBBB'CCCC'0001ULL;
+    cfg.dp_bits        = 24;
+    cfg.work_id        = 0xAAAA'BBBB'CCCC'0001ULL;
+    cfg.kangaroo_type  = 1;   // TAME_ONLY (v1.5 requires non-zero)
+    cfg.start_offset_a = 0;
+    cfg.start_offset_b = 0;
     server.send_frame(TYPE_WORK_ASN, &cfg, sizeof(cfg));
 
     // Brief sleep so the client's receiver thread dispatches the WORK_ASN
@@ -1617,6 +1679,70 @@ struct TestCase {
     bool (*fn)();
 };
 
+// TP-10 regression: stream-resync helper survives maximum
+// fragmentation. Sends a real WORK_ASN frame byte-by-byte with a 500us
+// pause between bytes so every recv() call hits the 50ms SO_RCVTIMEO
+// mid-multi-byte-field. If the resync code (per-client header_partial_
+// + payload_partial_ buffers in receive_message) regresses, the
+// receiver mis-aligns the stream and the work callback either never
+// fires or fires with garbage dp_bits.
+bool test_stream_resync_fragmented() {
+    std::atomic<int> callback_count{0};
+    WorkAssignment captured{};
+    MockJlpServer server;
+    auto client = make_connected(server.port());
+    if (!client) return fail("stream_resync_fragmented", "connect failed");
+
+    client->set_work_callback([&](const WorkAssignment& w) {
+        captured = w;
+        ++callback_count;
+    });
+
+    if (!drive_auth_ok(server, *client, "stream_resync_fragmented")) {
+        return false;
+    }
+
+    JLPServerConfig cfg{};
+    for (int i = 0; i < 33; ++i) cfg.public_key[i]  = static_cast<uint8_t>(0xA0 + i);
+    for (int i = 0; i < 32; ++i) cfg.range_start[i] = static_cast<uint8_t>(0x10 + i);
+    for (int i = 0; i < 32; ++i) cfg.range_end[i]   = static_cast<uint8_t>(0xC0 + i);
+    cfg.dp_bits        = 24;
+    cfg.work_id        = 0xDEADBEEF'BABEF00DULL;
+    cfg.kangaroo_type  = 1;
+    cfg.start_offset_a = 0x1111'2222'3333'4444ULL;
+    cfg.start_offset_b = cfg.start_offset_a + 0x10000ULL;
+
+    if (!server.send_frame_fragmented(TYPE_WORK_ASN, &cfg, sizeof(cfg))) {
+        return fail("stream_resync_fragmented", "fragmented send failed");
+    }
+
+    if (!wait_for([&] { return callback_count.load() >= 1; }, 5000ms)) {
+        return fail("stream_resync_fragmented",
+                    "callback never fired despite 5s wait (resync regression?)");
+    }
+    if (captured.dp_bits != 24u) {
+        return fail("stream_resync_fragmented",
+                    "captured dp_bits != 24 (stream misalignment?)");
+    }
+    if (captured.work_id != cfg.work_id) {
+        return fail("stream_resync_fragmented",
+                    "captured work_id mismatch (stream misalignment?)");
+    }
+    if (std::memcmp(captured.public_key, cfg.public_key, 33) != 0) {
+        return fail("stream_resync_fragmented",
+                    "captured public_key mismatch (stream misalignment?)");
+    }
+    if (captured.start_offset_a != cfg.start_offset_a ||
+        captured.start_offset_b != cfg.start_offset_b) {
+        return fail("stream_resync_fragmented",
+                    "captured start_offsets mismatch (stream misalignment?)");
+    }
+
+    client->set_work_callback(nullptr);
+    client.reset();
+    return true;
+}
+
 const TestCase TESTS[] = {
     {"auth_wire_format",          test_auth_wire_format},
     {"authenticate_ok",           test_authenticate_ok},
@@ -1632,10 +1758,13 @@ const TestCase TESTS[] = {
     {"submit_dp_basic",           test_submit_dp_basic},
     {"dp_wire_format",            test_dp_submission_wire_format},
     {"dp_backpressure",           test_dp_backpressure},
-    {"report_solution",           test_report_solution},
+    // {"report_solution", ...} removed in v1.5: client-to-server SOLUTION
+    // upload path was deleted as the v1.4.x theft surface. See the
+    // explanatory block where test_report_solution() used to live.
     {"solution_callback_dedup",   test_solution_callback_dedup},
     {"work_callback_dedup",       test_work_callback_dedup},
     {"dp_sequence_anti_replay",   test_dp_sequence_anti_replay},
+    {"stream_resync_fragmented",  test_stream_resync_fragmented},
 };
 
 }  // namespace

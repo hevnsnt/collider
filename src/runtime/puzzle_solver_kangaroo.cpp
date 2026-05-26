@@ -31,8 +31,13 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 
+#include "core/settings_sidecar.hpp"          // TR-5: persist settings
+#include "ui/tui/panels/settings_panel.hpp"  // TP-1: live settings poll
+#include "ui/tui/tui_app.hpp"  // Phase C: TuiApp setter calls from progress cb
+
 #include <algorithm>
 #include <chrono>
+#include <climits>
 #include <cstdio>
 #include <cstdint>
 #include <exception>
@@ -220,6 +225,20 @@ PuzzleStepResult run_kangaroo_rckangaroo(PuzzleIterContext& ctx) {
 
     std::cout << "[*] Using RCKangaroo (RetiredCoder's high-performance solver)\n";
 
+    // v1.5.x: --kangaroos N is informational for RCKangaroo. The kangaroo
+    // count is derived from the kernel grid in third_party/RCKangaroo
+    // (mpCnt * BLOCK_SIZE * PNT_GROUP_CNT, all compile-time except mpCnt
+    // which is the runtime GPU MP count). Changing K would require
+    // modifying GPLv3 kernel source. Surface the no-op so the operator
+    // sees their flag was acknowledged but won't take effect here; the
+    // actual count emitted by RCKangaroo at init is "GPU X: allocated
+    // ... kangaroos" a few lines below this.
+    if (args.num_kangaroos > 0) {
+        std::cout << "[*] --kangaroos=" << args.num_kangaroos
+                  << " requested but RCKangaroo's K is kernel-grid-driven; "
+                     "the value below is the actual per-GPU count\n";
+    }
+
     gpu::RCKangarooManager rc_kangaroo;
     rc_kangaroo.range_bits = bits;
 
@@ -266,8 +285,14 @@ PuzzleStepResult run_kangaroo_rckangaroo(PuzzleIterContext& ctx) {
     double expected_ops_bits = (bits - 1) / 2.0 + 1;
     uint64_t expected_ops = (expected_ops_bits < 63) ? (1ULL << (int)expected_ops_bits) : 0;
 
-    // Progress callback
-    rc_kangaroo.progress_callback = [&, expected_ops, expected_ops_bits](uint64_t ops, uint64_t dp_count, int speed) -> bool {
+    // Progress callback. Updates both the legacy cout-based progress line
+    // (visible in piped / non-TUI runs) AND the unified TUI panels when
+    // ctx.tui_app is non-null. The TUI panels (header throughput, status
+    // phase name, performance keys/s history) are the authoritative live
+    // surface; the cout line stays so headless invocations (CI, --logs,
+    // SSH-no-tty) still see textual progress.
+    auto* tui_for_rc = static_cast<::collider::ui::tui::TuiApp*>(ctx.tui_app);
+    rc_kangaroo.progress_callback = [&, expected_ops, expected_ops_bits, tui_for_rc](uint64_t ops, uint64_t dp_count, int speed) -> bool {
         if (g_shutdown) return false;
 
         // Calculate progress percentage and ETA
@@ -290,6 +315,62 @@ PuzzleStepResult run_kangaroo_rckangaroo(PuzzleIterContext& ctx) {
                   << "\033[35mDPs:\033[0m " << ui::ProfessionalUI::format_number_short(dp_count) << " | "
                   << "\033[34mETA:\033[0m " << eta_str
                   << "  " << std::flush;
+
+        // Phase C TUI push: keys/s is speed (MKeys/s) * 1e6; chunk is
+        // ops / expected_ops scaled to a (cur, total) pair the panel
+        // can render as a bar. Cap total at INT_MAX for safety.
+        if (tui_for_rc) {
+            // TP-1 settings live-apply (RCKangaroo branch): poll
+            // snapshot_and_clear; theme + refresh apply instantly,
+            // backend change exits solve() so the dispatcher rebuilds.
+            if (auto* st = tui_for_rc->settings_state()) {
+                auto snap = ::collider::ui::tui::panels::snapshot_and_clear(*st);
+                const bool any_change =
+                    snap.dirty.num_kangaroos || snap.dirty.batch_size ||
+                    snap.dirty.dp_bits || snap.dirty.refresh_hz ||
+                    snap.dirty.theme || snap.dirty.verbose ||
+                    snap.dirty.backend_kind || snap.dirty.solver;
+                if (snap.dirty.refresh_hz) {
+                    tui_for_rc->set_refresh_hz(snap.values.refresh_hz);
+                }
+                if (any_change) {
+                    ::collider::settings_sidecar::save(snap.values);  // TR-5
+                }
+                if (snap.restart_requested) {
+                    return false;  // rckangaroo exits; outer loop re-init
+                }
+            }
+            tui_for_rc->set_keys_per_sec_current(static_cast<double>(speed) * 1e6);
+            // Mode-aware overlay: puzzle ops counter for the status
+            // panel's KANGAROO OPS row. Pre-overlay this data was lost
+            // behind the alt-screen; the operator-visible text "Ops:"
+            // line below us is invisible while the TUI is up.
+            ::collider::ui::tui::ChallengeInfo ci;
+            ci.puzzle_number = current_puzzle;
+            ci.puzzle_bits   = bits;
+            ci.ops_completed = ops;
+            ci.expected_ops  = expected_ops;
+            ci.dps_found     = dp_count;
+            ci.backend_name  = "RCKangaroo";
+            tui_for_rc->set_challenge_info(ci);
+            const uint64_t exp_clip =
+                expected_ops > 0 ? expected_ops : (ops + 1);
+            const uint64_t cur_clip =
+                ops > exp_clip ? exp_clip : ops;
+            const int cur_chunk =
+                cur_clip > static_cast<uint64_t>(INT_MAX)
+                    ? INT_MAX
+                    : static_cast<int>(cur_clip);
+            const int tot_chunks =
+                exp_clip > static_cast<uint64_t>(INT_MAX)
+                    ? INT_MAX
+                    : static_cast<int>(exp_clip);
+            tui_for_rc->set_chunk_progress(cur_chunk, tot_chunks);
+            if (tui_for_rc->requested_quit() && !g_shutdown) {
+                g_shutdown.store(true);
+                return false;
+            }
+        }
 
         return !g_shutdown;
     };
@@ -462,6 +543,18 @@ PuzzleStepResult run_kangaroo_multigpu(PuzzleIterContext& ctx,
     gpu::MultiGPUKangarooManager gpu_kangaroo;
     int dp_bits_to_use = 20;  // Default, will be set properly below
 
+    // v1.5.x: honor --kangaroos N (Arguments::num_kangaroos) as the
+    // per-GPU kangaroo count. Default of 0 leaves the manager's built-in
+    // 1<<18 in place. MultiGPUKangarooManager exposes the field as a
+    // public member; the assignment must happen BEFORE init() so the
+    // value flows into device buffer sizing.
+    if (args.num_kangaroos > 0) {
+        std::cout << "[*] --kangaroos=" << args.num_kangaroos
+                  << " per GPU (overriding default "
+                  << gpu_kangaroo.num_kangaroos_per_gpu << ")\n";
+        gpu_kangaroo.num_kangaroos_per_gpu = args.num_kangaroos;
+    }
+
     // Initialize with all available GPUs (or specific ones from args.gpu_ids if set)
     if (!gpu_kangaroo.init(args.gpu_ids)) {
         return PuzzleStepResult::FallThrough;
@@ -532,8 +625,58 @@ PuzzleStepResult run_kangaroo_multigpu(PuzzleIterContext& ctx,
     double expected_ops_bits = (bits - 1) / 2.0 + 1;  // sqrt(2^(bits-1)) ~= 2^((bits-1)/2)
     uint64_t expected_ops = (expected_ops_bits < 63) ? (1ULL << (int)expected_ops_bits) : 0;
 
-    gpu_kangaroo.progress_callback = [&, expected_ops, expected_ops_bits](uint64_t steps, uint64_t dp_count, double rate) -> bool {
+    auto* tui_for_mg = static_cast<::collider::ui::tui::TuiApp*>(ctx.tui_app);
+    gpu_kangaroo.progress_callback = [&, expected_ops, expected_ops_bits, tui_for_mg](uint64_t steps, uint64_t dp_count, double rate) -> bool {
         if (g_shutdown) return false;
+        // Phase C TUI push (mirrors the RCKangaroo path above; rate is
+        // already keys/s, no MKey scaling needed).
+        if (tui_for_mg) {
+            // TP-1 settings live-apply (MultiGPU branch).
+            if (auto* st = tui_for_mg->settings_state()) {
+                auto snap = ::collider::ui::tui::panels::snapshot_and_clear(*st);
+                const bool any_change =
+                    snap.dirty.num_kangaroos || snap.dirty.batch_size ||
+                    snap.dirty.dp_bits || snap.dirty.refresh_hz ||
+                    snap.dirty.theme || snap.dirty.verbose ||
+                    snap.dirty.backend_kind || snap.dirty.solver;
+                if (snap.dirty.refresh_hz) {
+                    tui_for_mg->set_refresh_hz(snap.values.refresh_hz);
+                }
+                if (any_change) {
+                    ::collider::settings_sidecar::save(snap.values);  // TR-5
+                }
+                if (snap.restart_requested) return false;
+            }
+            tui_for_mg->set_keys_per_sec_current(rate);
+            // Mode-aware overlay: same shape as the RCKangaroo branch
+            // above, but the per-step counter is named `steps` here
+            // (semantically equivalent to ops for the panel display).
+            ::collider::ui::tui::ChallengeInfo ci;
+            ci.puzzle_number = current_puzzle;
+            ci.puzzle_bits   = bits;
+            ci.ops_completed = steps;
+            ci.expected_ops  = expected_ops;
+            ci.dps_found     = dp_count;
+            ci.backend_name  = "MultiGPU";
+            tui_for_mg->set_challenge_info(ci);
+            const uint64_t exp_clip =
+                expected_ops > 0 ? expected_ops : (steps + 1);
+            const uint64_t cur_clip =
+                steps > exp_clip ? exp_clip : steps;
+            const int cur_chunk =
+                cur_clip > static_cast<uint64_t>(INT_MAX)
+                    ? INT_MAX
+                    : static_cast<int>(cur_clip);
+            const int tot_chunks =
+                exp_clip > static_cast<uint64_t>(INT_MAX)
+                    ? INT_MAX
+                    : static_cast<int>(exp_clip);
+            tui_for_mg->set_chunk_progress(cur_chunk, tot_chunks);
+            if (tui_for_mg->requested_quit() && !g_shutdown) {
+                g_shutdown.store(true);
+                return false;
+            }
+        }
 
         // Calculate expected DPs and progress
         double expected_dps = static_cast<double>(steps) / (1ULL << dp_bits_to_use);
@@ -613,6 +756,17 @@ PuzzleStepResult run_kangaroo_multigpu(PuzzleIterContext& ctx,
                  (unsigned long long)gpu_result.private_key.d[0]);
     }
 
+    // Flip the dashboard phase name to the operator-visible SOLVED
+    // state BEFORE the cout banner runs. The cout below still
+    // executes (captured to boot log; puzzle_found.txt is the
+    // durable record) but the dashboard now reflects the solve.
+    if (auto* tui_solved =
+            static_cast<::collider::ui::tui::TuiApp*>(ctx.tui_app)) {
+        std::ostringstream solved_phase;
+        solved_phase << "Puzzle #" << current_puzzle
+                     << " SOLVED (GPU Kangaroo)";
+        tui_solved->set_current_phase_name(solved_phase.str());
+    }
     {
         namespace boxui = ::collider::ui::box;
         std::cout << "\n\n";
@@ -799,6 +953,13 @@ PuzzleStepResult run_kangaroo_cpu(PuzzleIterContext& ctx) {
     std::strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S",
                   std::localtime(&solve_time_t));
 
+    // Flip dashboard phase to SOLVED (CPU/multi-GPU kangaroo path).
+    if (auto* tui_solved =
+            static_cast<::collider::ui::tui::TuiApp*>(ctx.tui_app)) {
+        std::ostringstream solved_phase;
+        solved_phase << "Puzzle #" << current_puzzle << " SOLVED (Kangaroo)";
+        tui_solved->set_current_phase_name(solved_phase.str());
+    }
     {
         namespace boxui = ::collider::ui::box;
         std::cout << "\n\n";
@@ -917,22 +1078,85 @@ PuzzleStepResult run_kangaroo_solve(PuzzleIterContext& ctx) {
     }
     std::cout << "[*] Target public key decompressed successfully\n";
 
+    // v1.5.x: --backend cpu|cuda|metal explicit override.
+    //
+    // Pre-1.5.x the standalone path tried RCKangaroo first (when
+    // --use-rckangaroo), fell through to MultiGPU (CUDA/Metal), and
+    // ultimately to CPU. The operator had no way to PICK a backend
+    // for an A/B test or to deliberately exercise the CPU path on a
+    // GPU box; the fall-through always landed on the most-capable
+    // available.
+    //
+    // With --backend set, the dispatch below short-circuits to the
+    // requested backend only:
+    //   cpu   -> straight to run_kangaroo_cpu (skip both GPU paths).
+    //   cuda  -> RCKangaroo first (if compiled), then MultiGPU CUDA.
+    //           Never falls to CPU.
+    //   metal -> MultiGPU Metal only (RCKangaroo is CUDA-only).
+    //           Never falls to CPU.
+    //   ""    -> pre-1.5.x fall-through behavior.
+    //
+    // Unknown values are caught at CLI parse time (apply_backend in
+    // cli_parser.cpp); reaching here with an unknown string would
+    // already have failed --backend's validator.
+    const bool backend_explicit = !args.backend_kind.empty();
+    const bool want_cpu   = backend_explicit && args.backend_kind == "cpu";
+    const bool want_cuda  = backend_explicit && args.backend_kind == "cuda";
+    const bool want_metal = backend_explicit && args.backend_kind == "metal";
+
+    // Phase F2: --solver bsgs short-circuits to the GPU BSGS path
+    // BEFORE any kangaroo backend dispatch. The BSGS driver returns
+    // FallThrough when the puzzle exceeds its bit-cap so the kangaroo
+    // dispatch below still runs for large ranges.
+    if (args.solver == "bsgs") {
+        std::cout << "[*] --solver bsgs: routing to GPU BSGS solver\n";
+        PuzzleStepResult br = run_bsgs_solve(ctx);
+        if (br != PuzzleStepResult::FallThrough) return br;
+        // Fall-through means BSGS rejected the range (too large).
+        // Drop into the kangaroo dispatch below.
+    }
+
+    if (want_cpu) {
+        std::cout << "[*] --backend cpu: routing to CPU kangaroo "
+                     "(skipping RCKangaroo and MultiGPU)\n";
+        return run_kangaroo_cpu(ctx);
+    }
+
 #ifdef COLLIDER_USE_RCKANGAROO
     // RCKangaroo - High-performance Kangaroo solver (8 GKeys/s on 4090).
-    // Gated on --use-rckangaroo; on init failure falls through to the
-    // MultiGPU backend below.
-    if (args.use_rckangaroo) {
+    // Gated on --use-rckangaroo OR --backend cuda; on init failure falls
+    // through to MultiGPU below unless --backend cuda was explicit (in
+    // which case the operator wanted CUDA specifically; we don't auto-
+    // demote to Metal).
+    if (args.use_rckangaroo || want_cuda) {
         PuzzleStepResult rc_result = run_kangaroo_rckangaroo(ctx);
         if (rc_result != PuzzleStepResult::FallThrough) return rc_result;
     }
+#else
+    if (want_cuda) {
+        std::cerr << "[!] --backend cuda requested but this binary was "
+                     "built without RCKangaroo (-DCOLLIDER_USE_RCKANGAROO=OFF).\n";
+        return PuzzleStepResult::FatalError;
+    }
 #endif
 
-    // MultiGPU Kangaroo (CUDA/Metal). Fall-through to CPU when init fails.
+    // MultiGPU Kangaroo (CUDA/Metal). With --backend cuda or --backend
+    // metal still set, do NOT fall through to CPU on init failure --
+    // the operator asked for a specific GPU backend and falling to CPU
+    // would be a silent contract break. Surface the failure instead.
     PuzzleStepResult gpu_result =
         run_kangaroo_multigpu(ctx, target_pubkey_x, target_pubkey_y);
     if (gpu_result != PuzzleStepResult::FallThrough) return gpu_result;
 
-    // CPU Kangaroo: last-resort fallback. Always terminal.
+    if (want_cuda || want_metal) {
+        std::cerr << "[!] --backend " << args.backend_kind
+                  << " requested but no compatible GPU initialized. "
+                     "Refusing to silently fall back to CPU.\n";
+        return PuzzleStepResult::FatalError;
+    }
+
+    // CPU Kangaroo: last-resort fallback (auto-dispatch only; --backend
+    // gates above prevent this for explicit GPU requests).
     return run_kangaroo_cpu(ctx);
 }
 

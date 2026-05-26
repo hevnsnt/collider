@@ -464,6 +464,9 @@ struct CLIFlags {
     bool bloom_file_set = false;        // --bloom
     bool gpu_ids_set = false;           // --gpus / -g
     bool batch_size_set = false;        // --batch-size
+    bool backend_kind_set = false;      // --backend cpu|cuda|metal (v1.5.x)
+    bool num_kangaroos_set = false;     // --kangaroos N (v1.5.x)
+    bool solver_set       = false;      // --solver kangaroo|bsgs (v1.5.x F2)
     bool force_calibrate_set = false;   // --force-calibrate
 
     // Settings

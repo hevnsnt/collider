@@ -186,5 +186,69 @@ inline bool validate_mnemonic(const std::vector<std::string>& words,
     return true;
 }
 
+/**
+ * Encode a raw entropy buffer into a BIP-39 mnemonic word vector.
+ *
+ * Inverse of validate_mnemonic's bitstream reconstruction. Computes the
+ * checksum byte (top cs_bits of SHA-256(entropy)), appends it to the
+ * entropy, then slices into 11-bit word indices MSB-first and looks
+ * each one up in the wordlist.
+ *
+ * Used by the combinatorial scanner (v1.5.0): every 128/160/192/224/
+ * 256-bit entropy value maps to EXACTLY ONE valid mnemonic. Iterating
+ * entropy space is the maximum-throughput way to scan because every
+ * candidate passes checksum by construction; no rejection cycles.
+ *
+ * Word counts per BIP-39 spec:
+ *   ent_bytes=16 (128b) -> 12 words
+ *   ent_bytes=20 (160b) -> 15 words
+ *   ent_bytes=24 (192b) -> 18 words
+ *   ent_bytes=28 (224b) -> 21 words
+ *   ent_bytes=32 (256b) -> 24 words
+ *
+ * Throws std::invalid_argument on unsupported entropy length.
+ */
+[[nodiscard]] inline std::vector<std::string> entropy_to_mnemonic(
+    const std::vector<uint8_t>& entropy,
+    const WordlistEnglish& wordlist) {
+    if (!wordlist.ready()) {
+        throw std::runtime_error("BIP-39 wordlist not loaded");
+    }
+    const size_t ent_bytes = entropy.size();
+    if (ent_bytes != 16 && ent_bytes != 20 && ent_bytes != 24 &&
+        ent_bytes != 28 && ent_bytes != 32) {
+        throw std::invalid_argument(
+            "BIP-39 entropy must be 16/20/24/28/32 bytes; got " +
+            std::to_string(ent_bytes));
+    }
+    const size_t ent_bits = ent_bytes * 8;
+    const size_t cs_bits = ent_bits / 32;
+    const size_t total_bits = ent_bits + cs_bits;
+    const size_t word_count = total_bits / WordlistEnglish::kIndexBits;
+
+    // Build stream = entropy || checksum_byte
+    auto hash = collider::cpu::SHA256::hash(entropy.data(), entropy.size());
+    std::vector<uint8_t> stream(ent_bytes + 1, 0);
+    std::memcpy(stream.data(), entropy.data(), ent_bytes);
+    stream[ent_bytes] = hash[0];
+
+    // Slice 11-bit indices MSB-first.
+    std::vector<std::string> out;
+    out.reserve(word_count);
+    size_t bit_pos = 0;
+    for (size_t w = 0; w < word_count; ++w) {
+        uint32_t idx = 0;
+        for (int b = 0; b < 11; ++b) {
+            const size_t bp = bit_pos + static_cast<size_t>(b);
+            const uint8_t bit =
+                (stream[bp / 8] >> (7 - (bp % 8))) & 1u;
+            idx = (idx << 1) | bit;
+        }
+        bit_pos += 11;
+        out.push_back(wordlist.word(idx));
+    }
+    return out;
+}
+
 }  // namespace bip39
 }  // namespace collider

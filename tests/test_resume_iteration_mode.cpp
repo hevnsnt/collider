@@ -130,11 +130,16 @@ int probe_resume_into(const std::string& wordlist_path,
 
 }  // namespace
 
-// Repair R2 cover: confirm the GPU-incompatible Combinator phase gets
-// skipped by advance_past_gpu_incompatible_phases() and the generator
-// lands on a phase whose `gpu_compatible` flag is true. Without R2 this
-// helper does not exist on the generator; with R2 it exists and skips
-// past phase 4 (Combinator) to phase 5 (Deep Dive).
+// Original R2 cover asserted that Combinator (phase 3) was
+// gpu_incompatible and that advance_past_gpu_incompatible_phases()
+// skipped it. ad5326d added next_raw_words_internal() pair generation
+// + the GPU rule engine for Combinator, flipping it to gpu_compatible
+// (see streaming_brain_wallet.cpp:1358 "gpu_compatible=true (the
+// default) is correct"). The probe now asserts the post-ad5326d
+// invariant: Combinator (and every other live phase) is
+// gpu_compatible, so advance_past returns true without advancing.
+// Acts as a regression guard against accidental gpu_compatible=false
+// regression on any phase.
 int probe_advance_past_gpu_incompatible(const std::string& wordlist_path) {
     bw::StreamingBrainWallet::Config config;
     config.base_wordlist = wordlist_path;
@@ -177,10 +182,11 @@ int probe_advance_past_gpu_incompatible(const std::string& wordlist_path) {
         return 22;
     }
 
-    if (gen.current_phase_gpu_compatible()) {
+    if (!gen.current_phase_gpu_compatible()) {
         std::fprintf(stderr,
                      "[advance_past] FAIL: Combinator should be marked "
-                     "gpu_compatible=false but it isn't.\n");
+                     "gpu_compatible=true (ad5326d's pair-generator + GPU "
+                     "rule-engine path) but the flag is false.\n");
         return 23;
     }
 
@@ -191,16 +197,21 @@ int probe_advance_past_gpu_incompatible(const std::string& wordlist_path) {
         return 24;
     }
 
-    if (!gen.current_phase_gpu_compatible()) {
+    // With every phase gpu_compatible, advance must be a no-op: we should
+    // still be sitting on Combinator. If a future change marks Combinator
+    // (or any earlier phase) incompatible, advance would walk forward and
+    // this assertion catches the silent regression.
+    if (gen.current_phase_name() != "Combinator") {
         std::fprintf(stderr,
-                     "[advance_past] FAIL: after advance, landed in another "
-                     "gpu_compatible=false phase (\"%s\").\n",
+                     "[advance_past] FAIL: advance should be a no-op when "
+                     "every phase is gpu_compatible; expected to remain on "
+                     "Combinator, got \"%s\".\n",
                      gen.current_phase_name().c_str());
         return 25;
     }
 
-    std::printf("[advance_past] PASS: skipped \"Combinator\" -> \"%s\"\n",
-                gen.current_phase_name().c_str());
+    std::printf("[advance_past] PASS: Combinator gpu_compatible=true, "
+                "advance stayed put.\n");
     return 0;
 }
 

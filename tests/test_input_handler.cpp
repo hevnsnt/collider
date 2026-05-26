@@ -371,9 +371,13 @@ int main() {
             return fail("table: 't' should map to ThemeCycle");
         if (lookup('g') != Action::GpuToggle)
             return fail("table: 'g' should map to GpuToggle");
-        // Phase 5 wiring (Wave 9): w/l now dispatch live Actions.
-        if (lookup('w') != Action::WordlistPicker)
-            return fail("table: 'w' should map to WordlistPicker");
+        // User report 2026-05-23: 'w' now opens the Composer (the
+        // unified add-source / remove / recombine / PCFG modal). The
+        // legacy "pick from existing profile" picker is unreachable
+        // from the keyboard now; only direct programmatic open
+        // (test 17 below) drives it for modal-routing coverage.
+        if (lookup('w') != Action::ComposerOpen)
+            return fail("table: 'w' should map to ComposerOpen");
         if (lookup('l') != Action::RecentHits)
             return fail("table: 'l' should map to RecentHits");
         // Uppercase: lookup() lowercases first.
@@ -388,16 +392,17 @@ int main() {
     // ================================================================
     {
         auto live = active_footer_bindings();
-        bool found_wordlist = false;
+        bool found_composer = false;
         bool found_recent = false;
         for (const auto& kb : live) {
             if (kb.action == Action::Quit)
                 return fail("footer: Quit should be omitted from active list");
-            if (kb.action == Action::WordlistPicker) found_wordlist = true;
-            if (kb.action == Action::RecentHits) found_recent = true;
+            // 'w' now opens the Composer (user report 2026-05-23).
+            if (kb.action == Action::ComposerOpen) found_composer = true;
+            if (kb.action == Action::RecentHits)   found_recent = true;
         }
-        if (!found_wordlist)
-            return fail("footer: WordlistPicker missing from active list");
+        if (!found_composer)
+            return fail("footer: ComposerOpen missing from active list");
         if (!found_recent)
             return fail("footer: RecentHits missing from active list");
     }
@@ -421,22 +426,22 @@ int main() {
     }
 
     // ================================================================
-    // 16. Wordlist picker open: 'w' sets WordlistPickerState::open.
-    //     Phase 5 / Wave 9 wiring. The new host-context overload is
-    //     used so the handler can dispatch the wordlist Action; the
-    //     bloom-only overload (used by tests 10-12) keeps working.
+    // 16. Wordlist composer open: 'w' now sets
+    //     WordlistComposerState::open instead of the legacy picker
+    //     (user report 2026-05-23: 'w' should be the one access
+    //     point for wordlist management). The picker is still
+    //     reachable programmatically for tests 17-19 that exercise
+    //     its modal-routing behaviour.
     // ================================================================
     {
         reset_runtime_state();
         InputHandler h;
-        collider::ui::tui::panels::WordlistPickerState picker;
+        collider::ui::tui::panels::WordlistComposerState composer;
         collider::ui::tui::InputHandlerHostContext host;
-        host.wordlist_picker = &picker;
+        host.wordlist_composer = &composer;
         h.on_event(Event::Character('w'), host);
-        if (!picker.open)
-            return fail("wordlist: 'w' did not open picker");
-        if (!picker.selected_path.empty())
-            return fail("wordlist: selected_path should be empty before commit");
+        if (!composer.open)
+            return fail("wordlist: 'w' did not open composer");
     }
 
     // ================================================================

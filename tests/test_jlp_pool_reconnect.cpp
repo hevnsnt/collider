@@ -83,10 +83,13 @@ constexpr uint8_t TYPE_AUTH      = 0x01;
 constexpr uint8_t TYPE_AUTH_OK   = 0x02;
 constexpr uint8_t TYPE_AUTH_FAIL = 0x03;
 
-// v1.4.2 B.5: mock server must send flags = PROTOCOL_VERSION (=2) just like
+// v1.4.2 B.5: mock server must send flags = PROTOCOL_VERSION just like
 // the real server, otherwise the client (correctly) rejects with protocol
 // version mismatch.
-constexpr uint8_t MOCK_PROTOCOL_VERSION = 2;
+// v1.5 (protocol_version=3): bumped from 2 to 3. The reconnect /
+// supervisor / dedup tests below are protocol-version agnostic; the
+// bump here is mock-server hygiene, not a behavior change.
+constexpr uint8_t MOCK_PROTOCOL_VERSION = 3;
 std::vector<uint8_t> build_frame(uint8_t type, const void* payload, uint16_t len) {
     std::vector<uint8_t> out;
     out.reserve(8 + len);

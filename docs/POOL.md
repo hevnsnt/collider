@@ -4,6 +4,8 @@ How to join the Collision Protocol pool, what your worker does on the wire, how 
 
 For the wire format itself (frame layouts, byte offsets, struct sizes), see [JLP-PROTOCOL.md](JLP-PROTOCOL.md). This document is the operator-facing companion.
 
+> **v1.5 worker note.** Starting in v1.5, the pool assigns you ONE side (TAME or WILD) on each connect. You do not pick. The pool round-robins across connections so the network stays balanced. You never see the puzzle's private key in pool mode; the algorithm itself denies any single worker the data needed to compute it. Payouts arrive at the Bitcoin address in your `--worker` argument after the operator triggers them through the admin payout UI. See [`v1.5 migration guide`](MIGRATION-v1.5.md) for the upgrade procedure; v1.4.x clients are refused by v1.5 servers with `AUTH_FAIL: UPGRADE_REQUIRED`.
+
 ---
 
 ## Table of contents
@@ -60,13 +62,20 @@ Once connected, the client runs the following loop. The full state machine is do
 ```
 1. TCP / TLS handshake.
 2. Send AUTH (within 30 seconds of connect) -> AUTH_OK or AUTH_FAIL.
-3. Send WORK_REQ -> receive WORK_ASN (a chunk: pubkey + range + dp_bits + work_id).
-4. Compute kangaroo on the chunk. Whenever a DP is produced, queue it.
+3. Send WORK_REQ -> receive WORK_ASN
+     (v1.5: pubkey + range + dp_bits + work_id + kangaroo_type + start_offset_a + start_offset_b).
+4. Compute kangaroo on the chunk. v1.5 workers run ONLY tame OR ONLY wild
+   kangaroos based on the type field; the host-side cross-collision detection is
+   disabled in pool mode. Whenever a DP is produced, queue it.
 5. Every few seconds, flush queued DPs as a DP_BATCH_V2 frame -> receive DP_ACK.
 6. Every 20 seconds with no other traffic, send PING -> receive PONG.
 7. On chunk completion (the kangaroo finishes its assigned range): send WORK_REQ again.
-8. Eventually: server pushes SOLUTION when any worker's tame collides with any wild.
+8. Eventually: server pushes SOLUTION when any TAME worker's DPs collide with any
+   WILD worker's DPs in the pool aggregator. The puzzle private key is computed
+   on the server, never on a worker.
 ```
+
+Submitting a DP whose type does not match your assigned `kangaroo_type` is treated as binary modification and results in a permanent IP ban on first occurrence (audit finding P2). A well-behaved v1.5 client cannot trigger this; the type bit is set automatically by the backend at `WORK_ASN` time.
 
 The connection is long-lived. theCollider holds one socket for the full session and multiplexes the read and write loops behind a TLS-safe mutex. Reconnects are jittered and bounded (3 attempts on `AUTH_FAIL`, exponential backoff with a unified cap).
 

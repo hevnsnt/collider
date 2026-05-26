@@ -6,6 +6,12 @@
 #include "../core/byte_codec.hpp"
 #include "../core/secure_write.hpp"  // secure_open_ofstream for bloom_hits.txt
 
+// defs.h from the forked RCKangaroo carries KANG_MODE_BOTH / TAME_ONLY /
+// WILD_ONLY. The wire-side u8 values in WorkAssignment.kangaroo_type are
+// byte-stable with these constants (0/1/2). v1.5 pool mode MUST translate
+// to TAME_ONLY or WILD_ONLY; BOTH is rejected as a server bug.
+#include "../../third_party/RCKangaroo/defs.h"
+
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -22,6 +28,41 @@ CudaRCKangarooBackend::CudaRCKangarooBackend(std::vector<int> gpu_ids)
 
 bool CudaRCKangarooBackend::initialize(const collider::pool::WorkAssignment& work) {
     error_.clear();
+
+    // v1.5: enforce the asymmetric tame/wild assignment from the pool
+    // server. Without this, RCKangaroo would default to KANG_MODE_BOTH
+    // and the worker would self-solve into the v1.4.x theft-vulnerable
+    // code path (host-side tame x wild collision detection computes the
+    // recovered private key into worker memory). The mapping below is
+    // the SOLE bridge between the wire u8 and the kangaroo runtime mode.
+    //
+    // BOTH (kangaroo_type == 0) is REJECTED in pool mode: the v1.5 pool
+    // server is contractually required to assign TAME_ONLY or WILD_ONLY
+    // round-robin. A BOTH assignment hitting this path means either a
+    // server bug, a downgrade attack from a malicious server, or a
+    // protocol-version slip. Fail fast rather than silently configuring
+    // a theft-vulnerable solver.
+    switch (work.kangaroo_type) {
+        case 1:  // TAME_ONLY
+            rc_.mode = KANG_MODE_TAME_ONLY;
+            break;
+        case 2:  // WILD_ONLY
+            rc_.mode = KANG_MODE_WILD_ONLY;
+            break;
+        case 0:  // BOTH (legacy / illegal in v1.5 pool mode)
+        default: {
+            std::ostringstream oss;
+            oss << "pool work assignment carries illegal kangaroo_type="
+                << static_cast<int>(work.kangaroo_type)
+                << " (v1.5 pool servers must assign 1=TAME_ONLY or "
+                   "2=WILD_ONLY; kangaroo_type=0/BOTH would re-enable the "
+                   "v1.4.x theft-vulnerable local solve path). Refusing "
+                   "to initialize. Check that the pool server is running "
+                   "v1.5+ asymmetric protocol.";
+            error_ = oss.str();
+            return false;
+        }
+    }
 
     rc_.dp_bits    = work.dp_bits;
     // Pool range_bits = bit_length(range_start), NOT bit_length(chunk_size).
@@ -124,14 +165,17 @@ void CudaRCKangarooBackend::solve(BackendCallbacks cb) {
     };
 
     gpu::RCKangarooResult result = rc_.solve();
-    if (result.found && cb.on_solution) {
-        // RCKangaroo returns the private key as std::array<uint64_t, 4>
-        // in LE-by-limb order; the pool wire wants 32 bytes BE. Reuse
-        // the shared codec rather than open-coding the conversion.
-        uint8_t key[32];
-        ::collider::limbs_le_to_be32(result.private_key.data(), key);
-        cb.on_solution(key);
-    }
+    // v1.5: the result.found path that invoked cb.on_solution with the
+    // recovered private key was DELETED. In pool mode rc_.mode is always
+    // TAME_ONLY or WILD_ONLY (enforced in initialize() above), and the
+    // forked RCKangaroo's contract guarantees no Mode != BOTH instance
+    // can produce result.found=true (the per-instance host-side tame x
+    // wild hashtable is bypassed; the solve loop exits only on the
+    // external stop signal). The standalone solver runs through a
+    // different backend dispatch and does not share this code path.
+    // Reading result.private_key here would re-introduce the theft
+    // surface v1.5 was designed to eliminate, so the read is gone too.
+    (void)result;
 }
 
 std::string CudaRCKangarooBackend::device_summary() const {

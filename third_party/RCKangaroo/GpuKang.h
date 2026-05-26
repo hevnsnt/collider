@@ -3,6 +3,19 @@
 // License: GPLv3, see "LICENSE.TXT" file
 // https://github.com/RetiredC
 
+// ============================================================================
+// Modifications by SixCyber LLC, licensed under GPLv3 per
+// the original work. See LICENSE at the repository root and
+// THIRD_PARTY_LICENSES.md for the project-wide dependency inventory.
+//
+// Modification history for this file:
+//   2026-05-21 (v1.5.0):
+//     - Added a public Mode field on RCGpuKang (default KANG_MODE_BOTH)
+//       so the consumer can configure asymmetric tame-only or wild-only
+//       execution before Prepare() is called. Supports the v1.5 pool
+//       protocol's asymmetric work assignment.
+// ============================================================================
+
 
 #pragma once
 
@@ -78,6 +91,23 @@ public:
 	// y[4], priv[4]). Matches the cudaMalloc size at GpuKang.cpp Prepare.
 	const unsigned char* InitKangsHost = nullptr;
 	unsigned char*       SaveKangsHost = nullptr;
+
+	// theCollider v1.5: asymmetric kangaroo mode (default BOTH preserves
+	// upstream behavior). Set BEFORE calling Prepare(). Persisted into
+	// Kparams.Mode by Prepare(). See defs.h KANG_MODE_* and the v1.5
+	// plan for the theft-resistance rationale.
+	//
+	// In TAME_ONLY: every kangaroo starts as a tame (RndPnts[i].x = 0,
+	// distance ~ Range - 4), the host-side hashtable is the caller's
+	// problem (the upstream RCKangaroo.cpp main still uses it; the
+	// pool-mode wrapper bypasses it), the DPs that come back through
+	// AddPointsToList all carry type = TAME, and the solve loop does
+	// not terminate on found=true (the caller stops via Stop()).
+	//
+	// In WILD_ONLY: every kangaroo starts as wild1 (RndPnts[i].x =
+	// PntA, distance ~ Range - 1, even), DPs carry type = WILD1, and
+	// the solve loop similarly runs until external Stop().
+	int Mode = KANG_MODE_BOTH;
 
 	int CalcKangCnt();
 	bool Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP* _EcJumps1, EcJMP* _EcJumps2, EcJMP* _EcJumps3);

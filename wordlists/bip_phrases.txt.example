@@ -1,0 +1,19 @@
+# theCollider Pro -- BIP-39 / BIP-32 candidate phrases.
+#
+# One mnemonic phrase per line. Words separated by whitespace.
+# Phrase length: 12, 15, 18, 21, or 24 words (BIP-39 standard).
+# Lines starting with '#' or blank lines are skipped.
+#
+# To start using this file: rename it from
+#   wordlists/bip_phrases.txt.example
+# to
+#   wordlists/bip_phrases.txt
+# and replace the lines below with your own candidate phrases.
+#
+# Examples (these are FAMOUS test mnemonics from the BIP-39 spec;
+# they are NOT funded, but they let you verify the scanner runs):
+
+abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about
+legal winner thank year wave sausage worth useful legal winner thank yellow
+letter advice cage absurd amount doctor acoustic avoid letter advice cage above
+zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong

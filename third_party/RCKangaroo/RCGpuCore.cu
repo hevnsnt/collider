@@ -3,20 +3,48 @@
 // License: GPLv3, see "LICENSE.TXT" file
 // https://github.com/RetiredC
 
-// Local patch (collider-pro, v1.4.2): NVCC 12.8 on Ubuntu 22.04 doesn't
-// pull <cstdint> through "defs.h" transitively, so uint32_t/uint64_t at
-// line 65 (Kparams.DP shift math) fail to resolve. The Windows + macOS
-// builds work because their toolchains pre-pull it. Add the include
-// explicitly so the Linux GH Actions build doesn't die at 17% with
-// "identifier uint32_t is undefined" errors. Upstream this if a future
-// RCKangaroo sync drops the patch.
+// ============================================================================
+// Modifications by SixCyber LLC, licensed under GPLv3 per
+// the original work. See LICENSE at the repository root and
+// THIRD_PARTY_LICENSES.md for the project-wide dependency inventory.
+//
+// Modification history for this file:
+//   2026-05-21 (v1.5.0):
+//     - Build-system changes to support the v1.5 asymmetric KangarooMode
+//       (CUDA_SEPARABLE_COMPILATION discipline pinned for downstream
+//       test-target device-link correctness; see CMakeLists.txt). No
+//       device-code semantics changed in this file for v1.5.
+//   v1.4.2:
+//     - Added explicit <cstdint> include because NVCC 12.8 on Ubuntu
+//       22.04 doesn't pull it through "defs.h" transitively, causing
+//       Kparams.DP shift math to fail to resolve uint32_t / uint64_t.
+//       Windows and macOS toolchains pre-pull it so they don't see the
+//       break; this keeps the Linux GH Actions build green. Upstream
+//       this if a future RCKangaroo sync drops the patch.
+// ============================================================================
+
 #include <cstdint>
 
 #include "defs.h"
 #include "RCGpuUtils.h"
 
 //imp2 table points for KernelA
-__device__ __constant__ u64 jmp2_table[8 * JMP_CNT];
+// theCollider v1.5.x: __align__(16) is REQUIRED. The kernel below reads
+// jmp2_table via Copy_int4_x2 (== ((int4*)src)[0/1]), which is a 16-byte
+// vectorized load. Without an explicit alignment hint, __constant__ arrays
+// of u64 get only u64-natural (8-byte) alignment, and the link-order of
+// other __constant__ symbols in the same module decides whether
+// jmp2_table happens to land on a 16-byte boundary or only an 8-byte one.
+//   * collider-pro.exe link graph: 8-byte-only, kernel hits
+//     cudaErrorMisalignedAddress at line 466 (KernelA) on every Turing
+//     GPU and on Ampere GPUs under compute-sanitizer.
+//   * test_kangaroo_mode_asymmetric.exe link graph: lands 16-aligned by
+//     luck, kernel runs.
+// Explicit __align__(16) closes this so the alignment is a property of the
+// declaration, not the link order. Verified by re-running with
+// compute-sanitizer after the fix: no Invalid __global__ stanza on either
+// GPU.
+__device__ __constant__ __align__(16) u64 jmp2_table[8 * JMP_CNT];
 
 
 #define BLOCK_CNT	gridDim.x
@@ -526,7 +554,20 @@ __device__ __forceinline__ void BuildDP(const TKparams& Kparams, int kang_ind, u
 	*(int4*)&DPs[4] = rx1;
 	*(int4*)&DPs[8] = ((int4*)d)[0];
 	*(u64*)&DPs[12] = d[2];
-	DPs[14] = 3 * kang_ind / Kparams.KangCnt; //kang type
+	// theCollider v1.5: in pool TAME_ONLY / WILD_ONLY modes the herd is
+	// homogeneous, so the type byte is fixed regardless of kang_ind.
+	// In BOTH (upstream) the type is derived from the 1/3 partitioning
+	// of kang_ind across [0, KangCnt). The wrapper / upstream
+	// CheckNewPoints both read this byte at DPs[14] (= byte offset 56
+	// in the 64-byte GPU DP record).
+	u32 dp_type;
+	if (Kparams.Mode == KANG_MODE_TAME_ONLY)
+		dp_type = TAME;
+	else if (Kparams.Mode == KANG_MODE_WILD_ONLY)
+		dp_type = WILD1;
+	else
+		dp_type = 3 * kang_ind / Kparams.KangCnt; //kang type (BOTH)
+	DPs[14] = dp_type;
 }
 
 __device__ __forceinline__ bool ProcessJumpDistance(u32 step_ind, u32 d_cur, u64* d, u32 kang_ind, u64* jmp1_d, u64* jmp2_d, const TKparams& Kparams, u64* table, u32* cur_ind, u8 iter)
@@ -897,13 +938,36 @@ __global__ void KernelGen(const TKparams Kparams)
 			Copy_u64_x4(ty, t2y);
 		}
 
+		// theCollider v1.5: decide whether this kangaroo's starting
+		// point gets the wild offset (PntA or PntB, supplied through
+		// x0/y0) added to its tame-only `d*G` result.
+		//   BOTH (upstream): only the upper 2/3 of indices (the wild
+		//     kangaroos) take the offset. Tames stay at d*G.
+		//   TAME_ONLY: never add the offset. Every kangaroo stays at
+		//     d*G (a tame). x0/y0 are zero per the host seeding in
+		//     GpuKang.cpp:Start.
+		//   WILD_ONLY: every kangaroo takes the offset (PntA for the
+		//     whole herd). They are all wild1.
+		// IsGenMode (tames-generation mode) suppresses the wild branch
+		// in BOTH the way it did upstream; it is mutually exclusive
+		// with the pool TAME_ONLY / WILD_ONLY modes (pool mode never
+		// runs tame-file generation).
+		bool add_wild_offset = false;
 		if (!Kparams.IsGenMode)
-			if (kang_ind >= Kparams.KangCnt / 3)
-			{
-				AddPoints(t2x, t2y, x, y, x0, y0);
-				Copy_u64_x4(x, t2x);
-				Copy_u64_x4(y, t2y);
-			}
+		{
+			if (Kparams.Mode == KANG_MODE_TAME_ONLY)
+				add_wild_offset = false;
+			else if (Kparams.Mode == KANG_MODE_WILD_ONLY)
+				add_wild_offset = true;
+			else // KANG_MODE_BOTH
+				add_wild_offset = (kang_ind >= Kparams.KangCnt / 3);
+		}
+		if (add_wild_offset)
+		{
+			AddPoints(t2x, t2y, x, y, x0, y0);
+			Copy_u64_x4(x, t2x);
+			Copy_u64_x4(y, t2y);
+		}
 
 		Kparams.Kangs[kang_ind * 12 + 0] = x[0];
 		Kparams.Kangs[kang_ind * 12 + 1] = x[1];

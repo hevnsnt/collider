@@ -26,6 +26,15 @@ struct DistinguishedPoint {
 };
 
 // Work assignment from pool
+//
+// v1.5 (protocol_version=3): adds asymmetric tame/wild fields at the tail
+// (kangaroo_type, start_offset_a, start_offset_b). Default kangaroo_type=0
+// (= KANG_MODE_BOTH from third_party/RCKangaroo/defs.h) is REJECTED in pool
+// mode by CudaRCKangarooBackend::initialize -- the server MUST assign 1
+// (TAME_ONLY) or 2 (WILD_ONLY) so the worker never holds both halves of
+// the Pollard rho trail data. The pool server is the sole entity that
+// sees DPs of both types together; only the server can compute the
+// recovered key. See .claude/tasks/v1.5-asymmetric-kangaroo.md.
 struct WorkAssignment {
     uint8_t public_key[33];  // Compressed public key (target)
     uint8_t range_start[32]; // Start of search range
@@ -33,6 +42,16 @@ struct WorkAssignment {
     uint32_t dp_bits;        // Distinguished point bits
     uint64_t work_id;        // Unique work identifier
     std::string puzzle_name; // e.g., "Puzzle #135"
+    // v1.5 asymmetric work-assignment fields (wire offsets 109..125).
+    // kangaroo_type values: 0=BOTH (illegal in pool mode), 1=TAME_ONLY,
+    // 2=WILD_ONLY. Mapped to KANG_MODE_* before being handed to the
+    // backend. start_offset_a/_b bind this worker to a disjoint sub-range
+    // [a, b) of the assigned chunk; reserved for future per-worker
+    // chunk-slicing (currently informational, propagated end-to-end so
+    // the server can revoke if the worker drifts outside).
+    uint8_t  kangaroo_type   = 0;
+    uint64_t start_offset_a  = 0;
+    uint64_t start_offset_b  = 0;
 };
 
 // In-process pool statistics surfaced to the host (UI, progress display,
@@ -93,11 +112,24 @@ public:
     // Statistics
     virtual PoolStatsLocal get_stats() = 0;
 
-    // Solution notification (called when key is found)
-    virtual bool report_solution(const uint8_t* private_key) = 0;
+    // v1.5: client-to-server report_solution() was DELETED.
+    // No code path on the worker may possess the puzzle's private key;
+    // the pool server is the sole key-computer (collision_detector in
+    // collision-protocol). The SOLUTION wire message is now strictly
+    // server-to-client, used by the server to broadcast "the pool solved
+    // it; stop grinding" -- the broadcast payload is NOT stored on the
+    // worker and never leaves the SolutionCallback invocation site.
+    // See .claude/tasks/v1.5-asymmetric-kangaroo.md.
 
     // Callbacks
-    using SolutionCallback = std::function<void(const uint8_t* private_key)>;
+    // v1.5: SolutionCallback fires only on the server-to-client SOLUTION
+    // BROADCAST. The 32-byte payload is the pool-server-computed recovered
+    // key (server publishes it for transparency / audit); the worker
+    // treats it as opaque stop-signal metadata and MUST NOT persist,
+    // forward, or display it in copy-paste-friendly form. The parameter
+    // is named `solution_payload` (not `private_key`) to keep that
+    // contract in callers' line of sight.
+    using SolutionCallback = std::function<void(const uint8_t* solution_payload)>;
     using WorkCallback = std::function<void(const WorkAssignment& work)>;
 
     virtual void set_solution_callback(SolutionCallback cb) = 0;

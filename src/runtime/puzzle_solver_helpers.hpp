@@ -165,6 +165,13 @@ void select_algorithm(Arguments& args,
 // of locals inside the per-puzzle for-loop. Construction is free; the
 // solve helpers read/write fields through references and we pass the
 // struct by reference to keep the call sites lightweight.
+// Forward decl: the Phase F2 BSGS path. Implementation lives in
+// puzzle_solver_bsgs.cpp; called from puzzle_solver_kangaroo.cpp's
+// dispatcher when args.solver == "bsgs".
+struct PuzzleIterContext;
+enum class PuzzleStepResult;
+PuzzleStepResult run_bsgs_solve(PuzzleIterContext& ctx);
+
 struct PuzzleIterContext {
     Arguments& args;
     const GPUDetectionResult& gpu_info;
@@ -172,6 +179,12 @@ struct PuzzleIterContext {
     const PuzzleInfo* puzzle;     // may be null for --puzzle-start/--puzzle-end mode
     PuzzleTarget& tgt;
     bool is_multi_puzzle;
+    // Phase C: when non-null, solvers push their per-tick keys/s and
+    // ops counters here so the unified panels render live data. Null
+    // = no TUI active (test invocations, programmatic callers). Typed
+    // as void* + cast inside the .cpp so this header does not have to
+    // pull in ui/tui/tui_app.hpp (which transitively drags ftxui).
+    void* tui_app = nullptr;
 };
 
 // Print the free SHA-256-only benchmark (CPU + GPU SHA256 throughput).

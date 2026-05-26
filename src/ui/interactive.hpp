@@ -30,8 +30,9 @@ namespace ui {
 enum class MainMenuChoice {
     PUZZLE_MODE = 1,
     BRAINWALLET_MODE = 2,
-    BENCHMARK_MODE = 3,
-    SHOW_HELP = 4,
+    BIP_SCAN_MODE = 3,         // v1.5.x: BIP-39/32 mnemonic scanner
+    BENCHMARK_MODE = 4,
+    SHOW_HELP = 5,
     EXIT = 0
 };
 
@@ -270,13 +271,15 @@ public:
         std::cout << "  " << colors::BRIGHT_GREEN << "[2]" << colors::RESET
                   << " Brain Wallet Scanner\n";
         std::cout << "  " << colors::BRIGHT_GREEN << "[3]" << colors::RESET
-                  << " Run Benchmark\n";
+                  << " BIP-39/32 Mnemonic Scanner\n";
         std::cout << "  " << colors::BRIGHT_GREEN << "[4]" << colors::RESET
+                  << " Run Benchmark\n";
+        std::cout << "  " << colors::BRIGHT_GREEN << "[5]" << colors::RESET
                   << " Show Help\n";
         std::cout << "\n";
         std::cout << "  " << colors::DIM << "[0]" << colors::RESET
                   << colors::DIM << " Exit" << colors::RESET << "\n";
-        int choice = prompt_menu_choice(0, 4);
+        int choice = prompt_menu_choice(0, 5);
         return static_cast<MainMenuChoice>(choice);
 #else
         std::cout << "  " << colors::BRIGHT_GREEN << "[2]" << colors::RESET

@@ -42,10 +42,48 @@ static_assert(sizeof(JLPDistinguishedPointV2) == sizeof(jlp_wire::DistinguishedP
 static_assert(sizeof(jlp_wire::DistinguishedPointV2) == 78,
               "DP v2 wire size is 78 by spec (post-1.4.1 B.1 sequence)");
 
+// v1.5 (protocol_version=3): WorkAssignment grew to 126 bytes with
+// three trailing asymmetric-assignment fields (kangaroo_type,
+// start_offset_a, start_offset_b). The handwritten JLPServerConfig
+// in jlp_pool_client.hpp was extended by client-runtime (Wave 2 task #5)
+// to match the new 126-byte layout; the equality drift detector below
+// is reactivated. Both struct sizes are pinned to 126 by the second
+// assert so any future schema change without a parallel struct update
+// trips at build time.
 static_assert(sizeof(JLPServerConfig) == sizeof(jlp_wire::WorkAssignment),
               "WorkAssignment layout has diverged");
-static_assert(sizeof(jlp_wire::WorkAssignment) == 109,
-              "WorkAssignment wire size is 109 by spec");
+static_assert(sizeof(jlp_wire::WorkAssignment) == 126,
+              "v1.5: WorkAssignment wire size is 126 by spec "
+              "(109 head + 1 kangaroo_type + 8 start_offset_a + 8 start_offset_b)");
+static_assert(sizeof(JLPServerConfig) == 126,
+              "v1.5: JLPServerConfig must be 126 bytes after task #5 extension");
+
+// Field-by-field offset checks for the new v1.5 fields so a future
+// reorder is caught by both sizeof equality AND member-position equality.
+static_assert(offsetof(JLPServerConfig, public_key) ==
+              offsetof(jlp_wire::WorkAssignment, public_key),
+              "WorkAssignment.public_key offset drifted");
+static_assert(offsetof(JLPServerConfig, range_start) ==
+              offsetof(jlp_wire::WorkAssignment, range_start),
+              "WorkAssignment.range_start offset drifted");
+static_assert(offsetof(JLPServerConfig, range_end) ==
+              offsetof(jlp_wire::WorkAssignment, range_end),
+              "WorkAssignment.range_end offset drifted");
+static_assert(offsetof(JLPServerConfig, dp_bits) ==
+              offsetof(jlp_wire::WorkAssignment, dp_bits),
+              "WorkAssignment.dp_bits offset drifted");
+static_assert(offsetof(JLPServerConfig, work_id) ==
+              offsetof(jlp_wire::WorkAssignment, work_id),
+              "WorkAssignment.work_id offset drifted");
+static_assert(offsetof(JLPServerConfig, kangaroo_type) ==
+              offsetof(jlp_wire::WorkAssignment, kangaroo_type),
+              "WorkAssignment.kangaroo_type offset drifted");
+static_assert(offsetof(JLPServerConfig, start_offset_a) ==
+              offsetof(jlp_wire::WorkAssignment, start_offset_a),
+              "WorkAssignment.start_offset_a offset drifted");
+static_assert(offsetof(JLPServerConfig, start_offset_b) ==
+              offsetof(jlp_wire::WorkAssignment, start_offset_b),
+              "WorkAssignment.start_offset_b offset drifted");
 
 // v1.4.2 B.3: AUTH drift detector. Pre-fix this was missing entirely, so
 // the handwritten JLPClientHelloV2 (120 bytes) had drifted from the IDL
@@ -103,8 +141,8 @@ static_assert(static_cast<uint8_t>(JLPMessageType::MSG_ERROR) ==
 
 // ---- compile-time: protocol constants -------------------------------------
 
-static_assert(jlp_wire::PROTOCOL_VERSION == 2,
-              "Phase 0 IDL fixes the version at 2");
+static_assert(jlp_wire::PROTOCOL_VERSION == 3,
+              "v1.5: protocol bumped to 3 for asymmetric tame/wild work assignment");
 static_assert(jlp_wire::MAX_BATCH_SIZE == 10000);
 static_assert(jlp_wire::MAX_MESSAGE_SIZE == 1048576);
 
@@ -197,6 +235,60 @@ void test_auth_payload_v2_layout() {
           "AuthPayloadV2.nonce at offset 104");
 }
 
+void test_work_assignment_v3_layout() {
+    // v1.5 (protocol_version=3): WORK_ASN payload extends from 109 to
+    // 126 bytes with kangaroo_type (u8) + start_offset_a (u64 LE) +
+    // start_offset_b (u64 LE) at the tail. Verify the new fields land
+    // at the right offsets and round-trip via memcpy.
+    jlp_wire::WorkAssignment w{};
+    for (int i = 0; i < 33; ++i) w.public_key[i] = 0x01;
+    for (int i = 0; i < 32; ++i) w.range_start[i] = static_cast<uint8_t>(i);
+    for (int i = 0; i < 32; ++i) w.range_end[i] = static_cast<uint8_t>(0xC0 | i);
+    w.dp_bits = 28;
+    w.work_id = 42;
+    w.kangaroo_type = 1;  // wild
+    w.start_offset_a = 0x00000000DEADBEEFULL;
+    w.start_offset_b = 0x00000000DEADBEEFULL + 1024ULL;
+
+    uint8_t buf[sizeof(jlp_wire::WorkAssignment)];
+    std::memcpy(buf, &w, sizeof(buf));
+
+    // Offset 0..32: public_key
+    CHECK(buf[0] == 0x01 && buf[32] == 0x01, "WORK_ASN public_key at offset 0");
+    // Offset 33..64: range_start
+    CHECK(buf[33] == 0x00 && buf[64] == 31, "WORK_ASN range_start at offset 33");
+    // Offset 65..96: range_end
+    CHECK(buf[65] == 0xC0 && buf[96] == (0xC0 | 31), "WORK_ASN range_end at offset 65");
+    // Offset 97..100: dp_bits LE (28 = 0x1C)
+    CHECK(buf[97] == 0x1C && buf[98] == 0x00 && buf[99] == 0x00 && buf[100] == 0x00,
+          "WORK_ASN dp_bits LE at offset 97");
+    // Offset 101..108: work_id LE (42 = 0x2A)
+    CHECK(buf[101] == 0x2A && buf[102] == 0x00 && buf[108] == 0x00,
+          "WORK_ASN work_id LE at offset 101");
+    // Offset 109: kangaroo_type
+    CHECK(buf[109] == 0x01, "WORK_ASN kangaroo_type at offset 109");
+    // Offset 110..117: start_offset_a LE (0xDEADBEEF)
+    CHECK(buf[110] == 0xEF && buf[111] == 0xBE && buf[112] == 0xAD && buf[113] == 0xDE &&
+          buf[114] == 0x00 && buf[115] == 0x00 && buf[116] == 0x00 && buf[117] == 0x00,
+          "WORK_ASN start_offset_a LE at offset 110");
+    // Offset 118..125: start_offset_b LE (0xDEADBEEF + 1024 = 0xDEADC2EF)
+    CHECK(buf[118] == 0xEF && buf[119] == 0xC2 && buf[120] == 0xAD && buf[121] == 0xDE &&
+          buf[122] == 0x00 && buf[123] == 0x00 && buf[124] == 0x00 && buf[125] == 0x00,
+          "WORK_ASN start_offset_b LE at offset 118");
+
+    // Round-trip via memcpy.
+    jlp_wire::WorkAssignment w2{};
+    std::memcpy(&w2, buf, sizeof(w2));
+    CHECK(w2.dp_bits == 28, "round-trip dp_bits");
+    CHECK(w2.work_id == 42ULL, "round-trip work_id");
+    CHECK(w2.kangaroo_type == 1, "round-trip kangaroo_type");
+    CHECK(w2.start_offset_a == 0x00000000DEADBEEFULL, "round-trip start_offset_a");
+    CHECK(w2.start_offset_b == 0x00000000DEADBEEFULL + 1024ULL, "round-trip start_offset_b");
+    CHECK(std::memcmp(w2.public_key, w.public_key, 33) == 0, "round-trip public_key");
+    CHECK(std::memcmp(w2.range_start, w.range_start, 32) == 0, "round-trip range_start");
+    CHECK(std::memcmp(w2.range_end, w.range_end, 32) == 0, "round-trip range_end");
+}
+
 void test_legacy_to_generated_memcpy() {
     // A legacy JLPDistinguishedPointV2 must be byte-equivalent to the
     // codegen one. v1.4.1 B.1 added a sequence field on both sides
@@ -226,6 +318,7 @@ int main() {
     test_header_layout();
     test_dp_v2_layout();
     test_auth_payload_v2_layout();
+    test_work_assignment_v3_layout();
     test_legacy_to_generated_memcpy();
 
     if (failures != 0) {

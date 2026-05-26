@@ -23,6 +23,27 @@ Pro is built to find these.
 
 ---
 
+## Theft-resistant pool architecture (v1.5+)
+
+When you pool-mine puzzle 135 with Pro v1.5, the architecture itself prevents anyone, including you, from sweeping the puzzle funds out from under the pool. v1.4.x and earlier pools had a structural weakness: the worker that found the cross-collision computed the puzzle's private key on its own GPU and could broadcast a sweep transaction before the pool ever saw the solution. Six figures of bounty creates a strong incentive to write a modified client.
+
+v1.5 closes the window at the protocol layer:
+
+- Your worker is assigned ONE side of the kangaroo walk on each connect. You run **only TAME** kangaroos or **only WILD** kangaroos, never both. The pool round-robins assignment.
+- The host-side cross-collision detection (the part of RCKangaroo that turns two trail halves into a private key) is **disabled** in pool mode. Your machine does not hold both halves of the trail data, by construction.
+- The pool server is the only entity that ever sees DPs of both types together. When the cross-type collision happens, the pool computes the private key, broadcasts a sweep transaction to the pool's hot wallet, waits for cross-provider attestation that the sweep is propagating, and only then notifies workers that the puzzle is solved.
+- Workers receive a SOLUTION wire message that contains no private key bytes. The "you solved the puzzle" event is **after** the funds have already moved.
+
+The design is documented and audited; see [`MIGRATION-v1.5.md`](MIGRATION-v1.5.md) for the worker upgrade path and the [`v1.5 security audit`](../../collision-protocol/docs/v1.5-security-audit-report.md) for the formal verification that no v1.5 worker, even with a binary-level modification, can both collect DPs of both types and submit them through the protocol.
+
+Practically, what this means for you as an operator:
+
+- Your share-of-pool credit accrues identically to v1.4.x. The DPs your worker submits are the same shape (same `dp_bits`, same `work_id` attestation, same per-DP sequence nonce).
+- Payouts arrive at the Bitcoin address in your `--worker` argument. The pool operator triggers payouts through an admin UI once the sweep has confirmed; see the pool operator's docs for the cadence.
+- You never need to copy a private key off your machine or worry about losing one. The architecture handles that for you.
+
+---
+
 ## Opportunistic scanning while you solve puzzles
 
 While your GPU is grinding puzzle 135 in pool or standalone mode, the distinguished points it produces are also handed to a CPU-side checker that derives a Bitcoin H160 from each one and probes the 100 million entry funded-address bloom filter. The GPU pipeline is the same one Free runs. The opportunistic check happens after the DP leaves the GPU, on the CPU; the only added work on the GPU is the small bookkeeping needed to keep the pubkey alongside the DP.

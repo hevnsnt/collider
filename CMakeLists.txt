@@ -491,6 +491,14 @@ set(CORE_SOURCES
     src/core/rule_engine.cpp
     src/core/cpu_kangaroo_backend.cpp
     src/core/kangaroo_backend_factory.cpp
+    # Q7: gpu-layer instrumentation callback storage. Plain C++ (no CUDA),
+    # holds the two atomic function-pointer slots that fused_pipeline.cu
+    # and the runtime perf adapter share. Was previously only built into
+    # collider_gpu under the CUDA branch, which left register_callbacks
+    # undefined at link time on Metal (perf_instrumentation.cpp's static
+    # initializer calls it from collider_core). Lives here so every
+    # backend gets the symbol regardless of the GPU code path.
+    src/gpu/instrumentation_hook.cpp
     # v1.4.2 quality: per-session log + atomic session_state.json + OS
     # crash handler. Extends core/logger.hpp's rotating singleton with
     # a one-file-per-invocation log, a structured JSON snapshot a
@@ -526,6 +534,9 @@ set(CORE_SOURCES
     # block. Preserves --resume-kangaroo, SaveKangsHost/InitKangsHost
     # wiring, and secure_wipe on every recovered private key.
     src/runtime/puzzle_solver_kangaroo.cpp
+    # v1.5.x Phase F2: GPU BSGS standalone-challenge path. Routed from
+    # the kangaroo dispatcher when args.solver == "bsgs".
+    src/runtime/puzzle_solver_bsgs.cpp
     # v1.4.2 quality: brute-force solve-path (>128-bit reject, GPU brute,
     # CPU brute, final stats) extracted from run_puzzle_mode. Preserves
     # SearchState v4 position_full[0..3] layout and SIGINT save semantics.
@@ -689,6 +700,17 @@ if(COLLIDER_PRO)
     # scrypt-based scan loop can be reviewed without GPU-pipeline
     # context. Pro-only (same #ifdef guard as the rest of brainwallet).
     list(APPEND CORE_SOURCES src/runtime/warpwallet_runner.cpp)
+    # v1.5.x: BIP brainwallet scanner. Iterates BIP-39 candidate phrases,
+    # derives BIP-32 children across every historical + modern path
+    # (pre-BIP-44 / Electrum / MultiBit / BIP-44/49/84), probes each
+    # address against the loaded bloom filter. Pro-only; selected via
+    # --bip-scan on the CLI.
+    list(APPEND CORE_SOURCES src/runtime/bip_scanner_runner.cpp)
+    # GPU dispatcher for BIP scan: routes derived priv keys through
+    # the existing MultiAddressSession kernel (secp256k1 + hash160 +
+    # bloom probe) so the per-pubkey work runs on GPU instead of CPU.
+    # Multi-device aware (one worker thread per GPU in args.gpu_ids).
+    list(APPEND CORE_SOURCES src/runtime/bip_gpu_dispatcher.cpp)
     # Full-pipeline benchmark core. Shared between the --benchmark CLI
     # path (puzzle_solver.cpp) and the standalone benchmarks/
     # bench_gpu_pipeline.cu binary. Pro-only because it depends on the
@@ -747,6 +769,7 @@ if(COLLIDER_PRO)
     list(APPEND CORE_SOURCES
         # Phase 1 (builder-foundation: tui-app-skeleton)
         src/ui/tui/tui_app.cpp
+        src/ui/tui/tui_launcher.cpp
         src/ui/tui/theme.cpp
         # Carbon-fiber boot banner (2026-05-16). Standalone animation
         # printed before TuiApp::start(); not part of the FTXUI panel
@@ -767,8 +790,14 @@ if(COLLIDER_PRO)
         src/ui/tui/panels/plugins_panel.cpp
         src/ui/tui/panels/recent_hits_panel.cpp
         src/ui/tui/panels/help_overlay.cpp
+        src/ui/tui/panels/settings_panel.cpp
+        src/ui/tui/panels/wordlist_composer.cpp
         src/ui/tui/panels/wordlist_picker.cpp
         src/ui/tui/panels/bloom_picker.cpp
+        # TR-1: TUI-native main menu (replaces cout banner+numbered list).
+        src/ui/tui/menu/main_menu.cpp
+        # TR-1-full: TUI mode-config modals (BIP confirm + puzzle picker).
+        src/ui/tui/menu/mode_config.cpp
         # Phase 1..3 widgets (builder-panels)
         src/ui/tui/widgets/sparkline.cpp
         src/ui/tui/widgets/progress_bar.cpp
@@ -814,6 +843,14 @@ if(CORE_SOURCES)
     if(CURL_FOUND)
         target_link_libraries(collider_core CURL::libcurl)
         target_compile_definitions(collider_core PRIVATE COLLIDER_HAVE_CURL=1)
+    endif()
+    # v1.5.x: BIP scanner runtime + bip32.hpp need OpenSSL for PBKDF2 +
+    # HMAC-SHA512. OpenSSL is already linked for collider_pool (TLS);
+    # propagate the link + define here so collider_core's BIP code paths
+    # can call PKCS5_PBKDF2_HMAC and HMAC() directly.
+    if(OPENSSL_FOUND)
+        target_link_libraries(collider_core OpenSSL::SSL OpenSSL::Crypto)
+        target_compile_definitions(collider_core PUBLIC COLLIDER_HAS_OPENSSL)
     endif()
     if(KANGAROO_METAL_GENERATED_INCLUDE_DIR)
         target_include_directories(collider_core PUBLIC
@@ -1024,11 +1061,12 @@ if(COLLIDER_BACKEND STREQUAL "CUDA")
         src/gpu/fused_pipeline.cu
         src/gpu/puzzle_gpu.cu
         src/gpu/puzzle_optimized.cu
+        src/gpu/bsgs_solver_gpu.cu
         src/gpu/kangaroo_kernel.cu
-        # Q7: gpu-layer instrumentation callback storage. fused_pipeline.cu
-        # calls into this via the header; the runtime layer registers an
-        # adapter on top.
-        src/gpu/instrumentation_hook.cpp
+        # NOTE: src/gpu/instrumentation_hook.cpp lives in CORE_SOURCES so
+        # the Metal backend also picks it up; without that, Mac Pro
+        # linking errors with "undefined symbol: register_callbacks"
+        # called from perf_instrumentation.cpp's static initializer.
     )
 
     # Pro-only GPU sources. The brain-wallet rule engine, mega-fused kernel,
@@ -1056,6 +1094,14 @@ if(COLLIDER_BACKEND STREQUAL "CUDA")
         if(EXISTS "${CMAKE_SOURCE_DIR}/src/gpu/v2/v2_kernels_unity.cu" AND
            NOT COLLIDER_DISABLE_V2)
             list(APPEND GPU_SOURCES src/gpu/v2/v2_kernels_unity.cu)
+        endif()
+
+        # BIP-39 PBKDF2-HMAC-SHA512 kernel. Replaces OpenSSL's CPU
+        # PBKDF2 path on the hot BIP scan loop (~1ms per phrase on
+        # CPU; GPU dispatch lets one device do 2-5k phrases/sec on
+        # consumer Ampere/Ada, multiplied per device in args.gpu_ids).
+        if(EXISTS "${CMAKE_SOURCE_DIR}/src/gpu/bip39_pbkdf2.cu")
+            list(APPEND GPU_SOURCES src/gpu/bip39_pbkdf2.cu)
         endif()
     endif()
 
@@ -1159,6 +1205,20 @@ if(COLLIDER_BUILD_TOOLS)
         endif()
     endif()
 
+    # B1 wire-v4: keygen tool. Generates a fresh secp256k1 worker
+    # identity, writes 0600-permissioned WIF, prints the bech32 address.
+    if(EXISTS "${CMAKE_SOURCE_DIR}/src/tools/generate_worker_key.cpp"
+       AND TARGET collider_core AND OPENSSL_FOUND)
+        add_executable(generate_worker_key
+            src/tools/generate_worker_key.cpp
+        )
+        target_link_libraries(generate_worker_key
+            collider_core
+            OpenSSL::SSL OpenSSL::Crypto
+            Threads::Threads
+        )
+    endif()
+
     # Banner Test Tool
     if(EXISTS "${CMAKE_SOURCE_DIR}/src/tools/test_banner.cpp")
         add_executable(test_banner
@@ -1242,6 +1302,42 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/src/main.cpp")
 
     target_link_libraries(collider ${MAIN_LIBS})
 
+    # TR-1-full (2026-05-23): when building the Pro edition, the output
+    # exe should be named collider_pro.exe so the build_pro/ directory
+    # contract matches the build script + Open Brain references. The
+    # CMake target stays named "collider" (changing it would ripple
+    # through every set_target_properties / target_link_libraries call
+    # above and below); we only override the linked output filename.
+    if(COLLIDER_PRO)
+        set_target_properties(collider PROPERTIES
+            OUTPUT_NAME "collider_pro"
+        )
+    endif()
+
+    # Stage data/ next to the built exe (post-build copy). The BIP
+    # scanner's data_search_roots() walks the exe directory first, so
+    # dropping data/bip39/english.txt next to collider_pro.exe makes
+    # the scanner work out of the box on a fresh install. The CMake
+    # source-to-build copy is a single recursive step that runs on
+    # every build; copy_directory is idempotent so the cost is one
+    # mtime check per file.
+    if(EXISTS "${CMAKE_SOURCE_DIR}/data")
+        add_custom_command(TARGET collider POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_directory
+                "${CMAKE_SOURCE_DIR}/data"
+                "$<TARGET_FILE_DIR:collider>/data"
+            COMMENT "Staging data/ (BIP-39 dictionaries + assets) next to exe"
+        )
+    endif()
+    if(EXISTS "${CMAKE_SOURCE_DIR}/wordlists")
+        add_custom_command(TARGET collider POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_directory
+                "${CMAKE_SOURCE_DIR}/wordlists"
+                "$<TARGET_FILE_DIR:collider>/wordlists"
+            COMMENT "Staging wordlists/ (candidate phrase examples) next to exe"
+        )
+    endif()
+
     # For CUDA separable compilation, the final executable must resolve device symbols
     if(COLLIDER_BACKEND STREQUAL "CUDA")
         set_target_properties(collider PROPERTIES
@@ -1322,6 +1418,70 @@ if(COLLIDER_BUILD_TESTS)
         set_tests_properties(Bip39Validate PROPERTIES SKIP_RETURN_CODE 77)
     endif()
 
+    # T1-E: BIP-39 trezor PBKDF2-HMAC-SHA512 seed vectors.
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_bip39_pbkdf2_kat.cpp"
+       AND TARGET collider_core)
+        add_executable(test_bip39_pbkdf2_kat tests/test_bip39_pbkdf2_kat.cpp)
+        target_link_libraries(test_bip39_pbkdf2_kat collider_core)
+        add_test(NAME Bip39Pbkdf2Kat COMMAND test_bip39_pbkdf2_kat)
+    endif()
+
+    # BIP-39 PBKDF2 GPU kernel KAT: cross-checks GPU output byte-for-
+    # byte against the canonical CPU OpenSSL output. Skipped (exit 77)
+    # when CUDA is not available.
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_bip39_pbkdf2_gpu_kat.cpp"
+       AND TARGET collider_core AND COLLIDER_BACKEND STREQUAL "CUDA")
+        add_executable(test_bip39_pbkdf2_gpu_kat
+            tests/test_bip39_pbkdf2_gpu_kat.cpp)
+        target_link_libraries(test_bip39_pbkdf2_gpu_kat
+            collider_core collider_gpu)
+        add_test(NAME Bip39Pbkdf2GpuKat
+                 COMMAND test_bip39_pbkdf2_gpu_kat)
+        set_tests_properties(Bip39Pbkdf2GpuKat
+                             PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+
+    # BipGpuDispatcher lifecycle + hit-routing test. Verifies init
+    # failure paths (nullptr on_hit, empty gpu_ids), end-to-end hit
+    # callback wiring (seeded bloom + matching priv => exactly one
+    # on_hit fires), shutdown idempotency, and destructor-without-
+    # shutdown cleanup. Skipped (exit 77) when CUDA is not available.
+    # PRO-only since the dispatcher class itself is gated on
+    # COLLIDER_PRO.
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_bip_gpu_dispatcher.cpp"
+       AND TARGET collider_core AND COLLIDER_BACKEND STREQUAL "CUDA"
+       AND COLLIDER_PRO)
+        add_executable(test_bip_gpu_dispatcher
+            tests/test_bip_gpu_dispatcher.cpp)
+        target_link_libraries(test_bip_gpu_dispatcher
+            collider_core collider_gpu)
+        add_test(NAME BipGpuDispatcher
+                 COMMAND test_bip_gpu_dispatcher)
+        set_tests_properties(BipGpuDispatcher
+                             PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+
+    # T1-F: BIP-49 P2SH-P2WPKH hash160 spec vector.
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_bip49_p2sh_p2wpkh_kat.cpp"
+       AND TARGET collider_core)
+        add_executable(test_bip49_p2sh_p2wpkh_kat
+            tests/test_bip49_p2sh_p2wpkh_kat.cpp)
+        target_link_libraries(test_bip49_p2sh_p2wpkh_kat collider_core)
+        add_test(NAME Bip49P2shP2wpkhKat COMMAND test_bip49_p2sh_p2wpkh_kat)
+    endif()
+
+    # T1-D: BIP scanner end-to-end smoke test.
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_bip_scan_runner_smoke.cpp"
+       AND TARGET collider_core)
+        add_executable(test_bip_scan_runner_smoke
+            tests/test_bip_scan_runner_smoke.cpp)
+        target_link_libraries(test_bip_scan_runner_smoke collider_core)
+        add_test(NAME BipScanRunnerSmoke COMMAND test_bip_scan_runner_smoke
+                 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+        set_tests_properties(BipScanRunnerSmoke PROPERTIES
+            SKIP_RETURN_CODE 77)
+    endif()
+
     # v1.4.2 A.3: regression for kangaroo Tame init range-offset reduction.
     if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_random_below.cpp")
         add_executable(test_random_below tests/test_random_below.cpp)
@@ -1338,6 +1498,46 @@ if(COLLIDER_BUILD_TESTS)
     if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_bech32_checksum.cpp")
         add_executable(test_bech32_checksum tests/test_bech32_checksum.cpp)
         add_test(NAME Bech32Checksum COMMAND test_bech32_checksum)
+    endif()
+
+    # B1 wire-v4: bech32 P2WPKH ENCODER KAT (cross-checks Python server).
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_bech32_encode_kat.cpp")
+        add_executable(test_bech32_encode_kat tests/test_bech32_encode_kat.cpp)
+        add_test(NAME Bech32EncodeKat COMMAND test_bech32_encode_kat)
+    endif()
+
+    # B1 wire-v4: WIF decode/encode KAT (Wallet Import Format private keys).
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_wif_kat.cpp"
+       AND TARGET collider_core)
+        add_executable(test_wif_kat tests/test_wif_kat.cpp)
+        target_link_libraries(test_wif_kat collider_core)
+        add_test(NAME WifKat COMMAND test_wif_kat)
+    endif()
+
+    # B1 wire-v4: OpenSSL secp256k1 signer KAT for the AUTH frame.
+    # Skipped when OpenSSL is unavailable; ctest treats exit 77 as SKIP.
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_worker_identity_kat.cpp"
+       AND TARGET collider_core AND OPENSSL_FOUND)
+        add_executable(test_worker_identity_kat
+            tests/test_worker_identity_kat.cpp)
+        target_link_libraries(test_worker_identity_kat
+            collider_core OpenSSL::SSL OpenSSL::Crypto)
+        add_test(NAME WorkerIdentityKat COMMAND test_worker_identity_kat)
+        set_tests_properties(WorkerIdentityKat PROPERTIES
+            SKIP_RETURN_CODE 77)
+    endif()
+
+    # B1 wire-v4: canonical AUTH message bytes (C++ <-> Python).
+    # Links collider_core for the session_log symbols pulled by
+    # jlp_pool_client.cpp.
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_jlp_auth_v4_canonical_kat.cpp"
+       AND TARGET collider_pool AND TARGET collider_core)
+        add_executable(test_jlp_auth_v4_canonical_kat
+            tests/test_jlp_auth_v4_canonical_kat.cpp)
+        target_link_libraries(test_jlp_auth_v4_canonical_kat
+            collider_pool collider_core)
+        add_test(NAME JlpAuthV4CanonicalKat
+                 COMMAND test_jlp_auth_v4_canonical_kat)
     endif()
 
     # v1.4.2 B.6: regression for STATS_RSP NaN/Inf clamp + UB-safe cast.
@@ -1556,6 +1756,68 @@ if(COLLIDER_BUILD_TESTS)
         set_tests_properties(KangarooDxzKernel PROPERTIES
             SKIP_RETURN_CODE 77
             RESOURCE_LOCK gpu)
+    endif()
+
+    # v1.5 asymmetric kangaroo mode self-test. Drives RCGpuKang directly
+    # (NOT via rckangaroo_wrapper, which is a process singleton) in two
+    # sequential passes: TAME_ONLY and WILD_ONLY. The host captures every
+    # emitted DP, then simulates the pool server's collision search and
+    # verifies cross-instance DPs recover a known private key via the
+    # SOTA formula. Pins the v1.5 plan's algorithm-level theft resistance:
+    # neither pass alone has the data to compute the key.
+    #
+    # Links ONLY against rckangaroo + CUDA::cudart (NOT collider_gpu),
+    # since the wrapper's own AddPointsToList / gGenMode / gTotalErrors
+    # singletons would conflict with the test's local versions.
+    if(COLLIDER_USE_CUDA AND COLLIDER_USE_RCKANGAROO AND TARGET rckangaroo AND
+       EXISTS "${CMAKE_SOURCE_DIR}/tests/test_kangaroo_mode_asymmetric.cu")
+        add_executable(test_kangaroo_mode_asymmetric
+            tests/test_kangaroo_mode_asymmetric.cu)
+        # rckangaroo is a CUDA-separable static lib whose RCGpuCore.cu
+        # defines __constant__ symbols (jmp2_table) referenced from
+        # cudaMemcpyToSymbol on the host. The device-side relocation
+        # that resolves those symbols at runtime is finalized in the
+        # final executable's device-link step, which only happens when
+        # the target itself is marked CUDA-separable. Without these
+        # properties cudaMemcpyToSymbol returns cudaErrorInvalidSymbol
+        # ("named symbol not found") and Prepare() fails for every
+        # mode. Same pattern used by test_kangaroo_dxz_kernel above.
+        # Match test_kangaroo_dxz_kernel above: CUDA_SEPARABLE_COMPILATION
+        # ON. The executable's device link absorbs rckangaroo's device
+        # side and registers the __constant__ jmp2_table symbol in this
+        # executable's fatbin so cudaMemcpyToSymbol can find it at
+        # runtime. rckangaroo's CMakeLists.txt drops
+        # CUDA_RESOLVE_DEVICE_SYMBOLS so the device link defers to here.
+        #
+        # /WHOLEARCHIVE forces every .obj from rckangaroo.lib into the
+        # exe. Without it, the linker pulls only obj files whose host
+        # symbols are referenced -- which IS RCGpuCore.cu.obj (via
+        # cuSetGpuParams) -- but then COMDAT-level deadstrip can drop
+        # __sti____cudaRegisterAll (the static init that calls
+        # __cudaRegisterVar for jmp2_table). With the static init
+        # dropped, cudaMemcpyToSymbol(jmp2_table, ...) returns
+        # cudaErrorInvalidSymbol at runtime. WHOLEARCHIVE keeps every
+        # init COMDAT alive.
+        set_target_properties(test_kangaroo_mode_asymmetric PROPERTIES
+            CUDA_SEPARABLE_COMPILATION ON
+            CUDA_RUNTIME_LIBRARY Shared)
+        target_link_libraries(test_kangaroo_mode_asymmetric
+            rckangaroo CUDA::cudart)
+        if(MSVC)
+            target_link_options(test_kangaroo_mode_asymmetric PRIVATE
+                "LINKER:/WHOLEARCHIVE:rckangaroo")
+        else()
+            target_link_options(test_kangaroo_mode_asymmetric PRIVATE
+                "LINKER:--whole-archive"
+                "LINKER:-lrckangaroo"
+                "LINKER:--no-whole-archive")
+        endif()
+        add_test(NAME KangarooModeAsymmetric
+            COMMAND test_kangaroo_mode_asymmetric)
+        set_tests_properties(KangarooModeAsymmetric PROPERTIES
+            SKIP_RETURN_CODE 77
+            RESOURCE_LOCK gpu
+            TIMEOUT 120)
     endif()
 
     # Metal kangaroo throughput benchmark. Production-shaped config
@@ -1987,6 +2249,22 @@ if(COLLIDER_BUILD_TESTS)
                 RESOURCE_LOCK gpu)
         endif()
 
+        # TP-5: fused-pipeline boundary KAT (count=0, count=1,
+        # MAX_MATCHES_PER_BATCH saturation with OOB sentinel).
+        if(COLLIDER_PRO AND EXISTS "${CMAKE_SOURCE_DIR}/tests/test_fused_pipeline_oob.cu" AND TARGET collider_core)
+            add_executable(test_fused_pipeline_oob tests/test_fused_pipeline_oob.cu)
+            set_target_properties(test_fused_pipeline_oob PROPERTIES
+                CUDA_SEPARABLE_COMPILATION ON
+                CUDA_RUNTIME_LIBRARY Shared
+            )
+            target_link_libraries(test_fused_pipeline_oob collider_gpu collider_core CUDA::cudart)
+            add_test(NAME FusedPipelineOob COMMAND test_fused_pipeline_oob)
+            set_tests_properties(FusedPipelineOob PROPERTIES
+                SKIP_RETURN_CODE 77
+                RESOURCE_LOCK gpu
+                TIMEOUT 60)
+        endif()
+
         # GpuMultiAddr exercises the V2 multi_addr=true path of the fused
         # brain-wallet kernel (the path the user's --brainwallet-v2 --resume
         # session was on when it took the cudaErrorIllegalAddress fault).
@@ -2192,6 +2470,17 @@ if(COLLIDER_BUILD_TESTS)
             add_test(NAME CookedModeGuard COMMAND test_cooked_mode_guard)
         endif()
 
+        # T1-H: StdioCapture nesting safety. Header-only target; no
+        # link against collider_core required.
+        if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_stdio_capture_nesting.cpp")
+            add_executable(test_stdio_capture_nesting
+                tests/test_stdio_capture_nesting.cpp)
+            target_include_directories(test_stdio_capture_nesting
+                PRIVATE ${CMAKE_SOURCE_DIR}/src)
+            add_test(NAME StdioCaptureNesting
+                COMMAND test_stdio_capture_nesting)
+        endif()
+
         # Phase 2 (builder-gpu: nvml-wrapper): happy-path + degraded.
         if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_nvml_wrapper.cpp"
            AND TARGET collider_core)
@@ -2248,6 +2537,61 @@ if(COLLIDER_BUILD_TESTS)
             add_executable(test_wordlist_hot_swap tests/test_wordlist_hot_swap.cpp)
             target_link_libraries(test_wordlist_hot_swap collider_core)
             add_test(NAME WordlistHotSwap COMMAND test_wordlist_hot_swap)
+        endif()
+
+        # TP-2: WordlistComposer recombine action end-to-end test.
+        if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_wordlist_composer.cpp"
+           AND TARGET collider_core)
+            add_executable(test_wordlist_composer tests/test_wordlist_composer.cpp)
+            target_link_libraries(test_wordlist_composer collider_core)
+            add_test(NAME WordlistComposer COMMAND test_wordlist_composer)
+            set_tests_properties(WordlistComposer PROPERTIES TIMEOUT 60)
+        endif()
+
+        # TP-3: BIP-32 KAT against the standard spec test vectors.
+        if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_bip32_kat.cpp"
+           AND TARGET collider_core)
+            add_executable(test_bip32_kat tests/test_bip32_kat.cpp)
+            target_link_libraries(test_bip32_kat collider_core)
+            add_test(NAME Bip32Kat COMMAND test_bip32_kat)
+            set_tests_properties(Bip32Kat PROPERTIES TIMEOUT 30)
+        endif()
+
+        # TP-6: atomic_write_state_file durability KAT (empty / large
+        # / overwrite / leftover-tmp recovery / 1000-iter stress).
+        if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_state_atomic_write.cpp"
+           AND TARGET collider_core)
+            add_executable(test_state_atomic_write tests/test_state_atomic_write.cpp)
+            target_link_libraries(test_state_atomic_write collider_core)
+            add_test(NAME StateAtomicWrite COMMAND test_state_atomic_write)
+            set_tests_properties(StateAtomicWrite PROPERTIES TIMEOUT 60)
+        endif()
+
+        # TP-11: SettingsState concurrent edit + poll atomicity stress.
+        if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_settings_atomicity.cpp"
+           AND TARGET collider_core)
+            add_executable(test_settings_atomicity tests/test_settings_atomicity.cpp)
+            target_link_libraries(test_settings_atomicity collider_core)
+            add_test(NAME SettingsAtomicity COMMAND test_settings_atomicity)
+            set_tests_properties(SettingsAtomicity PROPERTIES TIMEOUT 30)
+        endif()
+
+        # TP-8: generator_candidates_per_iteration budget enforcement.
+        if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_generator_budget.cpp"
+           AND TARGET collider_core)
+            add_executable(test_generator_budget tests/test_generator_budget.cpp)
+            target_link_libraries(test_generator_budget collider_core)
+            add_test(NAME GeneratorBudget COMMAND test_generator_budget)
+            set_tests_properties(GeneratorBudget PROPERTIES TIMEOUT 30)
+        endif()
+
+        # TP-9: CLI > config.yml precedence + auto-enable side effects.
+        if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_cli_config_precedence.cpp"
+           AND TARGET collider_core)
+            add_executable(test_cli_config_precedence tests/test_cli_config_precedence.cpp)
+            target_link_libraries(test_cli_config_precedence collider_core)
+            add_test(NAME CliConfigPrecedence COMMAND test_cli_config_precedence)
+            set_tests_properties(CliConfigPrecedence PROPERTIES TIMEOUT 10)
         endif()
 
         # Phase 5 (builder-threading: plugin-runner): synthetic echo plugin.
@@ -2336,6 +2680,10 @@ endif()
 
 if(TARGET build_bloom)
     install(TARGETS build_bloom RUNTIME DESTINATION bin)
+endif()
+
+if(TARGET generate_worker_key)
+    install(TARGETS generate_worker_key RUNTIME DESTINATION bin)
 endif()
 
 if(EXISTS "${CMAKE_SOURCE_DIR}/rules")

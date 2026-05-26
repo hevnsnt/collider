@@ -3,8 +3,27 @@
 // License: GPLv3, see "LICENSE.TXT" file
 // https://github.com/RetiredC
 
+// ============================================================================
+// Modifications by SixCyber LLC, licensed under GPLv3 per
+// the original work. See LICENSE at the repository root and
+// THIRD_PARTY_LICENSES.md for the project-wide dependency inventory.
+//
+// Modification history for this file:
+//   2026-05-21 (v1.5.0):
+//     - Added KangarooMode constants (KANG_MODE_BOTH = 0,
+//       KANG_MODE_TAME_ONLY = 1, KANG_MODE_WILD_ONLY = 2) and a u32 Mode
+//       field on TKparams. Used by the v1.5 pool protocol's asymmetric
+//       tame/wild work assignment so a worker is assigned ONE half of
+//       the kangaroo walk; the consumer (src/gpu/cuda_rckangaroo_backend.cpp)
+//       sets Mode before each Prepare() call.
+//   Earlier:
+//     - MAX_GPU_CNT reduced from upstream 32 to 8 to match the runtime's
+//       kMaxGpus constant in src/runtime/runtime_control.hpp. See the
+//       inline comment at the MAX_GPU_CNT definition below for context.
+// ============================================================================
 
-#pragma once 
+
+#pragma once
 
 #pragma warning(disable : 4996)
 
@@ -61,8 +80,25 @@ typedef char i8;
 
 // kang type
 #define TAME				0  // Tame kangs
-#define WILD1				1  // Wild kangs1 
+#define WILD1				1  // Wild kangs1
 #define WILD2				2  // Wild kangs2
+
+// theCollider v1.5 asymmetric mode. Selects which subset of the
+// kangaroo herd a given RCGpuKang instance produces. BOTH is the
+// upstream behavior (tame + wild1 + wild2 in a 1/1/1 split on a single
+// GPU; host-side hashtable detects collisions and computes the key).
+// TAME_ONLY and WILD_ONLY are the v1.5 pool modes: a worker runs only
+// one side of the kangaroo equation, the host-side collision hashtable
+// is bypassed by the wrapper, and the pool server -- the only place
+// that aggregates DPs from both sides -- is the only entity that can
+// recover the private key. See plan: .claude/tasks/v1.5-asymmetric-
+// kangaroo.md.
+//
+// The values are wire-stable: the v1.5 JLP WORK_ASN message carries
+// this byte directly. Do not renumber without bumping the protocol.
+#define KANG_MODE_BOTH       0  // legacy: tame + wild1 + wild2 in one herd
+#define KANG_MODE_TAME_ONLY  1  // pool: all kangaroos are tames
+#define KANG_MODE_WILD_ONLY  2  // pool: all kangaroos are wild (use PntA)
 
 #define GPU_DP_SIZE			64
 #define MAX_DP_CNT			(256 * 1024)
@@ -103,6 +139,12 @@ struct TKparams
 	u32* dbg_buf;
 	u32* LoopedKangs;
 	bool IsGenMode; //tames generation mode
+
+	// theCollider v1.5: which of KANG_MODE_BOTH / TAME_ONLY / WILD_ONLY
+	// this kernel launch represents. The KernelGen branch and the DP
+	// type-tag emission both consult this; KernelABC body is mode-
+	// agnostic (the per-kangaroo walking is identical in all modes).
+	u32 Mode;
 
 	u32 KernelA_LDS_Size;
 	u32 KernelB_LDS_Size;

@@ -61,6 +61,7 @@
     #endif
     #include <windows.h>
     #include <process.h>     // _getpid
+    #include <psapi.h>       // MODULEINFO for crash_dump_modules
     #include <dbghelp.h>
     // dbghelp must come AFTER windows.h. Link with -ldbghelp; the
     // CMakeLists.txt wires this through for collider_core.
@@ -516,7 +517,18 @@ public:
     }
 
     ~SessionLogSink() {
-        std::lock_guard<std::mutex> lock(mu_);
+        // No lock on purpose. Same pattern as BalanceFetcher (see
+        // runtime/balance.cpp::~BalanceFetcher comment). This is a
+        // Meyers-singleton destructor that runs during process teardown
+        // after main() returned; on macOS, Apple's pthread library
+        // invalidates the mutex's internal state during teardown earlier
+        // than glibc/MSVC do, so the lock_guard ctor throws EINVAL via
+        // std::system_error -- which propagates uncaught and terminates
+        // the process AFTER the session has already finished cleanly,
+        // making customer-facing logs end with an abort message instead
+        // of a clean exit. By the time we reach this dtor, no other
+        // thread should still be writing (runtime is torn down, log()
+        // call sites are all dead) so the lock was theatrical anyway.
         if (initialized_ && file_.is_open()) {
             write_line_locked("SHUTDOWN", "session log closing");
             file_.flush();
@@ -598,6 +610,20 @@ public:
         return collider::paths::collider_home() / "session_state.json";
     }
 
+    // Enable disk writes. Mirrors SessionLogSink::initialize(): until
+    // init_session_log() runs the store accepts merges into the in-memory
+    // snapshot but never touches the on-disk session_state.json. This
+    // matters for test binaries that exercise wire handlers (handle_auth_ok,
+    // handle_work_asn, handle_solution) without ever initializing the
+    // session log. Previously every such call clobbered the operator's
+    // real ~/.collider/session_state.json from a background thread, and the
+    // resulting concurrent fopen/fwrite/rename traffic across many tests
+    // intermittently crashed the JLP test binaries with RIP=0.
+    void enable_disk_writes() {
+        std::lock_guard<std::mutex> lock(mu_);
+        disk_writes_enabled_ = true;
+    }
+
     void update(const SessionState& state) {
         std::unique_lock<std::mutex> lock(mu_);
         // Merge semantics: the caller fills in the fields relevant to
@@ -609,6 +635,7 @@ public:
         // of `latest_` intact.
         merge_into_latest(state);
         latest_.last_update_ts = std::chrono::system_clock::now();
+        if (!disk_writes_enabled_) return;
         auto now = std::chrono::steady_clock::now();
         if (now - last_write_at_ <
             std::chrono::milliseconds(kSessionStateMinIntervalMs)) {
@@ -625,6 +652,7 @@ public:
     void flush() {
         std::unique_lock<std::mutex> lock(mu_);
         if (latest_.mode.empty() && latest_.pid == 0) return;  // never updated
+        if (!disk_writes_enabled_) return;
         // Stamp BOTH the in-memory snapshot and the outgoing copy with
         // the same wall-clock instant so a subsequent reader of latest_
         // (e.g. the next update() merge) cannot observe a copy-on-disk
@@ -709,6 +737,9 @@ private:
     // update_session_state() call always writes through (no warm-up
     // period during which the operational snapshot is invisible).
     std::chrono::steady_clock::time_point last_write_at_{};
+    // Disk writes stay off until init_session_log() runs. See the
+    // enable_disk_writes() comment for why.
+    bool disk_writes_enabled_ = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -825,6 +856,11 @@ struct CrashPaths {
     // snapshot. The session state file is overwritten in place, so
     // the path is stable for the life of the process.
     char state_json[kCrashPathMax]{};
+    // Path the handler reads for the active session log (where milestones
+    // land). The crash report tails the last few KB so the diagnostic
+    // milestones immediately preceding the fault appear in the crash
+    // dump itself instead of forcing a reader to correlate by timestamp.
+    char session_log[kCrashPathMax]{};
     // The boot_ts as a steady_clock time_point, captured at install
     // time. The handler reports "uptime_ms = (now - boot)" so an
     // operator can correlate the crash against the run length.
@@ -992,6 +1028,117 @@ void crash_append_file(
 
 #ifdef _WIN32
 
+// Dump the integer registers from a CONTEXT record. Useful for AVs
+// where the disassembly of the faulting instruction references a
+// specific GPR -- the operator can read the register value here
+// instead of attaching a debugger. x64 only; the build is x64 only
+// per CMake. Async-signal-not-strictly-safe but the SEH filter runs
+// synchronously on the faulting thread, same risk envelope as the
+// existing StackWalk64 path.
+void crash_dump_registers(HANDLE out, const CONTEXT* ctx) {
+    if (!ctx) return;
+#ifdef _M_X64
+    struct Reg { const char* name; DWORD64 val; };
+    Reg regs[] = {
+        {"rax", ctx->Rax}, {"rbx", ctx->Rbx}, {"rcx", ctx->Rcx},
+        {"rdx", ctx->Rdx}, {"rsi", ctx->Rsi}, {"rdi", ctx->Rdi},
+        {"rbp", ctx->Rbp}, {"rsp", ctx->Rsp},
+        {"r8",  ctx->R8},  {"r9",  ctx->R9},  {"r10", ctx->R10},
+        {"r11", ctx->R11}, {"r12", ctx->R12}, {"r13", ctx->R13},
+        {"r14", ctx->R14}, {"r15", ctx->R15}, {"rip", ctx->Rip},
+    };
+    crash_write_str(out, "registers:\n");
+    for (size_t i = 0; i < sizeof(regs) / sizeof(regs[0]); ++i) {
+        crash_write_str(out, "  ");
+        crash_write_str(out, regs[i].name);
+        crash_write_str(out, " = 0x");
+        crash_write_hex(out, regs[i].val, 16);
+        crash_write_str(out, "\n");
+    }
+#else
+    (void)out;
+#endif
+}
+
+// Dump base address + image size of every loaded module so the
+// reader can map an absolute crash address (RIP / stack frame PC)
+// to an RVA = pc - base. Without this the operator has to know the
+// ASLR base separately. Uses GetModuleHandleEx + GetModuleFileNameA;
+// both can take loader-lock but the SEH filter is synchronous so
+// the loader is in a defined state.
+void crash_dump_modules(HANDLE out) {
+    crash_write_str(out, "modules:\n");
+    HMODULE mods[256];
+    DWORD needed = 0;
+    HANDLE proc = GetCurrentProcess();
+    // EnumProcessModules lives in psapi (loaded on demand). Use
+    // K32EnumProcessModules from kernel32 directly (Windows 7+) to
+    // avoid the link-time dep -- it has the identical signature.
+    using EnumModsFn = BOOL(WINAPI*)(HANDLE, HMODULE*, DWORD, LPDWORD);
+    HMODULE k32 = GetModuleHandleA("kernel32.dll");
+    if (!k32) return;
+    auto pEnum = reinterpret_cast<EnumModsFn>(
+        GetProcAddress(k32, "K32EnumProcessModules"));
+    if (!pEnum) return;
+    if (!pEnum(proc, mods, sizeof(mods), &needed)) return;
+    DWORD count = needed / sizeof(HMODULE);
+    if (count > 256) count = 256;
+    for (DWORD i = 0; i < count; ++i) {
+        MODULEINFO mi{};
+        using GetInfoFn = BOOL(WINAPI*)(HANDLE, HMODULE, LPMODULEINFO, DWORD);
+        auto pInfo = reinterpret_cast<GetInfoFn>(
+            GetProcAddress(k32, "K32GetModuleInformation"));
+        if (pInfo && pInfo(proc, mods[i], &mi, sizeof(mi))) {
+            char name[260];
+            using GetNameFn = DWORD(WINAPI*)(HANDLE, HMODULE, LPSTR, DWORD);
+            auto pName = reinterpret_cast<GetNameFn>(
+                GetProcAddress(k32, "K32GetModuleBaseNameA"));
+            name[0] = '\0';
+            if (pName) pName(proc, mods[i], name, sizeof(name));
+            crash_write_str(out, "  0x");
+            crash_write_hex(out,
+                            reinterpret_cast<uintptr_t>(mi.lpBaseOfDll), 16);
+            crash_write_str(out, " size=0x");
+            crash_write_hex(out, mi.SizeOfImage, 0);
+            crash_write_str(out, " ");
+            crash_write_str(out, name[0] ? name : "(unknown)");
+            crash_write_str(out, "\n");
+        }
+    }
+}
+
+// Append the trailing kTailBytes of the session log to the crash
+// report. Captures the milestones immediately preceding the fault,
+// which is what a forensic reader actually wants. Bounded so a
+// gigabyte-sized log can not blow up the crash dump.
+void crash_append_log_tail(HANDLE out, const char* src_path) {
+    if (!src_path || !src_path[0]) return;
+    constexpr DWORD kTailBytes = 16 * 1024;  // 16 KB of recent log
+    HANDLE in = CreateFileA(src_path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (in == INVALID_HANDLE_VALUE) {
+        crash_write_str(out, "(session log not available)\n");
+        return;
+    }
+    LARGE_INTEGER size{};
+    if (!GetFileSizeEx(in, &size)) {
+        CloseHandle(in);
+        return;
+    }
+    LARGE_INTEGER seek_to{};
+    if (size.QuadPart > static_cast<LONGLONG>(kTailBytes)) {
+        seek_to.QuadPart = size.QuadPart - kTailBytes;
+        SetFilePointerEx(in, seek_to, nullptr, FILE_BEGIN);
+    }
+    static char buf[16 * 1024];
+    DWORD read = 0;
+    if (ReadFile(in, buf, sizeof(buf), &read, nullptr) && read > 0) {
+        DWORD written = 0;
+        WriteFile(out, buf, read, &written, nullptr);
+    }
+    CloseHandle(in);
+}
+
 LONG WINAPI windows_crash_filter(EXCEPTION_POINTERS* ep) {
     // Re-entry guard. SetUnhandledExceptionFilter is the last-chance
     // handler so it normally runs once, but a secondary fault inside
@@ -1048,6 +1195,15 @@ LONG WINAPI windows_crash_filter(EXCEPTION_POINTERS* ep) {
     crash_write_str(out, "uptime_ms = ");
     crash_write_u64(out, static_cast<unsigned long long>(uptime));
     crash_write_str(out, "\n");
+
+    // Register dump from the CONTEXT record. Reading a GPR here is
+    // cheaper than re-running with a debugger attached.
+    crash_dump_registers(out, ep->ContextRecord);
+
+    // Module base + size table. The crash reader can compute any
+    // absolute address's RVA as (addr - module_base) and feed that
+    // into a PDB resolver without needing the runtime image base.
+    crash_dump_modules(out);
 
     // Best-effort stack walk. SymInitialize / StackWalk64 / SymFromAddr
     // do allocate, so technically they are not async-signal-safe. SEH
@@ -1117,6 +1273,16 @@ LONG WINAPI windows_crash_filter(EXCEPTION_POINTERS* ep) {
     crash_write_str(out, "\n--- session_state.json (verbatim) ---\n");
     crash_append_file(out, cp.state_json);
     crash_write_str(out, "\n--- end session_state.json ---\n");
+
+    // Tail of the active session log. Captures the milestones
+    // emitted in the seconds immediately before the fault. For
+    // crashes inside a known hot path (GPU dispatch, network rx,
+    // bloom load) this is usually the diagnostic record the
+    // operator actually wants.
+    crash_write_str(out, "\n--- session log tail ---\n");
+    crash_append_log_tail(out, cp.session_log);
+    crash_write_str(out, "\n--- end session log tail ---\n");
+
     crash_write_str(out, "=== end crash report ===\n");
 
     FlushFileBuffers(out);
@@ -1259,6 +1425,12 @@ bool atomic_write_state_file(const std::filesystem::path& path,
 bool init_session_log() {
     bool ok = SessionLogSink::instance().initialize();
     if (ok) {
+        // Flip the SessionStateStore out of "no-op" mode so subsequent
+        // milestone()/update_session_state() calls actually persist to
+        // ~/.collider/session_state.json. Test binaries that never call
+        // init_session_log() stay in no-op mode and therefore never
+        // touch the operator's real state file.
+        SessionStateStore::instance().enable_disk_writes();
         // Register a one-shot atexit hook so a clean exit (normal
         // return from main, std::exit, std::quick_exit on POSIX) always
         // force-flushes the SessionStateStore. The Meyers singleton's
@@ -1434,6 +1606,7 @@ void install_crash_handler() {
     auto state_path = SessionStateStore::instance().state_path().string();
     copy_to_buf(cp.crash_log, sizeof(cp.crash_log), crash_path);
     copy_to_buf(cp.state_json, sizeof(cp.state_json), state_path);
+    copy_to_buf(cp.session_log, sizeof(cp.session_log), sink.log_path());
 
 #ifdef _WIN32
     SetUnhandledExceptionFilter(windows_crash_filter);

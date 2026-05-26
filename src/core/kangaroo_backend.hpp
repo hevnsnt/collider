@@ -116,12 +116,44 @@ public:
     virtual bool load_herd_state(const std::string& /*path*/) { return false; }
 };
 
-// Factory: returns the appropriate backend for this build configuration.
-// The compile-time choice (CUDA / Metal / CPU) is the only #ifdef left
-// in the pool driver. Caller owns the returned pointer.
-// gpu_ids is consumed by the CUDA backend (which initializes the
-// nominated devices); ignored by Metal and CPU backends.
+// v1.5.x runtime backend selection. Pre-1.5.x the factory dispatched
+// at compile time via #if defined(COLLIDER_USE_RCKANGAROO) / __APPLE__,
+// so each binary had exactly one backend baked in. Operators on the
+// same Windows binary who wanted to A/B-test CPU vs CUDA had to build
+// two binaries. The runtime enum below lets a single binary expose
+// every backend the build pulled in, and the settings panel / CLI flag
+// picks which one this run uses.
+enum class BackendKind {
+    CPU,    // portable C++ KangarooSolver (always built)
+    CUDA,   // RCKangaroo on NVIDIA GPUs (built when COLLIDER_USE_RCKANGAROO)
+    METAL,  // KangarooMetalSolver on Apple Silicon (built on macOS)
+};
+
+// Short label for status lines and CLI parse errors. "cuda" / "metal"
+// / "cpu" lowercase to match the --backend flag value the operator types.
+std::string backend_kind_label(BackendKind kind);
+
+// Parse a CLI flag value into a BackendKind. Case-insensitive,
+// accepts the labels emitted by backend_kind_label. Returns false on
+// unrecognized input.
+bool parse_backend_kind(const std::string& label, BackendKind& out);
+
+// Returns the set of BackendKind values this binary actually has the
+// code for. Operators can only pick from this set; the settings panel
+// uses it to populate the backend dropdown. Order is preferred-first:
+// CUDA > Metal > CPU (the most-capable available first).
+std::vector<BackendKind> available_backends();
+
+// The default backend for this build. Equal to available_backends()[0];
+// callers that don't have an explicit operator preference call this.
+BackendKind default_backend();
+
+// Factory: build the backend implementation for the requested kind.
+// Throws std::runtime_error when the kind is not in available_backends()
+// (e.g., requesting CUDA on a macOS binary built without RCKangaroo).
+// gpu_ids is consumed by the CUDA backend; ignored by Metal and CPU.
 std::unique_ptr<IKangarooBackend> create_kangaroo_backend(
+    BackendKind kind,
     const std::vector<int>& gpu_ids);
 
 }  // namespace kangaroo

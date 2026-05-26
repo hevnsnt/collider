@@ -15,6 +15,8 @@
 #pragma once
 
 #include <cmath>
+#include <cstdint>
+#include <limits>
 
 namespace collider {
 namespace pool {
@@ -35,6 +37,30 @@ inline float sanitize_wire_float(float v, float lo, float hi) {
 inline void sanitize_stats_rsp_floats(float& dps_per_second, float& your_share) {
     dps_per_second = sanitize_wire_float(dps_per_second, 0.0f, 1.0e18f);
     your_share     = sanitize_wire_float(your_share,     0.0f, 1.0f);
+}
+
+// uint64 wire fields land in UI consumers (status panel, console
+// printout, JSON exports) without further validation. A hostile or
+// buggy server could feed values that overflow downstream arithmetic
+// (e.g. multiplied by a divisor when computing per-second rates) or
+// just look absurd in the UI. The cap below is generous: at 1 trillion
+// DPs across the whole pool, the panel still has six-decimal headroom
+// for human-readable formatting.
+inline uint64_t sanitize_wire_u64(uint64_t v, uint64_t cap) {
+    return v > cap ? cap : v;
+}
+
+inline void sanitize_stats_rsp_uints(uint64_t& your_dps,
+                                     uint64_t& total_dps) {
+    // Cap below UINT64_MAX so any downstream signed-int interpretation
+    // (e.g. int64_t-based JSON serializers) or x2 arithmetic
+    // (rate-of-change diff) cannot overflow. The cap is high enough
+    // that a long-lived pool aggregating trillions of DPs across all
+    // workers still round-trips losslessly.
+    constexpr uint64_t kSanityCap =
+        std::numeric_limits<uint64_t>::max() / 2;
+    your_dps  = sanitize_wire_u64(your_dps,  kSanityCap);
+    total_dps = sanitize_wire_u64(total_dps, kSanityCap);
 }
 
 }  // namespace pool

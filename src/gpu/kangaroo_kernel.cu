@@ -57,6 +57,36 @@ namespace collider {
 namespace gpu {
 
 // ============================================================================
+// cudaMemcpy hygiene helpers
+// ============================================================================
+//
+// D-1 follow-up (2026-05-24): pre-existing kangaroo paths had ~40
+// cudaMemcpy sites with discarded return codes. For H2D/D2H copies
+// on the host-driver code paths (NOT the per-thread device kernels)
+// a silent copy failure produces either (a) the kernel running on
+// uninitialized device memory for init paths -- DPs from a corrupted
+// herd are guaranteed-wrong + waste hours, or (b) uninitialized host
+// buffers for D2H paths -- the host sees a "false zero" / garbage
+// flag values that mask real DPs. The helper below logs + returns
+// the cuda error so each caller picks the right recovery (return
+// false from init, skip-iteration from harvest loops).
+//
+// Hot-path Async H2D copies (kernel pipelines that pre-fetch into
+// double-buffered streams) still discard the immediate return value
+// because the failure is caught by the next cudaStreamSynchronize;
+// changing those would require a wider stream-management refactor.
+
+namespace {
+inline bool kg_cuda_check(cudaError_t err, const char* what) {
+    if (err == cudaSuccess) return true;
+    std::fprintf(stderr,
+        "[!] kangaroo cudaMemcpy(%s) failed: %s\n",
+        what, cudaGetErrorString(err));
+    return false;
+}
+}  // namespace
+
+// ============================================================================
 // Constants
 // ============================================================================
 
@@ -1811,11 +1841,21 @@ public:
         size_t size_256 = num_kangaroos_ * 4 * sizeof(uint64_t);
         size_t size_32 = num_kangaroos_ * sizeof(uint32_t);
 
-        cudaMemcpy(d_x_, h_x, size_256, cudaMemcpyHostToDevice);
-        cudaMemcpy(d_y_, h_y, size_256, cudaMemcpyHostToDevice);
-        cudaMemcpy(d_z_, h_z, size_256, cudaMemcpyHostToDevice);
-        cudaMemcpy(d_dist_, h_dist, size_256, cudaMemcpyHostToDevice);
-        cudaMemcpy(d_types_, h_types, size_32, cudaMemcpyHostToDevice);
+        if (!kg_cuda_check(
+                cudaMemcpy(d_x_, h_x, size_256, cudaMemcpyHostToDevice),
+                "upload_initial_state.d_x")) return false;
+        if (!kg_cuda_check(
+                cudaMemcpy(d_y_, h_y, size_256, cudaMemcpyHostToDevice),
+                "upload_initial_state.d_y")) return false;
+        if (!kg_cuda_check(
+                cudaMemcpy(d_z_, h_z, size_256, cudaMemcpyHostToDevice),
+                "upload_initial_state.d_z")) return false;
+        if (!kg_cuda_check(
+                cudaMemcpy(d_dist_, h_dist, size_256, cudaMemcpyHostToDevice),
+                "upload_initial_state.d_dist")) return false;
+        if (!kg_cuda_check(
+                cudaMemcpy(d_types_, h_types, size_32, cudaMemcpyHostToDevice),
+                "upload_initial_state.d_types")) return false;
 
         // Clear flags
         cudaMemset(d_flags_, 0, size_32);
@@ -1911,8 +1951,16 @@ public:
         if (!allocated_) return dp_indices;
 
         std::vector<uint32_t> h_flags(num_kangaroos_);
-        cudaMemcpy(h_flags.data(), d_flags_, num_kangaroos_ * sizeof(uint32_t),
-                   cudaMemcpyDeviceToHost);
+        if (!kg_cuda_check(
+                cudaMemcpy(h_flags.data(), d_flags_,
+                           num_kangaroos_ * sizeof(uint32_t),
+                           cudaMemcpyDeviceToHost),
+                "collect_dps.h_flags")) {
+            // D2H copy failure -> h_flags is garbage. Return empty
+            // so the caller's loop doesn't dereference junk indices
+            // into d_x/d_y. Next collect_dps() call retries.
+            return dp_indices;
+        }
 
         for (size_t i = 0; i < num_kangaroos_; i++) {
             if (h_flags[i]) {
@@ -1943,11 +1991,24 @@ public:
         std::vector<uint64_t> all_dist(num_kangaroos_ * 4);
         std::vector<uint32_t> all_types(num_kangaroos_);
 
-        cudaMemcpy(all_x.data(), d_x_, size_256, cudaMemcpyDeviceToHost);
-        cudaMemcpy(all_y.data(), d_y_, size_256, cudaMemcpyDeviceToHost);
-        cudaMemcpy(all_dist.data(), d_dist_, size_256, cudaMemcpyDeviceToHost);
-        cudaMemcpy(all_types.data(), d_types_, num_kangaroos_ * sizeof(uint32_t),
-                   cudaMemcpyDeviceToHost);
+        // Bail if any of the four download copies fails -- the rest
+        // of this function would otherwise read garbage from the
+        // host buffers and write nonsense h_x/h_y/h_dist back to
+        // the caller (which then submits the bogus DPs to the pool).
+        if (!kg_cuda_check(
+                cudaMemcpy(all_x.data(), d_x_, size_256, cudaMemcpyDeviceToHost),
+                "download_state.all_x")) return;
+        if (!kg_cuda_check(
+                cudaMemcpy(all_y.data(), d_y_, size_256, cudaMemcpyDeviceToHost),
+                "download_state.all_y")) return;
+        if (!kg_cuda_check(
+                cudaMemcpy(all_dist.data(), d_dist_, size_256, cudaMemcpyDeviceToHost),
+                "download_state.all_dist")) return;
+        if (!kg_cuda_check(
+                cudaMemcpy(all_types.data(), d_types_,
+                           num_kangaroos_ * sizeof(uint32_t),
+                           cudaMemcpyDeviceToHost),
+                "download_state.all_types")) return;
 
         for (size_t idx = 0; idx < indices.size(); idx++) {
             size_t i = indices[idx];
@@ -2540,12 +2601,30 @@ GPUKangarooResult GPUKangarooManager::solve() {
     size_t size_256 = num_kangaroos * 4 * sizeof(uint64_t);
     size_t size_32 = num_kangaroos * sizeof(uint32_t);
 
-    cudaMemcpy(impl_->d_x, h_x.data(), size_256, cudaMemcpyHostToDevice);
-    cudaMemcpy(impl_->d_y, h_y.data(), size_256, cudaMemcpyHostToDevice);
-    cudaMemcpy(impl_->d_z, h_z.data(), size_256, cudaMemcpyHostToDevice);
-    cudaMemcpy(impl_->d_dist, h_dist.data(), size_256, cudaMemcpyHostToDevice);
-    cudaMemcpy(impl_->d_types, h_types.data(), size_32, cudaMemcpyHostToDevice);
-    cudaMemcpy(impl_->d_wild_offset, h_wild_offset.data(), size_256, cudaMemcpyHostToDevice);
+    // Initial herd upload. ANY copy failure here = kernel runs on
+    // uninitialized device memory and produces garbage DPs forever.
+    // Bail out with an explicit log; the caller (single-GPU solve)
+    // returns an empty result if init fails.
+    if (!kg_cuda_check(
+            cudaMemcpy(impl_->d_x, h_x.data(), size_256, cudaMemcpyHostToDevice),
+            "single-gpu-init.d_x") ||
+        !kg_cuda_check(
+            cudaMemcpy(impl_->d_y, h_y.data(), size_256, cudaMemcpyHostToDevice),
+            "single-gpu-init.d_y") ||
+        !kg_cuda_check(
+            cudaMemcpy(impl_->d_z, h_z.data(), size_256, cudaMemcpyHostToDevice),
+            "single-gpu-init.d_z") ||
+        !kg_cuda_check(
+            cudaMemcpy(impl_->d_dist, h_dist.data(), size_256, cudaMemcpyHostToDevice),
+            "single-gpu-init.d_dist") ||
+        !kg_cuda_check(
+            cudaMemcpy(impl_->d_types, h_types.data(), size_32, cudaMemcpyHostToDevice),
+            "single-gpu-init.d_types") ||
+        !kg_cuda_check(
+            cudaMemcpy(impl_->d_wild_offset, h_wild_offset.data(), size_256, cudaMemcpyHostToDevice),
+            "single-gpu-init.d_wild_offset")) {
+        return result;   // empty / sentinel result
+    }
     cudaMemset(impl_->d_flags, 0, size_32);
     cudaMemset(impl_->d_restart_pending, 0, size_32);
 
@@ -2587,7 +2666,15 @@ GPUKangarooResult GPUKangarooManager::solve() {
         total_steps += static_cast<uint64_t>(num_kangaroos) * steps_per_round;
 
         std::vector<uint32_t> h_flags(num_kangaroos);
-        cudaMemcpy(h_flags.data(), impl_->d_flags, size_32, cudaMemcpyDeviceToHost);
+        if (!kg_cuda_check(
+                cudaMemcpy(h_flags.data(), impl_->d_flags, size_32,
+                           cudaMemcpyDeviceToHost),
+                "solve.h_flags")) {
+            // h_flags is garbage on copy failure -- skip DP collection
+            // this round; next iteration's harvest catches them after
+            // the transient cleared.
+            continue;
+        }
 
         std::vector<size_t> dp_indices;
         for (size_t i = 0; i < static_cast<size_t>(num_kangaroos); i++) {
@@ -2599,13 +2686,30 @@ GPUKangarooResult GPUKangarooManager::solve() {
         if (!dp_indices.empty()) {
             dp_count += dp_indices.size();
 
-            cudaMemcpy(h_x.data(), impl_->d_x, size_256, cudaMemcpyDeviceToHost);
-            cudaMemcpy(h_dist.data(), impl_->d_dist, size_256, cudaMemcpyDeviceToHost);
-            cudaMemcpy(h_types.data(), impl_->d_types, size_32, cudaMemcpyDeviceToHost);
-            // /B3: pull wild offsets so the collision algebra has the
-            // per-kangaroo starting-distance correction available.
-            cudaMemcpy(h_wild_offset.data(), impl_->d_wild_offset, size_256,
-                       cudaMemcpyDeviceToHost);
+            // Bail any one of these four D2H copies fails -- the DP
+            // construction below would otherwise stamp garbage X/dist/
+            // type/wild_offset values into the in-memory DP table and
+            // (if pool-mode) submit them to the JLP server.
+            bool harvest_ok =
+                kg_cuda_check(
+                    cudaMemcpy(h_x.data(), impl_->d_x, size_256,
+                               cudaMemcpyDeviceToHost),
+                    "solve.h_x") &&
+                kg_cuda_check(
+                    cudaMemcpy(h_dist.data(), impl_->d_dist, size_256,
+                               cudaMemcpyDeviceToHost),
+                    "solve.h_dist") &&
+                kg_cuda_check(
+                    cudaMemcpy(h_types.data(), impl_->d_types, size_32,
+                               cudaMemcpyDeviceToHost),
+                    "solve.h_types") &&
+                // /B3: pull wild offsets so the collision algebra has the
+                // per-kangaroo starting-distance correction available.
+                kg_cuda_check(
+                    cudaMemcpy(h_wild_offset.data(), impl_->d_wild_offset,
+                               size_256, cudaMemcpyDeviceToHost),
+                    "solve.h_wild_offset");
+            if (!harvest_ok) continue;
 
             for (size_t idx : dp_indices) {
                 // key on full 256-bit X. Pre-fix this was x_low only,
@@ -2760,9 +2864,15 @@ GPUKangarooResult GPUKangarooManager::solve() {
                         // GPU path so there's no contention) and a single
                         // 32-bit store is sufficient to flag the kernel.
                         uint32_t one = 1;
-                        cudaMemcpy(impl_->d_restart_pending + entry.kang_idx,
-                                   &one, sizeof(uint32_t),
-                                   cudaMemcpyHostToDevice);
+                        // 4-byte flag write. If this fails the kangaroo
+                        // doesn't get restarted this round; next collision
+                        // for the same kang_idx triggers another attempt.
+                        // Logged so a sustained failure is diagnosable.
+                        (void)kg_cuda_check(
+                            cudaMemcpy(impl_->d_restart_pending + entry.kang_idx,
+                                       &one, sizeof(uint32_t),
+                                       cudaMemcpyHostToDevice),
+                            "single-gpu-collision.restart_flag");
                         // Keep the older entry (do NOT overwrite). The newer
                         // duplicate is discarded after marking its source for
                         // restart.
@@ -3313,12 +3423,43 @@ GPUKangarooResult MultiGPUKangarooManager::solve() {
             }
         }
 
-        cudaMemcpy(ctx.d_x, h_x.data(), size_256, cudaMemcpyHostToDevice);
-        cudaMemcpy(ctx.d_y, h_y.data(), size_256, cudaMemcpyHostToDevice);
-        cudaMemcpy(ctx.d_z, h_z.data(), size_256, cudaMemcpyHostToDevice);
-        cudaMemcpy(ctx.d_dist, h_dist.data(), size_256, cudaMemcpyHostToDevice);
-        cudaMemcpy(ctx.d_types, h_types.data(), size_32, cudaMemcpyHostToDevice);
-        cudaMemcpy(ctx.d_wild_offset, h_wild_offset.data(), size_256, cudaMemcpyHostToDevice);
+        // Multi-GPU per-device herd init upload. Any copy failure
+        // poisons this GPU's entire run (kernel reads uninitialized
+        // device memory). Log every failure with the device_id so
+        // the operator can diagnose which GPU is at fault; the
+        // surrounding for(auto& ctx : impl_->gpu_contexts) loop
+        // skips to the next device on failure rather than aborting
+        // the whole multi-GPU solve. Other GPUs keep running with
+        // their successfully-seeded herds; the impacted GPU's
+        // subsequent harvest cycles produce zero DPs (the kernel
+        // reads garbage flags), naturally falling out of the
+        // collision algebra without poisoning the DP table.
+        bool device_init_ok =
+            kg_cuda_check(cudaMemcpy(ctx.d_x, h_x.data(), size_256,
+                                     cudaMemcpyHostToDevice),
+                          "multigpu-init.d_x") &&
+            kg_cuda_check(cudaMemcpy(ctx.d_y, h_y.data(), size_256,
+                                     cudaMemcpyHostToDevice),
+                          "multigpu-init.d_y") &&
+            kg_cuda_check(cudaMemcpy(ctx.d_z, h_z.data(), size_256,
+                                     cudaMemcpyHostToDevice),
+                          "multigpu-init.d_z") &&
+            kg_cuda_check(cudaMemcpy(ctx.d_dist, h_dist.data(), size_256,
+                                     cudaMemcpyHostToDevice),
+                          "multigpu-init.d_dist") &&
+            kg_cuda_check(cudaMemcpy(ctx.d_types, h_types.data(), size_32,
+                                     cudaMemcpyHostToDevice),
+                          "multigpu-init.d_types") &&
+            kg_cuda_check(cudaMemcpy(ctx.d_wild_offset, h_wild_offset.data(),
+                                     size_256, cudaMemcpyHostToDevice),
+                          "multigpu-init.d_wild_offset");
+        if (!device_init_ok) {
+            std::fprintf(stderr,
+                "[!] kangaroo multi-GPU init: device %d skipped due to "
+                "host->device copy failure (see logs above)\n",
+                ctx.device_id);
+            continue;
+        }
         cudaMemset(ctx.d_flags, 0, size_32);
         cudaMemset(ctx.d_restart_pending, 0, size_32);
 
@@ -3488,9 +3629,15 @@ GPUKangarooResult MultiGPUKangarooManager::solve() {
                 impl_->total_steps += static_cast<uint64_t>(ctx.num_kangaroos) * steps_per_round;
                 local_rounds++;  // Track for work stealing
 
-                // Check for DPs
-                cudaMemcpy(h_flags.data(), ctx.d_flags, ctx.num_kangaroos * sizeof(uint32_t),
-                           cudaMemcpyDeviceToHost);
+                // Check for DPs. Skip iteration on copy failure so the
+                // dp_indices loop doesn't dereference garbage flags.
+                if (!kg_cuda_check(
+                        cudaMemcpy(h_flags.data(), ctx.d_flags,
+                                   ctx.num_kangaroos * sizeof(uint32_t),
+                                   cudaMemcpyDeviceToHost),
+                        "multigpu-solve.h_flags")) {
+                    continue;
+                }
 
                 std::vector<size_t> dp_indices;
                 for (size_t i = 0; i < static_cast<size_t>(ctx.num_kangaroos); i++) {
@@ -3503,13 +3650,31 @@ GPUKangarooResult MultiGPUKangarooManager::solve() {
                     impl_->total_dps += dp_indices.size();
                     local_dps += dp_indices.size();  // Track for productivity measurement
 
-                    cudaMemcpy(h_x.data(), ctx.d_x, size_256, cudaMemcpyDeviceToHost);
-                    cudaMemcpy(h_dist.data(), ctx.d_dist, size_256, cudaMemcpyDeviceToHost);
-                    cudaMemcpy(h_types.data(), ctx.d_types, ctx.num_kangaroos * sizeof(uint32_t),
-                               cudaMemcpyDeviceToHost);
-                    // /B3: pull per-kangaroo wild offsets for collision algebra.
-                    cudaMemcpy(h_wild_off_per.data(), ctx.d_wild_offset, size_256,
-                               cudaMemcpyDeviceToHost);
+                    // Same protection as collect_dps: bail if any of the
+                    // four DP-harvest D2H copies fails. The DP table
+                    // population below would otherwise stamp garbage
+                    // 256-bit X / dist / type / wild_offset values and
+                    // the collision algebra would chase the noise.
+                    bool harvest_ok =
+                        kg_cuda_check(
+                            cudaMemcpy(h_x.data(), ctx.d_x, size_256,
+                                       cudaMemcpyDeviceToHost),
+                            "multigpu-solve.h_x") &&
+                        kg_cuda_check(
+                            cudaMemcpy(h_dist.data(), ctx.d_dist, size_256,
+                                       cudaMemcpyDeviceToHost),
+                            "multigpu-solve.h_dist") &&
+                        kg_cuda_check(
+                            cudaMemcpy(h_types.data(), ctx.d_types,
+                                       ctx.num_kangaroos * sizeof(uint32_t),
+                                       cudaMemcpyDeviceToHost),
+                            "multigpu-solve.h_types") &&
+                        // /B3: pull per-kangaroo wild offsets for collision algebra.
+                        kg_cuda_check(
+                            cudaMemcpy(h_wild_off_per.data(), ctx.d_wild_offset,
+                                       size_256, cudaMemcpyDeviceToHost),
+                            "multigpu-solve.h_wild_offset");
+                    if (!harvest_ok) continue;
 
                     // Process DPs with shared table lock
                     std::lock_guard<std::mutex> lock(impl_->dp_mutex);
@@ -3638,10 +3803,17 @@ GPUKangarooResult MultiGPUKangarooManager::solve() {
                                 // rationale.
                                 uint32_t one = 1;
                                 cudaSetDevice(ctx.device_id);
-                                cudaMemcpy(
-                                    ctx.d_restart_pending + entry.kang_idx,
-                                    &one, sizeof(uint32_t),
-                                    cudaMemcpyHostToDevice);
+                                // 4-byte restart flag write. Failure here
+                                // leaves the kangaroo on its current path;
+                                // the next collision triggers another
+                                // attempt. Logged so a sustained failure
+                                // is diagnosable.
+                                (void)kg_cuda_check(
+                                    cudaMemcpy(
+                                        ctx.d_restart_pending + entry.kang_idx,
+                                        &one, sizeof(uint32_t),
+                                        cudaMemcpyHostToDevice),
+                                    "multigpu-collision.restart_flag");
                             }
                         } else {
                             impl_->dp_table[key] = entry;
@@ -3976,11 +4148,32 @@ bool MultiGPUKangarooManager::load_herd_state(const std::string& path) {
         }
 
         cudaSetDevice(ctx.device_id);
-        cudaMemcpy(ctx.d_x, h_x.data(), size_256, cudaMemcpyHostToDevice);
-        cudaMemcpy(ctx.d_y, h_y.data(), size_256, cudaMemcpyHostToDevice);
-        cudaMemcpy(ctx.d_dist, h_dist.data(), size_256, cudaMemcpyHostToDevice);
-        cudaMemcpy(ctx.d_wild_offset, h_wild.data(), size_256, cudaMemcpyHostToDevice);
-        cudaMemcpy(ctx.d_types, h_types.data(), size_32, cudaMemcpyHostToDevice);
+        // Resume herd upload. Same protection as the fresh-init path
+        // above: a copy failure here poisons this device's run. Log
+        // + continue to skip this device; the other devices keep
+        // resuming their slice of the herd state.
+        bool resume_ok =
+            kg_cuda_check(cudaMemcpy(ctx.d_x, h_x.data(), size_256,
+                                     cudaMemcpyHostToDevice),
+                          "multigpu-resume.d_x") &&
+            kg_cuda_check(cudaMemcpy(ctx.d_y, h_y.data(), size_256,
+                                     cudaMemcpyHostToDevice),
+                          "multigpu-resume.d_y") &&
+            kg_cuda_check(cudaMemcpy(ctx.d_dist, h_dist.data(), size_256,
+                                     cudaMemcpyHostToDevice),
+                          "multigpu-resume.d_dist") &&
+            kg_cuda_check(cudaMemcpy(ctx.d_wild_offset, h_wild.data(),
+                                     size_256, cudaMemcpyHostToDevice),
+                          "multigpu-resume.d_wild_offset") &&
+            kg_cuda_check(cudaMemcpy(ctx.d_types, h_types.data(), size_32,
+                                     cudaMemcpyHostToDevice),
+                          "multigpu-resume.d_types");
+        if (!resume_ok) {
+            std::fprintf(stderr,
+                "[!] kangaroo multi-GPU resume: device %d skipped due "
+                "to host->device copy failure\n", ctx.device_id);
+            continue;
+        }
         // Z is implicitly 1 in the affine pipeline; the kernel's first
         // batch inversion step will write Z=1 on its first DP store and
         // the host loop never reads Z prior to that. Reset flags +

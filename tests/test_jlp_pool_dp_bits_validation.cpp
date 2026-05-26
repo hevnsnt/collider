@@ -65,15 +65,24 @@ using namespace std::chrono_literals;
 namespace {
 
 #ifdef _WIN32
+// Match test_jlp_pool_protocol.cpp's task #34 fix: skip the explicit
+// WSACleanup() so it cannot race with Windows' process-exit socket
+// cleanup. The OS releases per-process WinSock state on exit; the
+// only thing we needed WSAStartup for is the per-process init.
 struct WSAGuard {
     WSAGuard()  { WSADATA w; WSAStartup(MAKEWORD(2, 2), &w); }
-    ~WSAGuard() { WSACleanup(); }
+    ~WSAGuard() { /* see task #34 note in test_jlp_pool_protocol.cpp */ }
 };
 #endif
 
 constexpr uint8_t TYPE_AUTH_OK   = 0x02;
 constexpr uint8_t TYPE_WORK_ASN  = 0x11;
-constexpr uint8_t MOCK_PROTOCOL_VERSION = 2;
+// v1.5 (protocol_version=3): the client now strictly requires flags=3 in
+// every header (set by jlp_wire::PROTOCOL_VERSION). Mocks below send v3
+// frames so the handshake reaches AUTH_OK and the dp_bits validation
+// path is exercisable. The dp_bits tests themselves are protocol-version
+// agnostic; the bump here is mock-server hygiene, not a behavior change.
+constexpr uint8_t MOCK_PROTOCOL_VERSION = 3;
 
 std::vector<uint8_t> build_frame(uint8_t type, const void* payload, uint16_t len) {
     std::vector<uint8_t> out;
@@ -285,7 +294,14 @@ std::unique_ptr<JLPPoolClient> make_connected(uint16_t port) {
     auto c = std::make_unique<JLPPoolClient>();
     c->set_use_tls(false);
     c->set_reconnect(false);
-    c->set_timeout(1);
+    // task #34: was set_timeout(1) which sent the receiver into a tight
+    // 1000Hz recv-timeout loop. Combined with no PING kicker this race-
+    // closed a teardown window where the receiver thread was mid-recv
+    // exactly when client.reset() fired closesocket(). 50ms gives the
+    // OS scheduler room to cleanly interrupt recv at the closesocket
+    // boundary without the high-frequency loop. Production timeouts are
+    // 100s; 50ms is plenty for tests that drive every byte explicitly.
+    c->set_timeout(50);
     if (!c->connect("127.0.0.1", port)) return nullptr;
     return c;
 }
@@ -322,7 +338,11 @@ bool fail(const char* tname, const char* why) {
     return false;
 }
 
-// Build a 109-byte JLPServerConfig with the requested dp_bits value.
+// Build a 126-byte v1.5 JLPServerConfig with the requested dp_bits value.
+// kangaroo_type defaults to 1 (TAME_ONLY) so that downstream tests which
+// reach the asymmetric-assignment path see a valid v1.5 chunk. The
+// dp_bits-rejection tests fire before that path is hit, so the type
+// choice is irrelevant for them.
 JLPServerConfig make_work_assignment(uint32_t dp_bits, uint64_t work_id) {
     JLPServerConfig cfg{};
     // Valid 33-byte compressed pubkey prefix (0x02 / 0x03 / 0x04 are
@@ -334,6 +354,9 @@ JLPServerConfig make_work_assignment(uint32_t dp_bits, uint64_t work_id) {
     for (int i = 0; i < 32; ++i) cfg.range_end[i]   = 0x20 + i;
     cfg.dp_bits = dp_bits;
     cfg.work_id = work_id;
+    cfg.kangaroo_type  = 1;   // TAME_ONLY (v1.5 requires non-zero)
+    cfg.start_offset_a = 0;
+    cfg.start_offset_b = 0;
     return cfg;
 }
 
@@ -365,8 +388,12 @@ bool test_dp_bits_255_rejected_callback_not_fired() {
     // The bad WORK_ASN. dp_bits=255 is well above the [8..32] window the
     // client supports.
     auto cfg = make_work_assignment(255, 0xDEADBEEFCAFE0001ULL);
-    static_assert(sizeof(JLPServerConfig) == 109,
-                  "JLPServerConfig must be 109 bytes on the wire");
+    static_assert(sizeof(JLPServerConfig) == 126,
+                  "v1.5: JLPServerConfig must be 126 bytes on the wire "
+                  "(109 head + kangaroo_type/start_offset_a/start_offset_b "
+                  "tail; the dp_bits=255 rejection still triggers because "
+                  "the reject_work_asn_dp_bits check fires before the new "
+                  "fields are read).");
     server.send_frame(TYPE_WORK_ASN, &cfg, sizeof(cfg));
 
     // Give the receiver thread a generous window to ingest, reject, and

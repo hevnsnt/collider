@@ -62,10 +62,16 @@
 #include "runtime/pool_solver.hpp"
 #include "runtime/puzzle_solver.hpp"
 #include "runtime/runtime_globals.hpp"
+#include "runtime/runtime_control.hpp"      // global_runtime_control reset
 #include "ui/interactive.hpp"               // Interactive::display_header
 #include "ui/interactive_ui.hpp"
 #ifdef COLLIDER_PRO
+#include "core/paths.hpp"                    // TR-1: collider_home for logs
+#include "core/settings_sidecar.hpp"        // TR-5: load TUI settings
 #include "runtime/brain_wallet_runner.hpp"
+#include "runtime/bip_scanner_runner.hpp"
+#include "ui/tui/stdio_capture.hpp"          // TR-1 / TR-7: post-menu cout/cerr
+#include "ui/tui/boot_banner.hpp"            // cinematic shine-wipe banner
 #include "runtime/license_gate.hpp"
 #include "ui/brainwallet_setup.hpp"
 #endif
@@ -183,9 +189,10 @@ static void auto_enable_puzzle_mode_if_needed(Arguments& args) {
 }
 
 /**
- * Main entry point.
+ * Implementation of main(), separated so the real entry-point can wrap
+ * the return value in std::_Exit (see below).
  */
-int main(int argc, char* argv[]) {
+static int main_impl(int argc, char* argv[]) {
     // Enable ANSI colors on Windows
     ui::enable_windows_ansi();
 
@@ -208,6 +215,32 @@ int main(int argc, char* argv[]) {
     collider::AppConfig app_config;
     if (app_config.load(args.config_file)) {
         collider::apply_config_to_args(args, app_config, cli_flags);
+    }
+
+    // TR-5: load TUI-modal settings sidecar AFTER config.yml so an
+    // operator's last-session edits beat the YAML defaults, but only
+    // for fields the CLI did NOT explicitly set (cli flags always win
+    // -- they're the most-recent operator intent). Sidecar holds the
+    // SettingsValues schema; we project a subset onto Arguments. Fields
+    // not represented in Arguments (theme, refresh_hz) are read back
+    // by the TUI on launch.
+    {
+        ::collider::ui::tui::panels::SettingsValues sidecar{};
+        if (::collider::settings_sidecar::load(sidecar)) {
+            if (!cli_flags.backend_kind_set && !sidecar.backend_kind.empty()) {
+                args.backend_kind = sidecar.backend_kind;
+            }
+            if (!cli_flags.solver_set && !sidecar.solver.empty()) {
+                args.solver = sidecar.solver;
+            }
+            if (!cli_flags.num_kangaroos_set && sidecar.num_kangaroos > 0) {
+                args.num_kangaroos = sidecar.num_kangaroos;
+            }
+            if (!cli_flags.batch_size_set && sidecar.batch_size > 0) {
+                args.batch_size = sidecar.batch_size;
+                args.batch_size_auto = false;
+            }
+        }
     }
 
     if (args.help) {
@@ -318,15 +351,24 @@ int main(int argc, char* argv[]) {
         collider::log::write_hardware_enum(devices);
     }
 
-    // INTERACTIVE MODE: when no command-line arguments provided.
-    if (argc == 1) {
-        double gpu_speed_mkeys = gpu_info.estimated_speed > 0
-            ? gpu_info.estimated_speed / 1e6
-            : 400.0;
-        args = ui::run_interactive_mode(args, gpu_speed_mkeys);
+    // Snapshot the post-CLI/post-config args BEFORE the interactive
+    // menu (or the first mode dispatch) mutates them. Each iteration of
+    // the interactive loop resets back to this baseline so a previously-
+    // picked mode does not pre-select itself when the operator returns
+    // to the menu via 'q'.
+    const Arguments args_baseline = args;
 
-        if (args.exit_program) return 0;
-        if (args.help) { print_usage(); return 0; }
+    const bool is_interactive_session = (argc == 1);
+    const double gpu_speed_mkeys = gpu_info.estimated_speed > 0
+        ? gpu_info.estimated_speed / 1e6
+        : 400.0;
+
+    if (is_interactive_session) {
+        // Cinematic shine-wipe boot banner. ~1.1 s total. Plays BEFORE
+        // any TUI takes over the screen so the operator sees the brand
+        // animation as the first thing on startup, then the TUI main
+        // menu takes over and offers mode selection.
+        ::collider::ui::tui::play_boot_banner();
     } else {
         // Direct CLI invocation: render the brand header so every mode shows
         // the version banner, not just the interactive menu.
@@ -334,34 +376,212 @@ int main(int argc, char* argv[]) {
         std::cout << "\n";
     }
 
-    // ---- Mode dispatch -----------------------------------------------------
-    // POOL MODE first (its banner/header comes from the runtime driver).
-    if (args.pool_mode) {
-        return collider::runtime::run_pool_mode(args, gpu_info);
-    }
+    // Outer loop: in an interactive session, falling out of a mode
+    // (quit-key or normal session-complete) returns to the main menu
+    // instead of exiting the process. CLI-driven invocations run a
+    // single mode and exit. The loop is structured so the
+    // baseline-reset, menu, and StdioCapture install/tear-down all
+    // happen per-iteration -- key to letting the menu re-use stdio
+    // after the previous mode's TUI restored it.
+    while (true) {
+        if (is_interactive_session) {
+            // Reset to baseline so the menu starts fresh, then ALSO
+            // clear every mode-selection flag: in an interactive
+            // session the menu's pick is the single source of truth
+            // for mode. config.yml may have set pool_mode=true or
+            // brainwallet_mode=true at startup -- baseline preserves
+            // that -- but when the operator picks PUZZLE SOLVER from
+            // the menu, the dispatcher below MUST run puzzle mode,
+            // not the config.yml-default mode. The dispatch chain
+            // checks bip_scan_mode -> pool_mode -> brainwallet_mode
+            // -> puzzle_mode, so a leftover pool_mode=true from
+            // config.yml beats the menu's puzzle_mode=true selection
+            // and runs the wrong mode. Clearing all flags here lets
+            // run_interactive_mode set EXACTLY ONE.
+            args = args_baseline;
+            args.pool_mode        = false;
+            args.brainwallet_mode = false;
+            args.puzzle_only_v2   = false;
+            args.puzzle_mode      = false;
+            args.benchmark        = false;
+            args.bip_scan_mode    = false;
 
-    // BRAINWALLET MODE / --puzzle-only-v2 (Pro-only).
+            // Reset the global shutdown latch + the per-session
+            // RuntimeControlState latches that the previous mode
+            // tripped. RuntimeControlState is a process-wide Meyers
+            // singleton; quit_requested is documented as a one-way
+            // latch from "running" to "shutting down" that the
+            // reader never clears. Without an explicit reset here,
+            // the FIRST 'q' press in ANY mode latches the flag
+            // forever and every subsequent mode pick exits on its
+            // first progress tick -- pool reads requested_quit()
+            // inside on_progress and returns false, the kangaroo
+            // solve loop exits, save_herd_state fails (RCKangaroo
+            // does not serialize), the pool disconnects, run_pool_
+            // mode returns, the menu re-opens, and the cycle
+            // repeats. Same story for brainwallet (resume thinks
+            // it's done in 0 s), BIP (one iteration then stop), and
+            // puzzle. The fix: this loop owns the menu/mode
+            // lifecycle, so it must clear the latches here.
+            g_shutdown.store(false, std::memory_order_release);
+            g_shutdown_signal.store(0, std::memory_order_release);
+            g_shutdown_logged.store(false, std::memory_order_release);
+            {
+                auto& rc = ::collider::runtime::global_runtime_control();
+                rc.quit_requested.store(false, std::memory_order_release);
+                rc.pause_requested.store(false, std::memory_order_release);
+                rc.is_paused.store(false, std::memory_order_release);
+                rc.save_requested.store(false, std::memory_order_release);
+                // Full process-global state reset between mode picks.
+                // Without these, operator-side tuning ('g1' to disable
+                // a GPU, '+' / '-' to nudge batch size, 's' to save,
+                // 'r' to cycle rule chunks, 'b'/'w' for bloom/wordlist
+                // hot-swap, focused-panel mode, the lingering banner
+                // from the previous mode's quit) leaks into the next
+                // mode. The user picks PUZZLE after disabling GPU 1
+                // in BIP scan and the puzzle launches with one GPU.
+                // Each mode should start with a clean slate; the
+                // operator can re-issue any tuning command via the
+                // mode's own input handler.
+                rc.gpu_enable_mask.store(0xff, std::memory_order_release);
+                for (size_t i = 0; i < rc.gpu_phase.size(); ++i) {
+                    rc.gpu_phase[i].store(
+                        ::collider::runtime::RuntimeControlState::GpuPhase::Active,
+                        std::memory_order_release);
+                }
+                rc.requested_batch_size.store(0, std::memory_order_release);
+                rc.last_applied_batch_size.store(0, std::memory_order_release);
+                rc.requested_rule_chunk_size.store(0, std::memory_order_release);
+                rc.last_applied_rule_chunk_size.store(0, std::memory_order_release);
+                rc.requested_focused_panel.store(
+                    ::collider::runtime::RuntimeControlState::kFocusNone,
+                    std::memory_order_release);
+                rc.set_requested_bloom_path("");
+                rc.set_last_applied_bloom_path("");
+                rc.set_requested_wordlist_profile("");
+                rc.set_last_applied_wordlist_profile("");
+                rc.set_banner("");
+                // Theme variant deliberately NOT reset -- the operator's
+                // 't' cycle is a user-preference that should persist
+                // across mode picks, not session state that needs to
+                // start clean.
+            }
+
+            args = ui::run_interactive_mode(args, gpu_speed_mkeys);
+
+            if (args.exit_program) return 0;
+            if (args.help) { print_usage(); return 0; }
+        }
+
+        // TR-1 / TR-7: install stdout/stderr capture HERE so every line
+        // the runner / pool client / GPU init code emits between this
+        // point and the end of the mode goes into ~/.collider/logs/tui-
+        // boot-<ts>.log instead of bleeding onto the alt-screen
+        // background or dumping into scrollback when the alt-screen
+        // restores. The interactive menu above used real stdio (its
+        // FTXUI screen owns and restores the terminal cleanly), so we
+        // capture only POST-menu output. The unique_ptr is per-loop:
+        // its dtor restores rdbufs before the next iteration's menu
+        // runs, so the menu gets normal stdio back. Captured bytes
+        // flush to disk best-effort.
+        std::unique_ptr<::collider::ui::tui::StdioCapture> tui_stdio_capture;
+        {
+            const bool will_launch_tui =
+                args.pool_mode ||
+                args.brainwallet_mode ||
+                args.puzzle_only_v2 ||
+                args.puzzle_mode ||
+                args.benchmark ||
+                args.bip_scan_mode;
+            if (will_launch_tui) {
+                tui_stdio_capture =
+                    std::make_unique<::collider::ui::tui::StdioCapture>(
+                        collider::paths::collider_home() / "logs");
+            }
+        }
+
+        // ---- Mode dispatch -------------------------------------------------
+        // BIP scanner first: an explicit --bip-scan from the CLI overrides any
+        // config.yml-set pool_mode / brainwallet_mode. The flag is the
+        // strongest "do this mode RIGHT NOW" signal an operator can give.
+        int rc = 0;
+        bool dispatched = false;
 #ifdef COLLIDER_PRO
-    if (args.puzzle_only_v2 || args.brainwallet_mode) {
-        return collider::runtime::run_brain_wallet_mode(args);
-    }
+        if (!dispatched && args.bip_scan_mode) {
+            rc = collider::runtime::run_bip_scan_mode(args);
+            dispatched = true;
+        }
 #endif
+        if (!dispatched && args.pool_mode) {
+            rc = collider::runtime::run_pool_mode(args, gpu_info);
+            dispatched = true;
+        }
+#ifdef COLLIDER_PRO
+        if (!dispatched && (args.puzzle_only_v2 || args.brainwallet_mode)) {
+            rc = collider::runtime::run_brain_wallet_mode(args);
+            dispatched = true;
+        }
+#endif
+        if (!dispatched) {
+            // If neither benchmark nor puzzle is set, auto-enable puzzle mode.
+            auto_enable_puzzle_mode_if_needed(args);
+            if (args.benchmark) {
+                rc = collider::runtime::run_benchmark(args, gpu_info);
+                dispatched = true;
+            } else if (args.puzzle_mode) {
+                rc = collider::runtime::run_puzzle_mode(args, gpu_info);
+                dispatched = true;
+            }
+        }
 
-    // If neither benchmark nor puzzle is set, auto-enable puzzle mode.
-    auto_enable_puzzle_mode_if_needed(args);
+        if (!dispatched) {
+            std::cerr << "[!] Error: No mode specified. "
+                         "Use --puzzle <number> or --benchmark.\n";
+            print_usage();
+            return 1;
+        }
 
-    // BENCHMARK MODE.
-    if (args.benchmark) {
-        return collider::runtime::run_benchmark(args, gpu_info);
+        // Tear down capture BEFORE the next iteration's menu runs.
+        tui_stdio_capture.reset();
+
+        // CLI invocation: one-shot. Interactive: loop unless the mode
+        // itself returned a non-zero exit (errors propagate out).
+        if (!is_interactive_session) return rc;
+        if (rc != 0) return rc;
+        // Successful mode exit (incl. 'q' quit): loop back to menu.
     }
+}
 
-    // PUZZLE MODE (default).
-    if (args.puzzle_mode) {
-        return collider::runtime::run_puzzle_mode(args, gpu_info);
-    }
-
-    // No mode resolved (shouldn't be reachable after auto_enable).
-    std::cerr << "[!] Error: No mode specified. Use --puzzle <number> or --benchmark.\n";
-    print_usage();
-    return 1;
+/**
+ * Real main(). All program logic is in main_impl above; this thin wrapper
+ * exists to short-circuit C++ static destruction on the exit path.
+ *
+ * Why: on macOS, several Meyers singletons in this codebase take a
+ * std::mutex lock in their destructor (Logger, SessionLogSink,
+ * BalanceFetcher). Apple's pthread library invalidates mutex state during
+ * the static-destruction phase earlier than glibc/MSVC, so lock_guard
+ * throws std::system_error EINVAL out of a noexcept dtor and aborts the
+ * process. Customers see a clean session summary followed by an
+ * "abort 6 ... libc++abi terminating" line that makes a clean exit look
+ * like a fault. We patched three offenders already (drop the dtor lock);
+ * std::_Exit() shortcut kills the whole class of bug categorically by
+ * not running ANY static destruction, atexit handler, or stream flush.
+ *
+ * Safety: every state-mutating write in this codebase flushes explicitly
+ * (puzzle_found.txt, brainwallet_hits.txt, bloom_hits.txt,
+ * pool_dp_pending.dat, kangaroo herd saves, all session/logger writes).
+ * The only cleanup we skip is in-memory: file-descriptor close, mutex
+ * destroy, heap free -- all of which the OS reclaims at process exit
+ * regardless. No customer-visible state is lost.
+ *
+ * We do flush std::cout / std::cerr explicitly before _Exit because they
+ * use line-buffered output on a TTY (auto-flush on \n) but full-buffer
+ * when stdout is a pipe; piping `collider | tee log.txt` would otherwise
+ * lose the final lines of output without this flush.
+ */
+int main(int argc, char* argv[]) {
+    int code = main_impl(argc, argv);
+    std::cout.flush();
+    std::cerr.flush();
+    std::_Exit(code);
 }

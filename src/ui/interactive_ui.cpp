@@ -28,6 +28,7 @@
 
 #include "ui/interactive_ui.hpp"
 
+#include "core/paths.hpp"
 #include "core/puzzle_analysis.hpp"
 #include "core/puzzle_config.hpp"
 #include "core/version.hpp"
@@ -35,6 +36,8 @@
 #include "tools/utxo_bloom_builder.hpp"
 #include "ui/banner.hpp"
 #include "ui/interactive.hpp"
+#include "ui/tui/menu/main_menu.hpp"     // TR-1: TUI-native main menu
+#include "ui/tui/menu/mode_config.hpp"   // TR-1-full: mode-config modals
 
 #ifdef COLLIDER_PRO
 #include "core/brainwallet_state.hpp"
@@ -42,6 +45,7 @@
 #endif
 
 #include "runtime/format.hpp"
+#include "runtime/bip_scanner_runner.hpp"  // resolve_* auto-detect helpers
 
 // format_number is still defined in runtime/puzzle_solver.cpp; forward
 // declare it here so we keep linking against the existing TU.
@@ -98,9 +102,8 @@ static void maybe_pick_opportunistic_bloom(Arguments& args,
             auto candidate = std::filesystem::path(dir) / name;
             if (std::filesystem::exists(candidate, ec) && !ec) {
                 args.bloom_file = candidate.string();
-                Interactive::status_message(
-                    "Found bloom filter for opportunistic scanning: "
-                    + args.bloom_file, true);
+                // Silent -- opportunistic-bloom info shows up in the
+                // confirm/dashboard later; no cout drop-out here.
                 return;
             }
         }
@@ -142,46 +145,40 @@ static void maybe_pick_opportunistic_bloom(Arguments& args,
     }
 
     if (found.empty()) {
-        Interactive::info_message(
-            mode_label + ": no bloom filter detected; "
-            "opportunistic address scanning disabled. "
-            "Drop funded_addresses.blf next to the binary "
-            "or pass --bloom <path> to enable.");
+        // Silent: opportunistic scanning is best-effort. Informing
+        // the operator here would dump cout between TUI screens; the
+        // dashboard PROFILE row makes the inactive state visible.
         return;
     }
 
     if (found.size() == 1) {
         args.bloom_file = found[0].first;
-        Interactive::status_message(
-            "Found bloom filter for opportunistic scanning: "
-            + args.bloom_file, true);
-        return;
+        return;  // silent
     }
 
-    // Multiple custom blooms: let the operator pick or skip.
-    std::cout << "\n";
-    Interactive::status_message(
-        "Found " + std::to_string(found.size())
-            + " bloom filter(s) for opportunistic scanning:", true);
-    std::cout << "\n";
-    for (size_t i = 0; i < found.size(); ++i) {
-        double size_mb = found[i].second / (1024.0 * 1024.0);
-        std::cout << "  [" << (i + 1) << "] " << found[i].first
-                  << " (" << std::fixed << std::setprecision(1)
-                  << size_mb << " MB)\n";
+    // Multiple custom blooms: T1-A polish: TUI picker_modal in place
+    // of the cout/cin "Continue without opportunistic scanning" menu.
+    std::vector<std::string> labels;
+    labels.reserve(found.size() + 1);
+    for (const auto& [path, size] : found) {
+        double size_mb = size / (1024.0 * 1024.0);
+        std::ostringstream lbl;
+        lbl << path << "  (" << std::fixed << std::setprecision(1)
+            << size_mb << " MB)";
+        labels.push_back(lbl.str());
     }
-    std::cout << "  [" << (found.size() + 1)
-              << "] Continue without opportunistic scanning\n\n";
-    int choice = Interactive::prompt_menu_choice(
-        1, static_cast<int>(found.size() + 1));
-    if (choice >= 1 && choice <= static_cast<int>(found.size())) {
-        args.bloom_file = found[choice - 1].first;
-        Interactive::status_message(
-            "Using bloom filter: " + args.bloom_file, true);
-    } else {
-        Interactive::info_message(
-            "Continuing without opportunistic scanning.");
+    labels.push_back("Continue without opportunistic scanning");
+    const int pick = ::collider::ui::tui::menu::picker_modal(
+        std::string("OPPORTUNISTIC BLOOM (") + mode_label + ")",
+        "Pro mode: derive each candidate pubkey against the chosen "
+        "bloom filter to opportunistically catch funded-address hits. "
+        "Pick a bloom file or continue without the side-channel scan.",
+        labels);
+    if (pick == 0 || pick == static_cast<int>(labels.size())) {
+        return;  // silent -- dashboard PROFILE shows inactive
     }
+    args.bloom_file = found[pick - 1].first;
+    // Silent -- the path is in the upcoming confirm modal's kv-rows.
 }
 #endif  // COLLIDER_PRO
 
@@ -190,22 +187,22 @@ Arguments run_puzzle_interactive(Arguments base_args, double gpu_speed_mkeys) {
     Arguments args = base_args;
     args.puzzle_mode = true;
 
-    Interactive::display_section("Bitcoin Puzzle Challenge Mode");
-
-    // First ask: standalone or pool?
-    PuzzleModeChoice mode_choice = Interactive::display_puzzle_mode_menu();
-
-    if (mode_choice == PuzzleModeChoice::BACK) {
-        args.go_back = true;  // Return to main menu
+    // TR-1-full: TUI standalone/pool picker. Replaces the cout-prompt
+    // "Choose mode: [1] Standalone [2] Join Pool [0] Back".
+    const int mode_pick = ::collider::ui::tui::menu::puzzle_mode_picker_modal();
+    if (mode_pick == 0) {
+        args.go_back = true;  // Back to main menu
         return args;
     }
-
-    bool use_pool = (mode_choice == PuzzleModeChoice::JOIN_POOL);
+    const bool use_pool = (mode_pick == 2);
 
     if (use_pool) {
-        // Configure pool settings
+        // T1-B polish: TUI pool config modal in place of the cout
+        // "Pool URL: ... Worker: ..." cin chain. Keeps the operator
+        // inside FTXUI from main-menu to scan view.
         std::string pool_url, worker;
-        if (!Interactive::prompt_pool_config(pool_url, worker, args.pool_url, args.pool_worker)) {
+        if (!::collider::ui::tui::menu::pool_config_modal(
+                pool_url, worker, args.pool_url, args.pool_worker)) {
             args.go_back = true;
             return args;
         }
@@ -220,29 +217,30 @@ Arguments run_puzzle_interactive(Arguments base_args, double gpu_speed_mkeys) {
         const std::string saved =
             collider::AppConfig::save_pool_worker(worker, pool_url);
         if (!saved.empty()) {
-            Interactive::info_message("Saved pool worker to " + saved
-                + " (will default on next launch)");
+            // Silent: cache write happened but we don't cout about it.
+            (void)saved;
         }
 
         // Pool mode doesn't need puzzle selection -- pool assigns work.
-        // Pre-1.4.1 the runner waited on Enter here, which forced an extra
-        // keystroke after the user had ALREADY confirmed the pool/worker
-        // pair in prompt_pool_config above. Just connect.
+        // The pool_config_modal above already captured the URL + worker
+        // pair; connect immediately without an extra Enter keystroke.
 #ifdef COLLIDER_PRO
         // Pro: offer the opportunistic-bloom side-channel before connecting.
         // Skipped silently for Free; --bloom is Pro-gated at the CLI parser.
-        std::cout << "\n";
         maybe_pick_opportunistic_bloom(args, "Pool mode");
 #endif
-        std::cout << "\n";
-        Interactive::info_message("Pool mode: Work will be assigned by the pool server. Connecting...");
+        // Silent connect -- the pool runtime emits its own status via
+        // session_log + stdio_capture into ~/.collider/logs.
         return args;
     }
 
-    // Standalone mode - select puzzle
-    std::cout << "\n";
-    std::cout << "Enter puzzle number (1-256) or 'auto' for smart selection";
-    int puzzle_choice = Interactive::prompt_number("", 1, 256, true);
+    // T1-B polish: TUI puzzle number picker in place of the cout
+    // "Enter puzzle number (1-256) or 'auto'" prompt.
+    int puzzle_choice = ::collider::ui::tui::menu::puzzle_number_modal();
+    if (puzzle_choice == 0) {
+        args.go_back = true;
+        return args;
+    }
 
     if (puzzle_choice == -1) {
         // Auto mode - use smart selection
@@ -250,10 +248,6 @@ Arguments run_puzzle_interactive(Arguments base_args, double gpu_speed_mkeys) {
         if (best > 0) {
             args.puzzle_number = best;
             const ::collider::PuzzleInfo* puzzle = ::collider::PuzzleDatabase::get_puzzle(best);
-
-            std::cout << "\n";
-            Interactive::info_message("Analyzing puzzles...");
-
             if (puzzle) {
                 bool has_pubkey = !puzzle->public_key_hex.empty();
 
@@ -270,19 +264,34 @@ Arguments run_puzzle_interactive(Arguments base_args, double gpu_speed_mkeys) {
                     est_time = "~" + std::to_string((int)analysis.estimated_gpu_years) + " years";
                 }
 
-                std::cout << "\n";
-                Interactive::info_message("Smart Selection: Puzzle #" + std::to_string(best));
-                Interactive::display_puzzle_info(puzzle->number, puzzle->bits, has_pubkey,
-                                                 puzzle->btc_reward, est_time);
-
                 if (has_pubkey) {
                     args.puzzle_kangaroo = true;
                 }
 
-                std::cout << "\n";
-                if (!Interactive::prompt_yes_no("Proceed with Puzzle #" + std::to_string(best) + "?", true)) {
-                    std::cout << "\n";
-                    Interactive::info_message("Selection cancelled. Returning to main menu...");
+                // T1-B: TUI confirm in place of cout-based prompt.
+                // The "Analyzing puzzles..." + display_puzzle_info
+                // cout block was removed; the confirm modal renders
+                // the same info in the kv-rows below.
+                std::vector<std::pair<std::string, std::string>> auto_kv = {
+                    {"Puzzle", "#" + std::to_string(best)
+                                + " (smart-selected)"},
+                    {"Bits", std::to_string(puzzle->bits)},
+                    {"Reward", std::to_string(puzzle->btc_reward) + " BTC"},
+                    {"Algorithm", has_pubkey ? "Kangaroo (pubkey known)"
+                                             : "BSGS"},
+                    {"Estimated time", est_time},
+                };
+                const auto auto_confirm =
+                    ::collider::ui::tui::menu::confirm_config_modal(
+                        "PUZZLE #" + std::to_string(best) + " -- CONFIRM",
+                        "Smart-selected based on your GPU throughput. "
+                        "Standalone solver runs locally against the "
+                        "puzzle's full keyspace. Solution writes to "
+                        "puzzle_<N>.txt on success.",
+                        auto_kv,
+                        "Start solver");
+                if (auto_confirm ==
+                    ::collider::ui::tui::menu::ConfirmResult::Back) {
                     args.go_back = true;
                     return args;
                 }
@@ -298,14 +307,22 @@ Arguments run_puzzle_interactive(Arguments base_args, double gpu_speed_mkeys) {
 
             // Check if solved
             if (puzzle->solved) {
-                std::cout << "\n";
-                Interactive::warning_message("Puzzle #" + std::to_string(puzzle_choice) + " is already SOLVED!");
-                std::cout << "    Solution: " << puzzle->solution_hex << "\n";
-                std::cout << "\n";
-
-                if (Interactive::prompt_yes_no("Continue in testing mode?", true)) {
-                    Interactive::info_message("Testing mode - will verify against known solution.");
-                } else {
+                // T1-B polish: TUI yes/no for the testing-mode prompt.
+                // The cout warning was removed; the modal title +
+                // intro already surface the "is already SOLVED" fact.
+                const int testing_pick =
+                    ::collider::ui::tui::menu::yes_no_modal(
+                        "PUZZLE #" + std::to_string(puzzle_choice)
+                            + " IS ALREADY SOLVED",
+                        "Solution: " + puzzle->solution_hex + "\n\n"
+                        "Continue in testing mode? The solver will run "
+                        "as if the puzzle were unsolved and verify "
+                        "the recovered key matches the known solution. "
+                        "Useful for benchmarking or smoke-testing.",
+                        /*default_yes=*/true,
+                        "Continue in testing mode",
+                        "Back to main menu");
+                if (testing_pick != 1) {
                     args.go_back = true;
                     return args;
                 }
@@ -322,23 +339,42 @@ Arguments run_puzzle_interactive(Arguments base_args, double gpu_speed_mkeys) {
                 est_time = "~" + std::to_string((int)analysis.estimated_gpu_years) + " years";
             }
 
-            std::cout << "\n";
-            Interactive::display_puzzle_info(puzzle->number, puzzle->bits, has_pubkey,
-                                             puzzle->btc_reward, est_time);
-
             if (has_pubkey) {
                 args.puzzle_kangaroo = true;
-                std::cout << "\n";
-                Interactive::info_message("Auto-enabled Kangaroo algorithm (public key available)");
             }
 
-            std::cout << "\n";
-            if (!Interactive::prompt_yes_no("Start solving Puzzle #" + std::to_string(puzzle_choice) + "?", true)) {
+            // T1-B: TUI confirm in place of cout-based prompt. The
+            // display_puzzle_info cout block + "Auto-enabled Kangaroo"
+            // info_message were removed; the modal kv-rows surface
+            // the same info inside the alt-screen.
+            std::vector<std::pair<std::string, std::string>> std_kv = {
+                {"Puzzle", "#" + std::to_string(puzzle_choice)},
+                {"Bits", std::to_string(puzzle->bits)},
+                {"Reward", std::to_string(puzzle->btc_reward) + " BTC"},
+                {"Algorithm", has_pubkey ? "Kangaroo (pubkey known)"
+                                         : "BSGS"},
+                {"Estimated time", est_time},
+            };
+            if (puzzle->solved) {
+                std_kv.push_back({"Status", "SOLVED (testing mode)"});
+            }
+            const auto std_confirm =
+                ::collider::ui::tui::menu::confirm_config_modal(
+                    "PUZZLE #" + std::to_string(puzzle_choice) + " -- CONFIRM",
+                    "Standalone solver runs locally against the puzzle's "
+                    "full keyspace. Solution writes to puzzle_<N>.txt on "
+                    "success.",
+                    std_kv,
+                    "Start solver");
+            if (std_confirm ==
+                ::collider::ui::tui::menu::ConfirmResult::Back) {
                 args.go_back = true;
                 return args;
             }
         } else {
-            Interactive::error_message("Unknown puzzle number: " + std::to_string(puzzle_choice));
+            // Unknown puzzle: bounce back to main menu silently. The
+            // puzzle_number_modal validates 1..256 so this only fires
+            // on a database row that's missing for that number.
             args.go_back = true;
             return args;
         }
@@ -353,7 +389,6 @@ Arguments run_puzzle_interactive(Arguments base_args, double gpu_speed_mkeys) {
     // anyway lets a user who switches backends mid-development still
     // pick up the bloom, and makes the feature reachable through the
     // standard interactive entry path per docs/PRO.md.
-    std::cout << "\n";
     maybe_pick_opportunistic_bloom(args, "Standalone puzzle mode");
 #endif
 
@@ -367,49 +402,69 @@ Arguments run_brainwallet_interactive(Arguments base_args) {
     args.brainwallet_mode = true;
     args.pool_mode = false;  // Disable pool mode - brainwallet is mutually exclusive
 
-    Interactive::display_section("Brain Wallet Scanner Mode");
+    // No display_section here -- the section heading would dump cout
+    // before the first TUI modal. Modal title already identifies the
+    // mode for the operator.
 
     // Check if this is first run - need to set up wordlists
     BrainwalletConfig config;
     bool first_run = !BrainwalletSetup::is_setup_complete();
 
     if (first_run) {
-        std::cout << colors::BRIGHT_WHITE << "First-time setup detected!\n" << colors::RESET;
-        std::cout << "Before scanning, we need to set up your wordlists.\n\n";
-
-        if (Interactive::prompt_yes_no("Run the setup wizard now?", true)) {
-            config = BrainwalletSetup::run_wizard();
-
-            if (!config.setup_complete) {
-                Interactive::warning_message("Setup was not completed.");
-                args.go_back = true;
-                return args;
-            }
-        } else {
-            Interactive::info_message("You can run setup later with: ./collider --brainwallet-setup");
+        // T1-A polish: TUI yes/no in place of the cout first-run prompt.
+        const int pick = ::collider::ui::tui::menu::yes_no_modal(
+            "BRAIN WALLET -- FIRST-TIME SETUP",
+            "No wordlist + bloom configuration was found in "
+            "~/.thecollider/. Run the setup wizard to choose source "
+            "directories, build a combined wordlist, and register a "
+            "bloom filter. The wizard can also be re-run later with "
+            "`./collider --brainwallet-setup`.",
+            /*default_yes=*/true,
+            "Run setup wizard",
+            "Back to main menu");
+        if (pick != 1) {
+            args.go_back = true;
+            return args;
+        }
+        config = BrainwalletSetup::run_wizard();
+        if (!config.setup_complete) {
+            Interactive::warning_message("Setup was not completed.");
             args.go_back = true;
             return args;
         }
     } else {
-        // Load existing configuration
+        // T1-A polish: TUI reconfigure picker in place of the cout
+        // "Reconfigure wordlists? (y/N)" prompt. The picker shows the
+        // current wordlist + entry count + bloom inline so the
+        // operator's decision is informed at the same screen, and the
+        // overall flow stays inside the TUI alt-screen without
+        // flashing back to raw shell text.
         config = BrainwalletSetup::load_config();
-        BrainwalletSetup::show_config_summary(config);
-
-        // Offer to reconfigure
-        if (Interactive::prompt_yes_no("Reconfigure wordlists?", false)) {
+        const std::string entries_summary =
+            BrainwalletSetup::format_number(config.total_unique_lines) +
+            " passphrases (" + std::to_string(config.wordlist_dirs.size()) +
+            " sources)";
+        const int reconfig_pick =
+            ::collider::ui::tui::menu::brainwallet_reconfigure_modal(
+                config.processed_wordlist,
+                entries_summary,
+                config.bloom_file);
+        if (reconfig_pick == 0) {
+            args.go_back = true;
+            return args;
+        }
+        if (reconfig_pick == 2) {
             config = BrainwalletSetup::run_wizard();
         }
     }
 
-    // Set the wordlist from config
-    if (!config.processed_wordlist.empty() && std::filesystem::exists(config.processed_wordlist)) {
+    // Set the wordlist from config (silent -- the final confirm modal
+    // shows the resolved path in its kv-rows; no cout here).
+    if (!config.processed_wordlist.empty() &&
+        std::filesystem::exists(config.processed_wordlist)) {
         args.wordlist_file = config.processed_wordlist;
-        Interactive::status_message("Using wordlist: " + config.processed_wordlist +
-                                   " (" + BrainwalletSetup::format_number(config.total_unique_lines) + " entries)", true);
     }
 
-    // Check for bloom filter
-    std::cout << "\n";
     std::string default_bloom = "funded_addresses.blf";
 
     // Build search paths for UTXO and bloom files
@@ -484,86 +539,115 @@ Arguments run_brainwallet_interactive(Arguments base_args) {
     dedupe(found_blooms);
     dedupe(found_utxos);
 
-    // Check config first, then search results
+    // Check config first, then search results. Auto-detected paths
+    // are silent -- the final confirm modal renders them in kv-rows.
     if (!config.bloom_file.empty() && std::filesystem::exists(config.bloom_file)) {
         args.bloom_file = config.bloom_file;
-        Interactive::status_message("Using bloom filter: " + config.bloom_file, true);
     } else if (std::filesystem::exists(default_bloom)) {
         args.bloom_file = default_bloom;
-        Interactive::status_message("Found bloom filter: " + default_bloom, true);
     } else if (!found_blooms.empty()) {
-        // Found bloom filter(s) - let user choose
-        Interactive::status_message("Found " + std::to_string(found_blooms.size()) + " bloom filter(s):", true);
-        std::cout << "\n";
-
-        for (size_t i = 0; i < found_blooms.size(); i++) {
-            double size_mb = found_blooms[i].second / (1024.0 * 1024.0);
-            std::cout << "  [" << (i + 1) << "] " << found_blooms[i].first
-                      << " (" << std::fixed << std::setprecision(1) << size_mb << " MB)\n";
+        // T1-A polish: TUI picker for bloom filter discovery.
+        std::vector<std::string> labels;
+        labels.reserve(found_blooms.size() + 1);
+        for (const auto& [path, size] : found_blooms) {
+            double size_mb = size / (1024.0 * 1024.0);
+            std::ostringstream lbl;
+            lbl << path << "  (" << std::fixed << std::setprecision(1)
+                << size_mb << " MB)";
+            labels.push_back(lbl.str());
         }
-        std::cout << "  [" << (found_blooms.size() + 1) << "] Enter a different path\n";
-        std::cout << "\n";
-
-        int choice = Interactive::prompt_menu_choice(1, static_cast<int>(found_blooms.size() + 1));
-
-        if (choice >= 1 && choice <= static_cast<int>(found_blooms.size())) {
-            args.bloom_file = found_blooms[choice - 1].first;
+        labels.push_back("Enter a different path...");
+        const int pick = ::collider::ui::tui::menu::picker_modal(
+            "BLOOM FILTER -- AUTO-DETECTED",
+            "Multiple .blf files were found on disk. Pick one to use, "
+            "or supply a custom path on the next screen. The chosen "
+            "path is persisted to your brainwallet config so the next "
+            "launch starts on it automatically.",
+            labels);
+        if (pick == 0) {
+            args.go_back = true;
+            return args;
+        }
+        if (pick <= static_cast<int>(found_blooms.size())) {
+            args.bloom_file = found_blooms[pick - 1].first;
             config.bloom_file = args.bloom_file;
             BrainwalletSetup::save_config(config);
         } else {
-            std::string bloom_path = Interactive::prompt_path("Enter path to bloom filter (.blf)", true);
-            if (bloom_path.empty() || !std::filesystem::exists(bloom_path)) {
-                Interactive::warning_message("Invalid bloom filter path.");
+            auto entered = ::collider::ui::tui::menu::text_input_modal(
+                "BLOOM FILTER -- CUSTOM PATH",
+                "Enter the absolute path to a .blf bloom filter built "
+                "by build_bloom.exe (or any compatible tool). Path "
+                "must exist on disk; Esc to go back.",
+                "Path",
+                /*default_value=*/"",
+                /*must_be_existing_path=*/true);
+            if (!entered || entered->empty()) {
                 args.go_back = true;
                 return args;
             }
-            args.bloom_file = bloom_path;
-            config.bloom_file = bloom_path;
+            args.bloom_file = *entered;
+            config.bloom_file = *entered;
             BrainwalletSetup::save_config(config);
         }
     } else if (!found_utxos.empty()) {
-        // No bloom filter, but found UTXO dump(s) - offer to build
-        Interactive::warning_message("No bloom filter found, but UTXO dump(s) detected!");
-        std::cout << "\n";
-
-        std::cout << colors::BRIGHT_WHITE << "Found UTXO dump file(s):\n" << colors::RESET;
-        for (size_t i = 0; i < found_utxos.size(); i++) {
-            double size_mb = found_utxos[i].second / (1024.0 * 1024.0);
-            std::cout << "  [" << (i + 1) << "] " << found_utxos[i].first
-                      << " (" << std::fixed << std::setprecision(1) << size_mb << " MB)\n";
+        // T1-A polish: TUI picker for UTXO dump discovery + TUI
+        // confirm before kicking off the (potentially multi-minute)
+        // bloom build. Replaces the cout/cin menu chain.
+        std::vector<std::string> utxo_labels;
+        utxo_labels.reserve(found_utxos.size() + 1);
+        for (const auto& [path, size] : found_utxos) {
+            double size_mb = size / (1024.0 * 1024.0);
+            std::ostringstream lbl;
+            lbl << path << "  (" << std::fixed << std::setprecision(1)
+                << size_mb << " MB)";
+            utxo_labels.push_back(lbl.str());
         }
-        std::cout << "  [" << (found_utxos.size() + 1) << "] Enter a different path\n";
-        std::cout << "\n";
-
-        int choice = Interactive::prompt_menu_choice(1, static_cast<int>(found_utxos.size() + 1));
-
+        utxo_labels.push_back("Enter a different path...");
+        const int upick = ::collider::ui::tui::menu::picker_modal(
+            "UTXO DUMP -- AUTO-DETECTED",
+            "No bloom filter was found, but UTXO dump CSV file(s) "
+            "were. Pick one to build a bloom filter from, or supply a "
+            "custom path on the next screen. Building a bloom filter "
+            "can take a few minutes for a full UTXO set.",
+            utxo_labels);
+        if (upick == 0) {
+            args.go_back = true;
+            return args;
+        }
         std::string selected_utxo;
-        if (choice >= 1 && choice <= static_cast<int>(found_utxos.size())) {
-            selected_utxo = found_utxos[choice - 1].first;
+        if (upick <= static_cast<int>(found_utxos.size())) {
+            selected_utxo = found_utxos[upick - 1].first;
         } else {
-            selected_utxo = Interactive::prompt_path("Enter path to UTXO dump (.csv)", true);
-            if (selected_utxo.empty() || !std::filesystem::exists(selected_utxo)) {
-                Interactive::warning_message("Invalid UTXO dump path.");
+            auto entered = ::collider::ui::tui::menu::text_input_modal(
+                "UTXO DUMP -- CUSTOM PATH",
+                "Enter the absolute path to a UTXO dump .csv "
+                "(bitcoin-utxo-dump format). Path must exist on disk; "
+                "Esc to go back.",
+                "Path", "", /*must_be_existing_path=*/true);
+            if (!entered || entered->empty()) {
                 args.go_back = true;
                 return args;
             }
+            selected_utxo = *entered;
         }
 
-        // Build the bloom filter automatically
-        std::cout << "\n";
-        Interactive::display_section("Building Bloom Filter");
-
-        std::cout << "This will create a bloom filter from the UTXO dump.\n";
-        std::cout << "  Input:  " << selected_utxo << "\n";
-        std::cout << "  Output: " << default_bloom << "\n\n";
-
-        std::cout << colors::BRIGHT_WHITE << "Configuration:\n" << colors::RESET;
-        std::cout << "  Min balance:  0.001 BTC (100,000 satoshis)\n";
-        std::cout << "  FP rate:      0.001%\n";
-        std::cout << "  Expected:     ~50 million addresses\n\n";
-
-        if (!Interactive::prompt_yes_no("Build bloom filter now?", true)) {
-            Interactive::warning_message("Bloom filter setup cancelled.");
+        // Confirm-build modal.
+        std::vector<std::pair<std::string, std::string>> bcfg = {
+            {"UTXO dump", selected_utxo},
+            {"Output bloom", default_bloom},
+            {"Min balance", "0.001 BTC (100,000 sat)"},
+            {"FP rate", "0.001%"},
+            {"Expected entries", "~50 million addresses"},
+        };
+        const auto bconf = ::collider::ui::tui::menu::confirm_config_modal(
+            "BUILD BLOOM FILTER -- CONFIRM",
+            "Streams the UTXO CSV and inserts every address whose "
+            "balance is at least min-balance into the bloom. Build "
+            "time scales with UTXO set size; expect a few minutes "
+            "for a full mainnet dump.",
+            bcfg,
+            "Build");
+        if (bconf == ::collider::ui::tui::menu::ConfirmResult::Back) {
             args.go_back = true;
             return args;
         }
@@ -617,34 +701,36 @@ Arguments run_brainwallet_interactive(Arguments base_args) {
             return args;
         }
     } else {
-        // No bloom filter or UTXO dump found anywhere
-        Interactive::warning_message("No bloom filter or UTXO dump found!");
-        std::cout << "\n";
-        std::cout << "A bloom filter is required to check addresses efficiently.\n\n";
-
-        std::cout << colors::BRIGHT_WHITE << "Options:\n" << colors::RESET;
-        std::cout << "  [1] I have a UTXO dump file (will build bloom filter)\n";
-        std::cout << "  [2] I have a bloom filter at a custom path\n";
-        std::cout << "  [3] Show me how to get a UTXO dump\n\n";
-
-        std::cout << colors::CYAN << "Select option (1-3): " << colors::RESET;
-        std::string input = Interactive::read_line();
-
-        int choice = 0;
-        try { choice = std::stoi(input); } catch (...) { choice = 3; }
-
-        if (choice == 1) {
-            std::string utxo_path = Interactive::prompt_path("Enter path to UTXO dump (.csv)", true);
-            if (utxo_path.empty() || !std::filesystem::exists(utxo_path)) {
-                Interactive::warning_message("Invalid UTXO dump path.");
+        // T1-A polish: TUI 3-option picker for the no-bloom-found
+        // branch. Replaces the cout "Options: [1] [2] [3]" menu +
+        // read_line + nested prompts.
+        const int npick = ::collider::ui::tui::menu::picker_modal(
+            "BLOOM FILTER -- NOT FOUND",
+            "A bloom filter is required to check addresses against "
+            "the funded-set efficiently. Pick how to provide one. "
+            "Esc to go back to the main menu.",
+            {
+                "I have a UTXO dump file (will build a bloom)",
+                "I have a bloom filter at a custom path",
+                "Show me how to get a UTXO dump",
+            });
+        if (npick == 0) {
+            args.go_back = true;
+            return args;
+        }
+        if (npick == 1) {
+            auto utxo_entered =
+                ::collider::ui::tui::menu::text_input_modal(
+                    "UTXO DUMP -- PATH",
+                    "Enter the absolute path to a UTXO dump .csv "
+                    "(bitcoin-utxo-dump format).",
+                    "Path", "", /*must_be_existing_path=*/true);
+            if (!utxo_entered || utxo_entered->empty()) {
                 args.go_back = true;
                 return args;
             }
 
-            // Build bloom filter (same code as above)
-            std::cout << "\n";
-            Interactive::info_message("Building bloom filter...");
-
+            // Build bloom filter (same code as above).
             try {
                 ::collider::utxo::UTXOBloomBuilder::Config bloom_config;
                 bloom_config.target_fp_rate = 0.00001;
@@ -652,145 +738,315 @@ Arguments run_brainwallet_interactive(Arguments base_args) {
                 bloom_config.min_satoshis = 100000;
 
                 ::collider::utxo::UTXOBloomBuilder builder(bloom_config);
-                builder.process_csv(utxo_path);
+                builder.process_csv(*utxo_entered);
                 builder.save(default_bloom);
 
-                Interactive::status_message("Bloom filter built: " + default_bloom, true);
                 args.bloom_file = default_bloom;
                 config.bloom_file = default_bloom;
                 BrainwalletSetup::save_config(config);
             } catch (const std::exception& e) {
-                Interactive::error_message("Failed: " + std::string(e.what()));
+                // Fatal build failure: surface to operator.
+                std::cerr << "[!] Bloom build failed: " << e.what() << "\n";
                 args.go_back = true;
                 return args;
             }
-        } else if (choice == 2) {
-            std::string bloom_path = Interactive::prompt_path("Enter path to bloom filter (.blf)", true);
-            if (bloom_path.empty() || !std::filesystem::exists(bloom_path)) {
-                Interactive::warning_message("Invalid bloom filter path.");
+        } else if (npick == 2) {
+            auto bloom_entered =
+                ::collider::ui::tui::menu::text_input_modal(
+                    "BLOOM FILTER -- CUSTOM PATH",
+                    "Enter the absolute path to an existing .blf "
+                    "bloom filter.",
+                    "Path", "", /*must_be_existing_path=*/true);
+            if (!bloom_entered || bloom_entered->empty()) {
                 args.go_back = true;
                 return args;
             }
-            args.bloom_file = bloom_path;
-            config.bloom_file = bloom_path;
+            args.bloom_file = *bloom_entered;
+            config.bloom_file = *bloom_entered;
             BrainwalletSetup::save_config(config);
         } else {
-            std::cout << "\n";
-            Interactive::info_message("How to get a UTXO dump:");
-            std::cout << "\n";
-            std::cout << "  1. Download bitcoin-utxo-dump: github.com/in3rsha/bitcoin-utxo-dump\n";
-            std::cout << "  2. Run against your Bitcoin Core data directory\n";
-            std::cout << "  3. Place the resulting CSV file in this directory\n";
-            std::cout << "  4. Restart theCollider - it will auto-detect and build the bloom filter\n\n";
-            std::cout << "  Alternative: Download a pre-built UTXO dump from trusted sources.\n\n";
+            // "Show me how to get a UTXO dump" -- informational
+            // confirm_config_modal (no input needed; Back returns).
+            std::vector<std::pair<std::string, std::string>> kv = {
+                {"Step 1", "Download bitcoin-utxo-dump"},
+                {"   URL", "github.com/in3rsha/bitcoin-utxo-dump"},
+                {"Step 2", "Run against your Bitcoin Core data dir"},
+                {"Step 3", "Place the .csv next to this binary"},
+                {"Step 4", "Restart theCollider; auto-detect kicks in"},
+                {"Alt",    "Download a pre-built dump from trusted sources"},
+            };
+            ::collider::ui::tui::menu::confirm_config_modal(
+                "HOW TO GET A UTXO DUMP",
+                "theCollider's bloom filter is built from a Bitcoin "
+                "Core UTXO dump CSV. The steps below produce one. "
+                "After you have the CSV in place, restart and the "
+                "auto-detect path picks it up.",
+                kv,
+                "OK -- back to menu");
             args.go_back = true;
             return args;
         }
     }
 
-    // Validate we have what we need
-    std::cout << "\n";
+    // Validate we have what we need. Empty wordlist is a degenerate
+    // state (setup wizard never completed or its output was deleted);
+    // surface via a TUI yes/no instead of a cout warning.
     if (args.wordlist_file.empty()) {
-        Interactive::warning_message("No wordlist configured. Run setup wizard first.");
+        ::collider::ui::tui::menu::yes_no_modal(
+            "BRAIN WALLET -- NO WORDLIST",
+            "No wordlist is configured. Run `./collider --brainwallet"
+            "-setup` from the shell, or pick Reconfigure on the next "
+            "Brain Wallet entry. Esc to return to the main menu.",
+            /*default_yes=*/false,
+            "OK -- back to menu",
+            "OK -- back to menu");
         args.go_back = true;
         return args;
     }
 
-    // Check for saved state and offer auto-resume
+    // T1-A: TUI resume modal in place of the cout-based three-prompt
+    // chain. brainwallet_resume_modal() collapses the cut/cin chain
+    // (Resume? / Start fresh? / Clear saved state?) into one TUI
+    // screen with the saved-state summary visible at decision time.
     if (BrainWalletStateManager::has_saved_state()) {
         auto saved_state = BrainWalletStateManager::load_state();
         if (saved_state.valid) {
-            // Check if wordlist matches
-            bool wordlist_matches = BrainWalletStateManager::verify_wordlist(saved_state, args.wordlist_file);
-
-            Interactive::display_section("Resume Previous Session?");
-
-            std::cout << colors::BRIGHT_CYAN << "Found saved progress:\n" << colors::RESET;
-            std::cout << "  Session:      " << saved_state.session_id << "\n";
-            std::cout << "  Last saved:   " << saved_state.timestamp << "\n";
-            std::cout << "  Checked:      " << ::format_number_human(saved_state.total_checked) << " passphrases\n";
-            std::cout << "  Progress:     Word " << ::format_number(saved_state.current_word_idx)
-                      << " / " << ::format_number(saved_state.wordlist_size) << "\n";
-            std::cout << "  Phase:        " << saved_state.current_phase
-                      << " (iteration " << saved_state.phase_iteration << ")\n";
-            if (saved_state.hits_found > 0) {
-                std::cout << colors::BRIGHT_GREEN << "  Hits found:   " << saved_state.hits_found << colors::RESET << "\n";
+            const bool wordlist_matches =
+                BrainWalletStateManager::verify_wordlist(
+                    saved_state, args.wordlist_file);
+            const std::string progress = "Word "
+                + ::format_number(saved_state.current_word_idx)
+                + " / "
+                + ::format_number(saved_state.wordlist_size);
+            const std::string phase = saved_state.current_phase
+                + " (iteration "
+                + std::to_string(saved_state.phase_iteration) + ")";
+            const int resume_pick =
+                ::collider::ui::tui::menu::brainwallet_resume_modal(
+                    saved_state.session_id,
+                    saved_state.timestamp,
+                    ::format_number_human(saved_state.total_checked),
+                    progress,
+                    phase,
+                    saved_state.hits_found,
+                    wordlist_matches);
+            if (resume_pick == 1) {  // Resume
+                args.resume = true;
+            } else if (resume_pick == 2) {  // Discard + fresh
+                BrainWalletStateManager::clear_state();
+                args.resume = false;
+            } else {  // Back to main menu
+                args.go_back = true;
+                return args;
             }
-            std::cout << "\n";
-
-            if (!wordlist_matches) {
-                Interactive::warning_message("Wordlist has changed since last session!");
-                std::cout << "  Previous: " << saved_state.wordlist_path << "\n";
-                std::cout << "  Current:  " << args.wordlist_file << "\n\n";
-
-                if (Interactive::prompt_yes_no("Start fresh with new wordlist?", true)) {
-                    BrainWalletStateManager::clear_state();
-                    Interactive::info_message("Previous state cleared. Starting fresh.");
-                    args.resume = false;
-                } else {
-                    Interactive::info_message("Please use the same wordlist to resume, or start fresh.");
-                    args.go_back = true;
-                    return args;
-                }
-            } else {
-                // Wordlist matches - offer to resume
-                if (Interactive::prompt_yes_no("Resume from saved progress?", true)) {
-                    args.resume = true;
-                    Interactive::status_message("Will resume from saved state", true);
-                } else {
-                    if (Interactive::prompt_yes_no("Clear saved state and start fresh?", false)) {
-                        BrainWalletStateManager::clear_state();
-                        Interactive::info_message("Previous state cleared.");
-                    }
-                    args.resume = false;
-                }
-            }
-            std::cout << "\n";
         }
     }
 
-    // Pro multi-address derivation: scan each candidate pubkey against
-    // all three H160 paths (compressed P2PKH / P2WPKH, uncompressed
-    // P2PKH, P2SH-P2WPKH / BIP-49) per docs/PRO.md. The CLI surface for
-    // this is --brainwallet-v2; expose it in the interactive flow so the
-    // capability is reachable without reading the CLI docs. Default ON
-    // to match docs/PRO.md's "multi-address derivation" Pro promise; an
-    // operator who specifically wants single-address can opt out.
-    Interactive::display_section("Address-Type Coverage");
-    std::cout << "Pro probes each candidate pubkey against three Bitcoin H160 paths:\n"
-              << "  - Compressed P2PKH / P2WPKH (BIP-84)\n"
-              << "  - Uncompressed P2PKH\n"
-              << "  - P2SH-P2WPKH (BIP-49)\n\n"
-              << "Multi-address mode adds two extra per-pubkey hashes for the\n"
-              << "uncompressed-P2PKH and P2SH-P2WPKH paths inside the fused kernel.\n\n";
-    if (Interactive::prompt_yes_no(
-            "Enable multi-address derivation (recommended)?", true)) {
-        args.brainwallet_v2_mode = true;
-        Interactive::status_message(
-            "Multi-address derivation enabled (--brainwallet-v2)", true);
-    } else {
-        args.brainwallet_v2_mode = false;
-        Interactive::info_message(
-            "Single-address mode (compressed P2PKH / P2WPKH only).");
+    // T1-A polish: TUI yes/no for multi-address derivation in place of
+    // the cout "Enable multi-address derivation? (Y/n)" prompt that
+    // used to flash the operator back to raw shell text in the middle
+    // of an otherwise-TUI flow.
+    {
+        const int pick = ::collider::ui::tui::menu::yes_no_modal(
+            "BRAIN WALLET -- ADDRESS COVERAGE",
+            "Pro probes each candidate pubkey against three Bitcoin "
+            "H160 paths: compressed P2PKH / P2WPKH (BIP-84), "
+            "uncompressed P2PKH, and P2SH-P2WPKH (BIP-49). "
+            "Multi-address mode adds two extra per-pubkey hashes for "
+            "the uncompressed-P2PKH and P2SH-P2WPKH paths inside the "
+            "fused kernel. Recommended unless throughput is the only "
+            "concern.",
+            /*default_yes=*/true,
+            "Enable multi-address (recommended)",
+            "Single-address only (compressed P2PKH / P2WPKH)");
+        if (pick == 0) {
+            args.go_back = true;
+            return args;
+        }
+        args.brainwallet_v2_mode = (pick == 1);
     }
-    std::cout << "\n";
 
-    Interactive::display_section("Ready to Scan");
-
-    std::cout << colors::BRIGHT_WHITE << "Configuration Summary:\n" << colors::RESET;
-    std::cout << "  Wordlist:     " << ::normalize_path(args.wordlist_file) << "\n";
-    std::cout << "  Bloom filter: " << args.bloom_file << "\n";
-    std::cout << "  Entries:      " << BrainwalletSetup::format_number(config.total_unique_lines) << " passphrases\n";
-    std::cout << "  Address mode: " << (args.brainwallet_v2_mode
-                                            ? "multi (3 H160 paths)"
-                                            : "single (compressed P2PKH)") << "\n";
-    std::cout << "\n";
-
-    if (!Interactive::prompt_yes_no("Start brain wallet scan?", true)) {
+    // T1-A: TUI confirm modal in place of cout-based summary + yes/no.
+    // Same kv-rows pattern the BIP scan flow uses so the visual style is
+    // consistent across modes. The cout::display_section line above
+    // ("Address-Type Coverage") is the last raw shell prompt the
+    // operator sees before the in-session TUI takes over; everything
+    // post-confirmation drops straight into the FTXUI scan view.
+    std::vector<std::pair<std::string, std::string>> bw_kv = {
+        {"Wordlist", ::normalize_path(args.wordlist_file)},
+        {"Bloom filter", args.bloom_file},
+        {"Entries",
+         BrainwalletSetup::format_number(config.total_unique_lines)
+             + " passphrases"},
+        {"Address mode",
+         args.brainwallet_v2_mode ? "multi (3 H160 paths)"
+                                  : "single (compressed P2PKH)"},
+    };
+    if (args.resume) {
+        bw_kv.push_back({"Mode", "Resume from saved state"});
+    }
+    const auto bw_choice = ::collider::ui::tui::menu::confirm_config_modal(
+        "BRAIN WALLET SCAN -- CONFIRM",
+        "Iterates every passphrase in the wordlist, derives the brain "
+        "wallet key, computes hash160 for each enabled address path, "
+        "and probes the bloom filter for funded addresses. Hits land "
+        "in hits/<timestamp>.json next to the binary.",
+        bw_kv,
+        "Start scan");
+    if (bw_choice == ::collider::ui::tui::menu::ConfirmResult::Back) {
         args.go_back = true;
         return args;
     }
+    return args;
+}
 
+// BIP-39 / BIP-32 mnemonic scanner interactive menu. Walks the
+// operator through picking a candidate-phrase file + the UTXO bloom,
+// then routes to run_bip_scan_mode. Files are validated for existence
+// before we commit; the scanner re-validates per spec (BIP-39
+// checksum) line by line so a typoed phrase doesn't block the run.
+Arguments run_bip_scan_interactive(Arguments base_args) {
+    using namespace ::collider::ui;
+    Arguments args = base_args;
+    args.bip_scan_mode    = true;
+    args.brainwallet_mode = false;
+    args.pool_mode        = false;
+    args.puzzle_mode      = false;
+
+    // User feedback 2026-05-24: BIP scan was wordlist-driven by default
+    // which mismatches the "scan random mnemonics forever" mental model
+    // most operators have. Surface the choice up-front via a TUI modal:
+    // combinatorial (default) vs wordlist-driven. The combinatorial
+    // backend (run_combinatorial_scan) iterates BIP-39 entropy space
+    // exhaustively, generating valid mnemonics by construction (no
+    // re-rolls), and is checkpoint-resumable across restarts.
+    const int source_pick =
+        ::collider::ui::tui::menu::bip_scan_source_picker_modal();
+    if (source_pick == 0) {
+        args.go_back = true;  // Back to main menu
+        return args;
+    }
+    if (source_pick == 1) {
+        // Combinatorial / random forever-loop mode. Skip the wordlist
+        // prompt entirely; only need the bloom filter. Default to
+        // 12 words (most common BIP-39 length, easiest to surface
+        // progress on the dashboard); operator can pin a different
+        // width via --bip-words on the CLI.
+        args.bip_combinatorial = true;
+    }
+
+    // Source picker already showed the user the mode they picked;
+    // the upcoming confirm modal renders the full config table.
+    // No pre-confirm cout text -- it dumps to PowerShell and breaks
+    // the all-TUI flow.
+
+    // Auto-detect phrases corpus, bloom filter. The scanner runtime
+    // does its own auto-discovery for the BIP-39 wordlist + bloom
+    // when called from the CLI; here we mirror the same logic so the
+    // interactive flow ASKS only when auto-discovery fails. The
+    // wordlist auto-detect is skipped in combinatorial mode where no
+    // file is needed.
+    if (!args.bip_combinatorial && args.bip_scan_wordlist.empty()) {
+        args.bip_scan_wordlist =
+            ::collider::runtime::resolve_candidate_phrases();
+    }
+    if (args.bloom_file.empty()) {
+        args.bloom_file = ::collider::runtime::resolve_bloom_filter();
+    }
+    if (args.bloom_tight_file.empty()) {
+        // Mirror the brainwallet path: ~/.collider/seen_tight.blf if
+        // present, otherwise skip silently (primary bloom alone).
+        std::string default_tight =
+            (collider::paths::collider_home() / "seen_tight.blf").string();
+        if (std::filesystem::exists(default_tight)) {
+            args.bloom_tight_file = default_tight;
+        }
+    }
+
+    if (!args.bip_combinatorial) {
+        if (args.bip_scan_wordlist.empty()) {
+            // T1-A polish: TUI text-input modal in place of the cout
+            // "Path to phrases file: " prompt.
+            const std::string default_hint =
+                (collider::paths::collider_home() / "wordlists" /
+                 "bip_phrases.txt").string();
+            auto entered = ::collider::ui::tui::menu::text_input_modal(
+                "BIP-39 PHRASES -- PATH",
+                "No candidate phrases file was auto-detected. Provide "
+                "the absolute path to a text file with one BIP-39 "
+                "mnemonic phrase per line (whitespace-separated "
+                "words). A typical drop location is " + default_hint +
+                ".",
+                "Path", "", /*must_be_existing_path=*/true);
+            if (!entered || entered->empty()) {
+                args.go_back = true;
+                return args;
+            }
+            args.bip_scan_wordlist = *entered;
+        }
+        // Auto-detected case: silent. Confirm modal kv-rows show the
+        // resolved path so the operator sees what's being used.
+    }
+
+    if (args.bloom_file.empty()) {
+        // T1-A polish: TUI text-input modal for the bloom-filter path.
+        const std::string default_hint =
+            (collider::paths::collider_home() / "funded_addresses.blf").string();
+        auto entered = ::collider::ui::tui::menu::text_input_modal(
+            "BIP-39 SCAN -- BLOOM FILTER PATH",
+            "No bloom .blf was auto-detected. Provide the absolute "
+            "path to an existing .blf built by build_bloom. A typical "
+            "drop location is " + default_hint + ".",
+            "Path", "", /*must_be_existing_path=*/true);
+        if (!entered || entered->empty()) {
+            args.go_back = true;
+            return args;
+        }
+        args.bloom_file = *entered;
+    }
+    // Auto-detected bloom + tight bloom: silent. Confirm modal kv-rows
+    // show the resolved paths so the operator sees what's being used
+    // without a cout drop-out before the modal.
+
+    // TR-1-full: replace cout summary + Y/N prompt with a TUI confirm
+    // modal that renders the same key/value table inside an alt-screen
+    // bordered panel + Start/Back picker. Keeps the operator inside a
+    // TUI context all the way from the main menu through to the in-
+    // session brainwallet TUI.
+    std::vector<std::pair<std::string, std::string>> kv;
+    if (args.bip_combinatorial) {
+        kv.push_back({"Mode", "Combinatorial (random / forever)"});
+        kv.push_back({"Word count",
+                      std::to_string(args.bip_combinatorial_word_count)});
+        kv.push_back({"Bloom filter", args.bloom_file});
+    } else {
+        kv.push_back({"Mode", "Wordlist-driven"});
+        kv.push_back({"Phrases file", args.bip_scan_wordlist});
+        kv.push_back({"Bloom filter", args.bloom_file});
+    }
+    if (!args.bloom_tight_file.empty()) {
+        kv.push_back({"Tight bloom", args.bloom_tight_file});
+    }
+    const std::string confirm_intro = args.bip_combinatorial
+        ? "Walks every BIP-39 entropy value of the chosen width. Each "
+          "entropy maps to exactly one valid mnemonic by construction "
+          "so there are no wasted re-rolls. The space is 2^128 (12 "
+          "words) and is not physically exhaustible -- progress "
+          "checkpoints to ~/.collider/bip_combinatorial.json. Stop with "
+          "q at any time. Hits land in bip_hits.txt."
+        : "Iterates BIP-39 mnemonic candidates from the phrases file, "
+          "derives every historical and modern derivation path, and "
+          "probes ~190 addresses per phrase against the bloom filter. "
+          "Hits land in bip_hits.txt next to the binary.";
+    const auto choice = ::collider::ui::tui::menu::confirm_config_modal(
+        "BIP-39 / BIP-32 SCAN -- CONFIRM",
+        confirm_intro,
+        kv,
+        "Start scan");
+    if (choice == ::collider::ui::tui::menu::ConfirmResult::Back) {
+        args.go_back = true;
+        return args;
+    }
     return args;
 }
 #endif  // COLLIDER_PRO
@@ -803,8 +1059,12 @@ Arguments run_interactive_mode(Arguments base_args, double gpu_speed_mkeys) {
         // Reset navigation flags
         args.go_back = false;
 
-        // Display main menu
-        MainMenuChoice choice = Interactive::display_main_menu(collider::kVersion);
+        // TR-1: TUI-native main menu. Replaces the historical cout
+        // banner-then-numbered-list with a fullscreen FTXUI picker so
+        // the operator never sees the "type a number then Enter"
+        // shell-prompt feel before the in-session TUI takes over.
+        MainMenuChoice choice = ::collider::ui::tui::menu::run_main_menu(
+            collider::kVersion);
 
         switch (choice) {
             case MainMenuChoice::PUZZLE_MODE: {
@@ -826,6 +1086,20 @@ Arguments run_interactive_mode(Arguments base_args, double gpu_speed_mkeys) {
                 std::cout << "\n[PRO] Brain wallet scanning requires theCollider Pro.\n"
                           << "      Purchase at: https://collisionprotocol.com/pro\n\n";
                 continue;  // Return to main menu
+#endif
+            }
+
+            case MainMenuChoice::BIP_SCAN_MODE: {
+#ifdef COLLIDER_PRO
+                args = run_bip_scan_interactive(args);
+                if (args.go_back) {
+                    continue;  // Return to main menu
+                }
+                return args;
+#else
+                std::cout << "\n[PRO] BIP-39/32 mnemonic scanning requires theCollider Pro.\n"
+                          << "      Purchase at: https://collisionprotocol.com/pro\n\n";
+                continue;
 #endif
             }
 

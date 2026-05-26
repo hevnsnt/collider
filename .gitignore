@@ -163,3 +163,13 @@ build_runner_only.bat
 # review reruns.
 scripts/tier*_*.bat
 scripts/tier*_*_*.bat
+
+# Compute-sanitizer artifacts. scripts/run_compute_sanitizer.bat writes
+# both a text report (stdout + stderr capture) and a binary trace file
+# alongside the build. They can hit hundreds of MB on a real run; never
+# belong in git. Glob covers both .txt and .bin under any cwd.
+sanitizer_report.*
+build_test_pro.bat
+build_ctest_pro.bat
+ctest_log.txt
+build_log.txt

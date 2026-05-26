@@ -195,5 +195,51 @@ inline std::optional<std::array<uint8_t, 20>> decode_p2wpkh(
     return out;
 }
 
+/**
+ * Encode a 20-byte hash160 as a witness-version-0 P2WPKH bech32 address
+ * (BIP-173). Mirrors the Python `encode_p2wpkh_address` used by the
+ * collision-protocol wire-v4 server-side verifier so the C++ client and
+ * Python server agree on the exact bech32 string for the same pubkey.
+ *
+ * Default HRP "bc" (mainnet). Testnet callers pass hrp="tb".
+ *
+ * Returns std::nullopt only if convert_bits fails, which is unreachable
+ * for a 20-byte input but kept for symmetry with the decoder.
+ */
+inline std::optional<std::string> encode_p2wpkh(
+    const std::array<uint8_t, 20>& h160,
+    const std::string& hrp = "bc")
+{
+    // 1. Convert 20 8-bit bytes to 5-bit groups (32 groups, padded).
+    std::vector<uint8_t> in(h160.begin(), h160.end());
+    std::vector<uint8_t> data5;
+    if (!convert_bits(data5, in, 8, 5, true)) return std::nullopt;
+
+    // 2. Prepend witness version 0.
+    std::vector<uint8_t> payload;
+    payload.reserve(1 + data5.size() + 6);
+    payload.push_back(0);
+    payload.insert(payload.end(), data5.begin(), data5.end());
+
+    // 3. Compute the 6-symbol checksum over hrp_expand(hrp) || payload || 6 zeros.
+    std::vector<uint8_t> values = hrp_expand(hrp);
+    values.insert(values.end(), payload.begin(), payload.end());
+    values.insert(values.end(), 6, 0);
+    uint32_t polymod_val = polymod(values) ^ BECH32_CONST;
+    for (int i = 0; i < 6; ++i) {
+        payload.push_back(static_cast<uint8_t>((polymod_val >> (5 * (5 - i))) & 31));
+    }
+
+    // 4. Assemble: hrp || '1' || charset-mapped payload.
+    std::string out;
+    out.reserve(hrp.size() + 1 + payload.size());
+    out.append(hrp);
+    out.push_back('1');
+    for (uint8_t v : payload) {
+        out.push_back(CHARSET[v]);
+    }
+    return out;
+}
+
 }  // namespace bech32
 }  // namespace collider

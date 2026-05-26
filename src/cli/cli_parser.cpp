@@ -210,6 +210,126 @@ int apply_batch_size(int& i, int argc, char* argv[], Arguments& args,
     return 0;
 }
 
+// v1.5.x: kangaroo count override (K). Positive int, no upper bound at
+// parse time (consumers clamp per-backend if needed). 0 / negative is
+// rejected so an accidental --kangaroos 0 doesn't silently fall back to
+// the default (which would mask a typo).
+int apply_kangaroos(int& i, int argc, char* argv[], Arguments& args,
+                    CLIFlags& cli, std::string& err_msg) {
+    const char* v = take_value(i, argc, argv, "--kangaroos", err_msg);
+    if (!v) return -1;
+    try {
+        int n = std::stoi(v);
+        if (n <= 0) {
+            err_msg = "[!] --kangaroos: must be a positive integer; "
+                      "got '" + std::string(v) + "'\n";
+            return -1;
+        }
+        args.num_kangaroos = n;
+        cli.num_kangaroos_set = true;
+        return 0;
+    } catch (const std::exception&) {
+        err_msg = "[!] --kangaroos: failed to parse '" +
+                  std::string(v) + "' as an integer\n";
+        return -1;
+    }
+}
+
+// v1.5.x: runtime kangaroo backend selection. Accepts cpu / cuda / metal
+// case-insensitively. The actual parse-into-BackendKind happens at the
+// consumption site (pool_solver, puzzle_solver_kangaroo) so this file
+// doesn't have to include core/kangaroo_backend.hpp (which pulls the
+// pool client header chain).
+int apply_backend(int& i, int argc, char* argv[], Arguments& args,
+                  CLIFlags& cli, std::string& err_msg) {
+    const char* v = take_value(i, argc, argv, "--backend", err_msg);
+    if (!v) return -1;
+    std::string label = v;
+    // Lowercase for the equality check below; the consumer also
+    // case-folds via parse_backend_kind so this is belt + suspenders.
+    std::string lower;
+    lower.reserve(label.size());
+    for (char c : label) {
+        lower.push_back(static_cast<char>(
+            std::tolower(static_cast<unsigned char>(c))));
+    }
+    if (lower != "cpu" && lower != "cuda" && lower != "metal") {
+        err_msg = "[!] --backend: unknown value '" + label +
+                  "'. Expected one of: cpu, cuda, metal.\n";
+        return -1;
+    }
+    args.backend_kind = lower;
+    cli.backend_kind_set = true;
+    return 0;
+}
+
+int apply_solver(int& i, int argc, char* argv[], Arguments& args,
+                 CLIFlags& cli, std::string& err_msg) {
+    const char* v = take_value(i, argc, argv, "--solver", err_msg);
+    if (!v) return -1;
+    std::string label = v;
+    std::string lower;
+    lower.reserve(label.size());
+    for (char c : label) {
+        lower.push_back(static_cast<char>(
+            std::tolower(static_cast<unsigned char>(c))));
+    }
+    if (lower != "kangaroo" && lower != "bsgs") {
+        err_msg = "[!] --solver: unknown value '" + label +
+                  "'. Expected one of: kangaroo, bsgs.\n";
+        return -1;
+    }
+    args.solver = (lower == "kangaroo") ? std::string{} : lower;
+    cli.solver_set = true;
+    return 0;
+}
+
+int apply_bip_scan(int&, int, char* [], Arguments& args, CLIFlags&,
+                   std::string&) {
+    args.bip_scan_mode = true;
+    return 0;
+}
+
+int apply_bip_scan_wordlist(int& i, int argc, char* argv[], Arguments& args,
+                            CLIFlags&, std::string& err_msg) {
+    const char* v = take_value(i, argc, argv, "--bip-scan-wordlist", err_msg);
+    if (!v) return -1;
+    args.bip_scan_wordlist = v;
+    return 0;
+}
+
+// v1.5.0: enable exhaustive BIP-39 entropy-space enumeration. Implies
+// --bip-scan; ignores --bip-scan-wordlist if both are set.
+int apply_bip_combinatorial(int&, int, char* [], Arguments& args,
+                            CLIFlags&, std::string&) {
+    args.bip_scan_mode = true;
+    args.bip_combinatorial = true;
+    return 0;
+}
+
+int apply_bip_no_gpu(int&, int, char* [], Arguments& args,
+                     CLIFlags&, std::string&) {
+    args.bip_no_gpu = true;
+    return 0;
+}
+
+int apply_bip_combinatorial_words(int& i, int argc, char* argv[],
+                                  Arguments& args, CLIFlags&,
+                                  std::string& err_msg) {
+    const char* v =
+        take_value(i, argc, argv, "--bip-combinatorial-words", err_msg);
+    if (!v) return -1;
+    char* end = nullptr;
+    const long n = std::strtol(v, &end, 10);
+    if (!end || *end != '\0' ||
+        (n != 12 && n != 15 && n != 18 && n != 21 && n != 24)) {
+        err_msg = "--bip-combinatorial-words expects one of 12/15/18/21/24";
+        return -1;
+    }
+    args.bip_combinatorial_word_count = static_cast<int>(n);
+    return 0;
+}
+
 int apply_benchmark(int&, int, char* [], Arguments& args, CLIFlags&,
                     std::string&) {
     args.benchmark = true;
@@ -696,8 +816,59 @@ int apply_worker(int& i, int argc, char* argv[], Arguments& args,
                  CLIFlags& cli, std::string& err_msg) {
     const char* v = take_value(i, argc, argv, "--worker", err_msg);
     if (!v) return -1;
-    args.pool_worker = v;
+    // Pentest CLIENT-LIE-3 (Info) + CLIENT-CHEAT-2 (defense-in-depth)
+    // worker-name format check (2026-05-23 deep audit). Mirrors the
+    // server-side strict validator added under SRV-LIE-14. A typo'd
+    // BTC address permanently misroutes payouts; refusing at parse
+    // time saves the operator from a silent payout-to-the-wrong-place
+    // surprise. Accept [A-Za-z0-9_.-]{1,64}; escape via
+    // --worker-unsafe-allow-any for tests.
+    std::string name = v;
+    bool unsafe = false;
+    for (int j = 1; j < argc; ++j) {
+        if (std::string(argv[j]) == "--worker-unsafe-allow-any") {
+            unsafe = true;
+            break;
+        }
+    }
+    if (!unsafe) {
+        if (name.empty() || name.size() > 64) {
+            err_msg = "--worker must be 1..64 characters";
+            return -1;
+        }
+        for (char c : name) {
+            const bool ok =
+                (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                (c >= '0' && c <= '9') ||
+                c == '_' || c == '.' || c == '-';
+            if (!ok) {
+                err_msg =
+                    "--worker contains invalid character; allowed "
+                    "[A-Za-z0-9_.-] only (use --worker-unsafe-allow-any "
+                    "for tests)";
+                return -1;
+            }
+        }
+    }
+    args.pool_worker = std::move(name);
     cli.pool_worker_set = true;
+    return 0;
+}
+
+int apply_worker_key(int& i, int argc, char* argv[], Arguments& args,
+                     CLIFlags& cli, std::string& err_msg) {
+    const char* v = take_value(i, argc, argv, "--worker-key", err_msg);
+    if (!v) return -1;
+    std::string path = v;
+    // Existence + readability is verified at pool startup, not here,
+    // so that --worker-key in a config.yml that's loaded long before
+    // any pool work doesn't fail dry-runs. We only do shape checks
+    // (non-empty path) at parse time.
+    if (path.empty()) {
+        err_msg = "--worker-key path must be non-empty";
+        return -1;
+    }
+    args.pool_worker_key_file = std::move(path);
     return 0;
 }
 
@@ -818,6 +989,15 @@ constexpr FlagSpec kFlagsRaw[] = {
     // GPU
     {"--gpus",                  "-g", apply_gpus,                  "gpu"},
     {"--batch-size",            nullptr, apply_batch_size,         "gpu"},
+    {"--backend",               nullptr, apply_backend,            "gpu"},
+    {"--solver",                nullptr, apply_solver,             "puzzle"},
+    {"--bip-scan",              nullptr, apply_bip_scan,           "puzzle"},
+    {"--bip-scan-wordlist",     nullptr, apply_bip_scan_wordlist,  "puzzle"},
+    {"--bip-combinatorial",     nullptr, apply_bip_combinatorial,  "puzzle"},
+    {"--no-bip-gpu",            nullptr, apply_bip_no_gpu,         "puzzle"},
+    {"--bip-combinatorial-words", nullptr,
+        apply_bip_combinatorial_words, "puzzle"},
+    {"--kangaroos",             nullptr, apply_kangaroos,          "gpu"},
 
     // Benchmark
     {"--benchmark",             nullptr, apply_benchmark,          "benchmark"},
@@ -873,6 +1053,7 @@ constexpr FlagSpec kFlagsRaw[] = {
     {"--pool-password",         nullptr, apply_pool_password,      "pool"},
     {"--pool-password-file",    nullptr, apply_pool_password_file, "pool"},
     {"--pool-api-key",          nullptr, apply_pool_api_key,       "pool"},
+    {"--worker-key",            nullptr, apply_worker_key,         "pool"},
 
     // TUI
     {"--no-tui",                nullptr, apply_no_tui,             "tui"},
@@ -1048,6 +1229,16 @@ GPU Options:
                               count when running --brainwallet; otherwise
                               4000000). Override only when GPU memory is
                               constrained.
+  --backend <kind>            Kangaroo backend: cpu | cuda | metal (default
+                              is the most-capable available in this build:
+                              cuda on Windows/Linux + NVIDIA, metal on
+                              macOS, cpu as the portable fallback).
+  --kangaroos <N>             Number of kangaroos (K) per GPU. 0 / unset =
+                              backend default (CPU: thread-driven, MultiGPU:
+                              262144, RCKangaroo: kernel-grid-driven so
+                              this flag is informational there). Higher K
+                              = more VRAM (linear) and faster DP rate up to
+                              GPU saturation.
 
 Output Options:
   --verbose, -v               Verbose output.

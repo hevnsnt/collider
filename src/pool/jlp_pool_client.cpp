@@ -7,9 +7,9 @@
 #include "jlp_pool_client.hpp"
 #include "jlp_wire_generated.hpp"   // PROTOCOL_VERSION constant
 #include "stats_sanitize.hpp"       // sanitize_stats_rsp_floats
+#include "../core/worker_identity.hpp"  // B1 wire-v4 signed AUTH
 #include "../core/byte_codec.hpp"
-#include "../core/paths.hpp"        // collider_home() for recovered_keys output
-#include "../core/secure_write.hpp" // owner-only open for recovered_keys/*.json
+#include "../core/secure_write.hpp" // secure_open_ofstream for DP backlog file
 #include "../core/session_log.hpp"  // milestone() / update_session_state() for
                                     // pool connect/auth/work/dp events.
 #include <cmath>                    // std::isfinite for STATS_RSP
@@ -34,6 +34,16 @@
 
 #ifdef COLLIDER_HAS_OPENSSL
 #include <openssl/x509v3.h>
+#endif
+
+// Pentest CLIENT-LIE-1: platform-native CSPRNG for AUTH nonce.
+#if defined(_WIN32)
+#  include <bcrypt.h>
+#  pragma comment(lib, "bcrypt.lib")
+#elif defined(__linux__)
+#  include <sys/random.h>
+#elif defined(__APPLE__)
+#  include <stdlib.h>      // arc4random_buf
 #endif
 
 // Windows TLS verification requires bridging
@@ -64,17 +74,8 @@ namespace pool {
 
 namespace {
 
-// Hex-encode 32 bytes into a 64-char string (lowercase, no separators).
-std::string hex32(const uint8_t* p) {
-    static const char* digits = "0123456789abcdef";
-    std::string out;
-    out.resize(64);
-    for (int i = 0; i < 32; ++i) {
-        out[2 * i]     = digits[(p[i] >> 4) & 0xF];
-        out[2 * i + 1] = digits[p[i]        & 0xF];
-    }
-    return out;
-}
+// v1.5: the hex32() helper that formatted a 32-byte private key for the
+// recovered_keys/*.json file is gone together with the file itself.
 
 // Atomic file write: write into a sibling tempfile, fsync (POSIX best
 // effort), then rename. On Windows std::filesystem::rename overwrites
@@ -84,13 +85,12 @@ std::string hex32(const uint8_t* p) {
 // SecureWriteOnFailure::FailHard. Owner-only mode 0600 on POSIX / owner-
 // only DACL on Windows. The rename preserves the mode of the source, so
 // the destination ends up owner-only as well. This is the path used for
-// recovered_keys/*.json which contains plaintext Bitcoin private key
-// bytes -- a world-readable file here would be the worst-stakes leak
-// in the entire binary, so FailHard refuses to create the tmp file at
-// all if the owner-only ACL cannot be constructed. atomic_write returns
-// false on that path and the caller logs the recovery failure; the key
-// is still in memory (subsequent recovery attempts can retry) and no
-// downgraded file is left on disk.
+// the DP backlog file persist_dp_queue_to_disk() writes during shutdown
+// (and previously for recovered_keys/*.json; that surface was deleted
+// in v1.5 since the worker no longer handles private keys). FailHard
+// refuses to create the tmp file at all if the owner-only ACL cannot
+// be constructed; atomic_write returns false on that path and the
+// caller logs the failure.
 bool atomic_write(const std::filesystem::path& path,
                   const std::string& content) {
     namespace fs = std::filesystem;
@@ -532,8 +532,6 @@ JLPPoolClient::JLPPoolClient()
     , connected_(false)
     , running_(false)
     , last_receive_was_timeout_(false)
-    , gpu_count_(1)
-    , speed_(0)
 {
     init_sockets();
     memset(&stats_, 0, sizeof(stats_));
@@ -785,22 +783,11 @@ void JLPPoolClient::disconnect() {
         }
     }
 
-    // Step 6b: stop and join any solution-upload retry threads. These hold
-    // `this` captures and call send_message() under ssl_write_mutex_, which
-    // touches ssl_; they MUST be joined before Step 7 frees ssl_. We do this
-    // after closesocket() so any in-flight send_message returns promptly.
-    // Move the vector out under the lock so we drop the mutex before
-    // joining the threads (RetryThread destructors block on join, and the
-    // lambda may briefly need the RetryThread cv_mutex).
-    std::vector<std::unique_ptr<RetryThread>> retries_to_join;
-    {
-        std::lock_guard<std::mutex> guard(retry_threads_mutex_);
-        retries_to_join.swap(retry_threads_);
-    }
-    // Signal all threads to stop (wakes the interruptible backoff sleep),
-    // then clear so RetryThread destructors join each thread.
-    for (auto& rt : retries_to_join) { rt->request_stop(); }
-    retries_to_join.clear();
+    // v1.5: the "Step 6b" block that stopped and joined the
+    // solution-upload retry threads was deleted. The RetryThread vector
+    // and the report_solution() retry uploader that populated it are
+    // both gone -- the pool server is the sole key-computer, the worker
+    // never holds a recovered key, and there is nothing to retry-upload.
 
     // Step 7: free TLS objects (both I/O threads have exited).
 #ifdef COLLIDER_HAS_OPENSSL
@@ -813,7 +800,14 @@ void JLPPoolClient::disconnect() {
     // think a stale drain is in progress.
     drain_requested_.store(false, std::memory_order_release);
 
-    std::cout << "[Pool] Disconnected" << std::endl;
+    // "[Pool] Disconnected" used to land on stdout here and was
+    // visible to the operator twice on every pool teardown (the
+    // supervisor's session disconnect plus the destructor's
+    // teardown disconnect both pass through this path). With the
+    // interactive menu loop the lines flashed between TUI exit
+    // and menu re-entry and read like an error. The session log
+    // milestone below preserves the disconnect record for post-
+    // mortem; no operator-facing stdout line is needed.
 
     // Session log: record the disconnect AFTER stdout so the order in
     // the log matches the operator-visible sequence. The endpoint
@@ -973,32 +967,138 @@ bool JLPPoolClient::send_hello() {
     ).count();
     hello.timestamp_ms = static_cast<uint64_t>(now_ms);
 
-    // 16-byte CSPRNG nonce. Use std::random_device for entropy; we call
-    // it once per AUTH so the cost is negligible. A weak nonce (e.g.
-    // monotonic counter) would let an attacker predict and replay before
-    // our dedup table sees it.
-    // previously this filled the nonce via raw rd()
-    // calls and sizeof(unsigned) striding, which is UB on platforms
-    // where unsigned is 16-bit (e.g. some embedded toolchains) or
-    // where rd() returns fewer than sizeof(unsigned)*CHAR_BIT bits.
-    // Use independent_bits_engine with a uint32_t result_type (the
-    // standard forbids uint8_t / uint16_t result_type per N4950
-    // [rand.req.genl]/1.6) and emit one 32-bit word per loop iteration.
+    // Pentest CLIENT-LIE-1 fix (2026-05-23 deep audit): historical
+    // std::random_device was assumed CSPRNG-grade, but several MinGW
+    // builds shipped a Mersenne Twister seeded from time() as their
+    // random_device implementation. A predictable nonce lets an
+    // attacker pre-compute AUTH replays. Use platform-native CSPRNG
+    // directly: BCryptGenRandom on Windows, getrandom(2) on Linux,
+    // arc4random_buf on macOS. std::random_device stays only as the
+    // last-resort fallback path if the native call fails, with a
+    // loud stderr warning so the operator notices.
     {
-        using WordEngine =
-            std::independent_bits_engine<std::random_device, 32, uint32_t>;
-        WordEngine eng;
-        static_assert(sizeof(hello.nonce) % sizeof(uint32_t) == 0,
-                      "nonce size must be a multiple of 4 bytes");
-        for (size_t i = 0; i < sizeof(hello.nonce); i += sizeof(uint32_t)) {
-            uint32_t w = eng();
-            for (size_t b = 0; b < sizeof(uint32_t); ++b) {
-                hello.nonce[i + b] = static_cast<uint8_t>((w >> (8 * b)) & 0xFFu);
+        bool ok = false;
+#if defined(_WIN32)
+        // BCryptGenRandom with BCRYPT_USE_SYSTEM_PREFERRED_RNG returns
+        // 0 (STATUS_SUCCESS) on success. The system-preferred RNG is
+        // the Cryptography Next Generation provider; CSPRNG-grade.
+        if (BCryptGenRandom(nullptr,
+                            reinterpret_cast<PUCHAR>(hello.nonce),
+                            static_cast<ULONG>(sizeof(hello.nonce)),
+                            BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0) {
+            ok = true;
+        }
+#elif defined(__linux__)
+        ssize_t n = getrandom(hello.nonce, sizeof(hello.nonce), 0);
+        if (n == static_cast<ssize_t>(sizeof(hello.nonce))) ok = true;
+#elif defined(__APPLE__)
+        arc4random_buf(hello.nonce, sizeof(hello.nonce));
+        ok = true;
+#endif
+        if (!ok) {
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                std::cerr
+                    << "[AUTH] WARNING: platform CSPRNG unavailable; "
+                       "AUTH nonce falls back to std::random_device "
+                       "(CLIENT-LIE-1 fix degraded). On MinGW builds "
+                       "std::random_device may be PRNG-seeded.\n";
+            }
+            using WordEngine =
+                std::independent_bits_engine<std::random_device,
+                                             32, uint32_t>;
+            WordEngine eng;
+            for (size_t i = 0; i < sizeof(hello.nonce);
+                 i += sizeof(uint32_t)) {
+                uint32_t w = eng();
+                for (size_t b = 0; b < sizeof(uint32_t); ++b) {
+                    hello.nonce[i + b] =
+                        static_cast<uint8_t>((w >> (8 * b)) & 0xFFu);
+                }
             }
         }
     }
 
+    // B1 wire-v4: if a worker identity is loaded (--worker-key flow),
+    // upgrade the AUTH frame in-place. The v4 layout is the v3 prefix
+    // (name + password + timestamp + nonce) followed by 33-byte pubkey
+    // and 64-byte raw r||s signature over the canonical AUTH message
+    // (see worker_identity.hpp + jlp_protocol.py
+    // build_auth_canonical_message). header.flags is bumped to
+    // PROTOCOL_VERSION_V4 so the server routes to its v4 decoder.
+    //
+    // The compressed pubkey's hash160 in bech32 form MUST equal
+    // worker_name (the server checks); we don't re-derive here because
+    // load_from_wif already populated bech32_address_ and the operator
+    // is expected to have set --worker = identity.bech32_address().
+    // Mismatch will surface as AUTH_FAIL on the server side.
+    // v1.5.2 auth-flow diagnostics. Every observable transition gets
+    // a milestone so the session log can localize an auth failure to
+    // ONE microsecond: did the signing block? was send_message slow?
+    // did the wire ack come back empty? Without these breadcrumbs,
+    // the only visible events were [pool_connect] and [disconnect],
+    // which forced cross-referencing the server log every time auth
+    // misbehaved (user-reported 2026-05-25 5s pool death).
+    auto auth_milestone = [](const char* event, const std::string& detail) {
+        ::collider::log::milestone(event, detail);
+    };
+    auth_milestone("auth_build_begin",
+                   std::string("wire=") +
+                       (worker_identity_ ? "v4" : "v3"));
+
+    if (worker_identity_) {
+        JLPClientHelloV4 hv4;
+        std::memset(&hv4, 0, sizeof(hv4));
+        std::memcpy(hv4.worker_name, hello.worker_name,
+                    sizeof(hello.worker_name));
+        // hv4.password_padding stays zero-filled.
+        hv4.timestamp_ms = hello.timestamp_ms;
+        std::memcpy(hv4.nonce, hello.nonce, sizeof(hello.nonce));
+        std::memcpy(hv4.pubkey_compressed,
+                    worker_identity_->pubkey_compressed().data(), 33);
+        auto canonical = auth_v4::build_canonical_message(
+            static_cast<uint8_t>(jlp_wire::PROTOCOL_VERSION_V4),
+            hv4.timestamp_ms, hv4.nonce, worker_name_);
+        // Signing is the most likely place for a multi-second stall
+        // (FIPS provider init, smart-card prompt, AV scan of the key
+        // file). Bracket it so the milestone gap shows the cost.
+        auth_milestone("auth_sign_begin",
+                       std::string("canonical_bytes=") +
+                           std::to_string(canonical.size()));
+        auto sig = worker_identity_->sign_message(
+            canonical.data(), canonical.size());
+        if (!sig) {
+            auth_milestone("auth_sign_failed", "worker_identity returned null signature");
+            std::cerr << "[Pool] wire-v4 signing failed; refusing to send "
+                         "AUTH (worker identity error)\n";
+            ::collider::secure_wipe(hello.password, sizeof(hello.password));
+            return false;
+        }
+        auth_milestone("auth_sign_end", "");
+        std::memcpy(hv4.signature_raw, sig->data(), 64);
+        auth_milestone("auth_send_begin",
+                       std::string("payload_bytes=") +
+                           std::to_string(sizeof(hv4)));
+        const bool sent = send_message(
+            JLPMessageType::AUTH, &hv4, sizeof(hv4),
+            static_cast<uint8_t>(jlp_wire::PROTOCOL_VERSION_V4));
+        auth_milestone(sent ? "auth_send_end" : "auth_send_failed",
+                       sent ? std::string("payload_bytes=") +
+                                  std::to_string(sizeof(hv4))
+                            : "send_message returned false");
+        ::collider::secure_wipe(hello.password, sizeof(hello.password));
+        return sent;
+    }
+
+    auth_milestone("auth_send_begin",
+                   std::string("payload_bytes=") +
+                       std::to_string(sizeof(hello)));
     const bool sent = send_message(JLPMessageType::AUTH, &hello, sizeof(hello));
+    auth_milestone(sent ? "auth_send_end" : "auth_send_failed",
+                   sent ? std::string("payload_bytes=") +
+                              std::to_string(sizeof(hello))
+                        : "send_message returned false");
 
     // Wipe the stack copy of the password before this frame is popped.
     // Without an explicit wipe the bytes linger in whatever the OS does
@@ -1009,6 +1109,44 @@ bool JLPPoolClient::send_hello() {
 
     return sent;
 }
+
+void JLPPoolClient::set_worker_identity(
+    std::shared_ptr<collider::identity::WorkerIdentity> id) {
+    worker_identity_ = std::move(id);
+}
+
+namespace auth_v4 {
+std::vector<uint8_t> build_canonical_message(
+    uint8_t protocol_version,
+    uint64_t timestamp_ms,
+    const uint8_t nonce[16],
+    const std::string& worker_name) {
+    // Layout MUST match collision-protocol/src/jlp_protocol.py
+    // JLPProtocol.build_auth_canonical_message exactly. Any drift
+    // breaks v4 AUTH cross-impl.
+    //   AUTH_SIG_PREFIX(24) || u8(proto_ver) || u64_le(ts_ms) ||
+    //   nonce16 || u8(name_len) || name_bytes
+    static const std::string kPrefix = "COLLIDER-WORKER-AUTH-v1\n";
+    std::vector<uint8_t> out;
+    out.reserve(kPrefix.size() + 1 + 8 + 16 + 1 + worker_name.size());
+    out.insert(out.end(), kPrefix.begin(), kPrefix.end());
+    out.push_back(protocol_version);
+    // Little-endian u64 timestamp.
+    for (int i = 0; i < 8; ++i) {
+        out.push_back(static_cast<uint8_t>((timestamp_ms >> (8 * i)) & 0xFF));
+    }
+    out.insert(out.end(), nonce, nonce + 16);
+    // Worker name capped at 255 bytes; Python's len() byte prefix
+    // tops out at 0xFF so anything longer would silently truncate.
+    // The pool side caps worker_name at 64 bytes (BTC address fits in
+    // 42-62), so this is defensive only.
+    const size_t name_len = (worker_name.size() > 255) ? 255 : worker_name.size();
+    out.push_back(static_cast<uint8_t>(name_len));
+    out.insert(out.end(), worker_name.begin(),
+               worker_name.begin() + name_len);
+    return out;
+}
+}  // namespace auth_v4
 
 bool JLPPoolClient::request_work(WorkAssignment& work) {
     // Send work request
@@ -1072,162 +1210,13 @@ PoolStatsLocal JLPPoolClient::get_stats() {
     return stats_;
 }
 
-bool JLPPoolClient::report_solution(const uint8_t* private_key) {
-    // a recovered Bitcoin private key can be worth six
-    // figures. Pre-fix this method was fire-and-forget: it called
-    // send_message() exactly once and the caller (PoolManager::report_solution)
-    // ignored the return value. A network blip during the upload would
-    // silently lose the key entirely.
-    // New behavior:
-    //   1. Persist {timestamp, work_id, hex_privkey, host} to
-    //      ~/.collider/recovered_keys/<ts>_<work_id>.json via an
-    //      atomic write FIRST. This is the source of truth; if the
-    //      network never comes back, the operator can manually upload.
-    //   2. Attempt send_message() once. If it succeeds, return true.
-    //   3. If send_message fails, spawn a detached background thread
-    //      that retries with exponential backoff (1s, 2s, 4s, ...,
-    //      cap MAX_RECONNECT_BACKOFF_MS) until either:
-    //        a) send_message() succeeds (then it tells the caller via
-    //           the persisted file; this method has already returned),
-    //        b) running_ flips to false (caller is shutting down),
-    //        c) the deadline of 24 hours is reached.
-    //   4. Stderr prints the persisted path prominently so the
-    //      operator can rescue the key manually.
-    // Note: there is no JLP SOLUTION_ACK message on the server side; we
-    // cannot positively confirm server-side acceptance. send_message()
-    // returning true means OpenSSL/recv accepted the bytes; that is the
-    // best confirmation available without changing the wire protocol.
-
-    // Step 1: persist to disk.
-    uint64_t work_id_snapshot = 0;
-    {
-        std::lock_guard<std::mutex> lock(work_mutex_);
-        work_id_snapshot = current_work_.work_id;
-    }
-    using namespace std::chrono;
-    const auto now_ms = duration_cast<milliseconds>(
-        system_clock::now().time_since_epoch()).count();
-
-    std::ostringstream fname;
-    fname << now_ms << "_" << work_id_snapshot << ".json";
-    auto out_path = collider::paths::collider_home() / "recovered_keys" / fname.str();
-
-    std::ostringstream body;
-    body << "{\n"
-         << "  \"timestamp_ms\": " << now_ms << ",\n"
-         << "  \"work_id\": " << work_id_snapshot << ",\n"
-         << "  \"private_key_hex\": \"" << hex32(private_key) << "\",\n"
-         << "  \"pool_host\": \"" << host_ << "\",\n"
-         << "  \"pool_port\": " << port_ << ",\n"
-         << "  \"worker_name\": \"" << worker_name_ << "\"\n"
-         << "}\n";
-
-    bool persisted = atomic_write(out_path, body.str());
-    if (persisted) {
-        std::cerr << "[Pool] Recovered private key persisted to: "
-                  << out_path.string() << std::endl;
-        std::cerr << "[Pool]   If the pool upload fails repeatedly, this "
-                     "file is the source of truth for manual recovery."
-                  << std::endl;
-    } else {
-        std::cerr << "[Pool] CRITICAL: failed to persist recovered key to "
-                  << out_path.string()
-                  << "; proceeding with network upload only."
-                  << std::endl;
-    }
-
-    // Step 2: attempt one synchronous upload.
-    if (send_message(JLPMessageType::SOLUTION, private_key, 32)) {
-        return true;
-    }
-
-    // Step 3: spawn an owned retry thread. The thread runs for up to 24h
-    // retrying the SOLUTION upload with exponential backoff. Cancellation:
-    // disconnect() swaps retry_threads_ out and calls request_stop() on
-    // each RetryThread, which sets the stop_flag and notifies the CV so
-    // the backoff sleep wakes immediately; the RetryThread destructor then
-    // joins. running_/connected_ are also monitored to short-circuit when
-    // the client has been torn down by some other path.
-    //
-    // Key handling: stage the 32-byte recovered private key in a
-    // SecureBuffer<uint8_t> instead of a std::array<uint8_t, 32>. The
-    // array's trivial destructor would have left the 32 bytes readable
-    // in the lambda's heap closure for up to 24 hours (until the retry
-    // thread exits and the closure is destroyed). SecureBuffer's
-    // destructor calls OPENSSL_cleanse on the bytes, so when the lambda
-    // completes (success, timeout, or stop_token cancellation) the key
-    // is wiped immediately. Captured via C++20 init-capture move because
-    // SecureBuffer is move-only (a copied secret is a leaked secret).
-    ::collider::SecureBuffer<uint8_t> key_buf(32);
-    std::memcpy(key_buf.data(), private_key, 32);
-    auto persisted_path = out_path.string();
-
-    {
-        std::lock_guard<std::mutex> guard(retry_threads_mutex_);
-        auto rt = std::make_unique<RetryThread>();
-        auto* rt_raw = rt.get();  // safe: rt lives in retry_threads_ for the thread's lifetime
-        rt->thread = std::thread(
-            [this, key_buf = std::move(key_buf), persisted_path, rt_raw]() mutable {
-                constexpr auto MAX_TOTAL = std::chrono::hours(24);
-                const auto deadline = std::chrono::steady_clock::now() + MAX_TOTAL;
-                uint32_t backoff_ms = 1000;
-                uint32_t attempt = 0;
-
-                while (!rt_raw->stop_flag.load(std::memory_order_acquire)
-                       && running_.load(std::memory_order_acquire)
-                       && std::chrono::steady_clock::now() < deadline) {
-                    // Interruptible sleep: wakes immediately when stop_flag is set.
-                    {
-                        std::unique_lock<std::mutex> lk(rt_raw->cv_mutex);
-                        rt_raw->cv.wait_for(lk,
-                                            std::chrono::milliseconds(backoff_ms),
-                                            [&] { return rt_raw->stop_flag.load(
-                                                             std::memory_order_relaxed); });
-                    }
-                    if (rt_raw->stop_flag.load(std::memory_order_acquire)
-                        || !running_.load(std::memory_order_acquire)) {
-                        break;
-                    }
-                    ++attempt;
-                    if (connected_.load() && auth_state_.load() == AuthState::AUTH_OK) {
-                        if (send_message(JLPMessageType::SOLUTION,
-                                         key_buf.data(),
-                                         key_buf.size())) {
-                            std::cerr << "[Pool] Solution upload succeeded after "
-                                      << attempt << " retries; persisted file at "
-                                      << persisted_path
-                                      << " is now redundant but retained for audit."
-                                      << std::endl;
-                            return;
-                        }
-                    }
-                    backoff_ms = std::min(MAX_RECONNECT_BACKOFF_MS, backoff_ms * 2u);
-                    std::cerr << "[Pool] Solution upload retry attempt " << attempt
-                              << " failed; next backoff " << backoff_ms
-                              << "ms (persisted at " << persisted_path << ")"
-                              << std::endl;
-                }
-                if (rt_raw->stop_flag.load(std::memory_order_acquire)) {
-                    std::cerr << "[Pool] Solution upload retry thread cancelled; "
-                                 "manual recovery file: " << persisted_path
-                              << std::endl;
-                } else {
-                    std::cerr << "[Pool] Solution upload retry thread exiting; "
-                                 "manual recovery file: " << persisted_path
-                              << std::endl;
-                }
-                // key_buf destructor runs here (after every return path),
-                // wiping the 32-byte private key from the closure storage
-                // via OPENSSL_cleanse before the thread frame frees.
-            });
-        retry_threads_.push_back(std::move(rt));
-    }
-
-    // First synchronous attempt failed; the persisted file is the source
-    // of truth and a background thread is now retrying. Return true
-    // because the operator's solution has been captured durably.
-    return persisted;
-}
+// v1.5: JLPPoolClient::report_solution() and its supporting infrastructure
+// (24-hour retry uploader, recovered_keys/<ts>.json atomic write,
+// SecureBuffer key staging) were DELETED. The pool server (collision-
+// protocol) is the sole key-computer; the SOLUTION wire message is
+// strictly server-to-client. There is no longer any code path on the
+// worker that handles a 32-byte recovered private key.
+// See .claude/tasks/v1.5-asymmetric-kangaroo.md.
 
 void JLPPoolClient::set_solution_callback(SolutionCallback cb) {
     std::lock_guard<std::mutex> lock(callbacks_mutex_);
@@ -1364,10 +1353,13 @@ bool JLPPoolClient::persist_dp_queue_to_disk(const std::string& path) const {
 // outside pattern that pre-1.4.1 was hand-coded only at the
 // WORK_ASN site (and skipped entirely at the SOLUTION site). The
 // dedup keys:
-//   * fire_solution_callback: 32-byte recovered pubkey (the SOLUTION
-//     payload). A retransmitted solution from the server has the
-//     same bytes; duplicates would otherwise let the caller leak
-//     the recovered key twice (logs, filesystem, network).
+//   * fire_solution_callback: 32-byte solution payload (server-
+//     broadcast on SOLUTION). v1.5: this is the pool-computed
+//     recovered key bytes, but the worker treats them as opaque
+//     stop-signal metadata -- the dedup exists so a server retransmit
+//     doesn't fire the host's shutdown latch twice. Parameter is named
+//     `pubkey_bytes` for historical reasons; functionally it is now
+//     "the bytes the server broadcast in the SOLUTION frame".
 //   * fire_work_callback: WorkAssignment.work_id. The server should
 //     not re-issue an identical work_id, but it's cheap defense and
 //     prevents duplicate kangaroo-restarts on a flaky link.
@@ -1415,7 +1407,8 @@ void JLPPoolClient::fire_work_callback(const WorkAssignment& work) {
     }
 }
 
-bool JLPPoolClient::send_message(JLPMessageType type, const void* data, size_t size) {
+bool JLPPoolClient::send_message(JLPMessageType type, const void* data, size_t size,
+                                 uint8_t flags_override) {
     if (!connected_ || socket_ == INVALID_SOCK) {
         return false;
     }
@@ -1424,13 +1417,17 @@ bool JLPPoolClient::send_message(JLPMessageType type, const void* data, size_t s
     // the `flags` byte carries PROTOCOL_VERSION. Senders MUST
     // set it; receivers MUST validate it. Pre-fix this was hard-coded 0,
     // which the spec/IDL has now repurposed as "v0 / legacy".
+    // B1 wire-v4: flags_override lets the AUTH path bump to
+    // PROTOCOL_VERSION_V4 without affecting all other messages.
     JLPHeader header;
     header.magic[0] = 'K';
     header.magic[1] = 'A';
     header.magic[2] = 'N';
     header.magic[3] = 'G';
     header.type = static_cast<uint8_t>(type);
-    header.flags = static_cast<uint8_t>(jlp_wire::PROTOCOL_VERSION);
+    header.flags = (flags_override == 0xFF)
+        ? static_cast<uint8_t>(jlp_wire::PROTOCOL_VERSION)
+        : flags_override;
     header.payload_size = static_cast<uint16_t>(size);  // 2-byte little-endian
 
     // Serialize the header+payload write so two writers (sender_loop and
@@ -1481,8 +1478,6 @@ bool JLPPoolClient::receive_message(JLPHeader& header, std::vector<uint8_t>& pay
         return false;
     }
 
-    int received;
-
     // Serialize only against other readers (only the receiver_loop reads
     // in this design, so this is defensive). Crucially, we do NOT share a
     // mutex with the writer side: the receiver may block here for minutes
@@ -1494,56 +1489,102 @@ bool JLPPoolClient::receive_message(JLPHeader& header, std::vector<uint8_t>& pay
     // contract.
     std::unique_lock<std::mutex> io_lock(ssl_read_mutex_);
 
-    // Receive header
+    // STREAM-RESYNC FIX (task #34, v1.5.x): when SO_RCVTIMEO fires
+    // mid-message Windows recv() returns the PARTIAL bytes received so
+    // far. The previous code returned that partial read as "timeout, try
+    // again" -- but those bytes were already drained from the socket's
+    // read queue, so the next iteration started at a byte offset inside
+    // the original frame. With the 1ms timeout the JLP test harness uses
+    // (set_timeout(1) in make_connected) this misalignment fired on
+    // nearly every frame, eventually corrupting the stream badly enough
+    // that the resulting bogus header crashed downstream via __fastfail
+    // with FAST_FAIL_RANGE_CHECK_FAILURE.
+    // Fix: accumulate partial reads into a per-call buffer that persists
+    // ACROSS timeout returns within the SAME receive_message invocation.
+    // The byte-count progress is kept on the JLPPoolClient member fields
+    // (header_progress_ / payload_progress_) so a return-on-timeout
+    // preserves the offset for the next call; the resync invariant is
+    // "we never lose a byte once it has been recv'd off the socket."
+    auto wait_for_bytes = [&](uint8_t* dst, size_t want, size_t& progress,
+                              bool* out_timed_out) -> bool {
+        // progress < want on entry; recv up to (want - progress) bytes,
+        // accumulate, return true on full fill; out_timed_out=true means
+        // partial but recoverable (call again); false return + out_timed
+        // _out=false means real connection error.
+        *out_timed_out = false;
+        while (progress < want) {
+            if (!connected_ || socket_ == INVALID_SOCK) {
+                return false;
+            }
+            int got = 0;
 #ifdef COLLIDER_HAS_OPENSSL
-    if (use_tls_ && ssl_) {
-        received = ssl_recv(&header, sizeof(header));
-        if (received != sizeof(header)) {
-            int ssl_err = SSL_get_error(ssl_, received);
-            if (ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE) {
-                last_receive_was_timeout_ = true;
-                return false;
-            }
-            // SSL_ERROR_SYSCALL with a recoverable system errno is also a
-            // "no data, try again" -- not a fatal connection loss.
-            if (ssl_err == SSL_ERROR_SYSCALL) {
+            if (use_tls_ && ssl_) {
+                got = ssl_recv(dst + progress,
+                               static_cast<int>(want - progress));
+                if (got <= 0) {
+                    int ssl_err = SSL_get_error(ssl_, got);
+                    if (ssl_err == SSL_ERROR_WANT_READ ||
+                        ssl_err == SSL_ERROR_WANT_WRITE) {
+                        *out_timed_out = true;
+                        return false;
+                    }
+                    if (ssl_err == SSL_ERROR_SYSCALL) {
 #ifdef _WIN32
-                int sock_err = WSAGetLastError();
-                if (sock_err == WSAETIMEDOUT || sock_err == WSAEWOULDBLOCK) {
-                    last_receive_was_timeout_ = true;
-                    return false;
-                }
+                        int se = WSAGetLastError();
+                        if (se == WSAETIMEDOUT || se == WSAEWOULDBLOCK) {
+                            *out_timed_out = true;
+                            return false;
+                        }
 #else
-                if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ETIMEDOUT) {
-                    last_receive_was_timeout_ = true;
+                        if (errno == EAGAIN || errno == EWOULDBLOCK ||
+                            errno == ETIMEDOUT) {
+                            *out_timed_out = true;
+                            return false;
+                        }
+#endif
+                    }
                     return false;
                 }
+            } else
 #endif
+            {
+                got = recv(socket_, reinterpret_cast<char*>(dst + progress),
+                           static_cast<int>(want - progress), 0);
+                if (got <= 0) {
+#ifdef _WIN32
+                    int err = WSAGetLastError();
+                    if (err == WSAETIMEDOUT || err == WSAEWOULDBLOCK) {
+                        *out_timed_out = true;
+                        return false;
+                    }
+#else
+                    if (errno == EAGAIN || errno == EWOULDBLOCK ||
+                        errno == ETIMEDOUT) {
+                        *out_timed_out = true;
+                        return false;
+                    }
+#endif
+                    return false;
+                }
             }
-            last_receive_was_timeout_ = false;
-            return false;
+            progress += static_cast<size_t>(got);
         }
-    } else
-#endif
+        return true;
+    };
+
+    // Receive header into the per-client partial buffer so a timeout
+    // resumes from the right offset on the next call.
     {
-        received = recv(socket_, (char*)&header, sizeof(header), MSG_WAITALL);
-        if (received != sizeof(header)) {
-            // Check if it's a timeout vs actual disconnect
-#ifdef _WIN32
-            int err = WSAGetLastError();
-            if (err == WSAETIMEDOUT || err == WSAEWOULDBLOCK) {
-                last_receive_was_timeout_ = true;
-                return false;
-            }
-#else
-            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ETIMEDOUT) {
-                last_receive_was_timeout_ = true;
-                return false;
-            }
-#endif
-            last_receive_was_timeout_ = false;
+        bool timed_out = false;
+        if (!wait_for_bytes(reinterpret_cast<uint8_t*>(&header_partial_),
+                            sizeof(header_partial_),
+                            header_partial_progress_,
+                            &timed_out)) {
+            last_receive_was_timeout_ = timed_out;
             return false;
         }
+        header = header_partial_;
+        header_partial_progress_ = 0;  // consumed; reset for next message
     }
     last_receive_was_timeout_ = false;
 
@@ -1587,20 +1628,34 @@ bool JLPPoolClient::receive_message(JLPHeader& header, std::vector<uint8_t>& pay
         return false;
     }
 
-    // Receive payload
+    // Receive payload, also using the partial-accumulating helper. The
+    // payload uses its own per-client member buffer so a timeout
+    // during the payload phase preserves the bytes already drained.
+    // payload_partial_progress_ resets to 0 only when the FULL payload
+    // has been received; until then, every receive_message call resumes
+    // exactly where the previous call left off.
     if (header.payload_size > 0) {
-        payload.resize(header.payload_size);
-#ifdef COLLIDER_HAS_OPENSSL
-        if (use_tls_ && ssl_) {
-            received = ssl_recv(payload.data(), header.payload_size);
-        } else
-#endif
-        {
-            received = recv(socket_, (char*)payload.data(), header.payload_size, MSG_WAITALL);
+        if (payload_partial_.size() != header.payload_size) {
+            payload_partial_.resize(header.payload_size);
         }
-        if (received != (int)header.payload_size) {
+        bool timed_out = false;
+        if (!wait_for_bytes(payload_partial_.data(),
+                            header.payload_size,
+                            payload_partial_progress_,
+                            &timed_out)) {
+            last_receive_was_timeout_ = timed_out;
+            // CRITICAL: do NOT reset header_partial_progress_ or
+            // payload_partial_progress_ here. The next call must resume
+            // payload-phase reads on this same header. Stash the header
+            // back into header_partial_ so the next call skips the
+            // header read (header_partial_progress_ = sizeof()).
+            header_partial_ = header;
+            header_partial_progress_ = sizeof(header_partial_);
             return false;
         }
+        payload = std::move(payload_partial_);
+        payload_partial_.clear();
+        payload_partial_progress_ = 0;
     }
 
     return true;
@@ -1847,10 +1902,6 @@ bool JLPPoolClient::send_dp_batch(
     g_last_dp_seq.store(
         seq_start + static_cast<uint32_t>(batch.size()),
         std::memory_order_release);
-    ::collider::log::update_session_state(
-        build_pool_state_seed(
-            host_ + ":" + std::to_string(port_),
-            /*connected=*/true));
 
     // dp_batch_submitted heartbeat. Emits one milestone every 10 batches
     // so a forensic reader can detect a worker that successfully sent
@@ -1860,6 +1911,17 @@ bool JLPPoolClient::send_dp_batch(
     // reconnect that recreates this client keeps the running totals
     // monotonic across the recreation boundary. Throttled at 10 batches
     // so even a 100-batch/s sender adds at most 10 milestone lines/sec.
+    //
+    // TP-15: the update_session_state(build_pool_state_seed(...)) call
+    // used to fire on EVERY batch. The session-state writer itself was
+    // throttled to 5s internally, but the seed builder (string concat,
+    // atomic loads, SessionState struct construction) ran every time
+    // -- ~100x/sec on a saturated sender. Folded inside the 10-batch
+    // milestone block so the seed builds + flushes share a cadence;
+    // the operator-visible session_state.json freshness goes from
+    // "every batch" (stale by up to 5s anyway) to "every 10 batches"
+    // (stale by up to ~1s at production rates), which matches the
+    // milestone heartbeat granularity the forensic reader already uses.
     {
         static std::atomic<uint64_t> batches_local{0};
         static std::atomic<uint64_t> dps_local{0};
@@ -1871,6 +1933,10 @@ bool JLPPoolClient::send_dp_batch(
               << " dps=" << d
               << " work_id=" << current_work_id;
             ::collider::log::milestone("dp_batch_submitted", m.str());
+            ::collider::log::update_session_state(
+                build_pool_state_seed(
+                    host_ + ":" + std::to_string(port_),
+                    /*connected=*/true));
         }
     }
     return true;
@@ -2139,6 +2205,14 @@ void JLPPoolClient::apply_work_asn_assignment(const JLPServerConfig& config,
     memcpy(current_work_.range_end, config.range_end, 32);
     current_work_.dp_bits = config.dp_bits;
     current_work_.work_id = config.work_id;
+    // v1.5 asymmetric assignment fields. The backend
+    // (CudaRCKangarooBackend::initialize) maps kangaroo_type to a
+    // KANG_MODE_* and rejects 0/BOTH in pool mode (server bug if it
+    // ever arrives). start_offset_a/_b are propagated for future
+    // per-worker chunk-slicing and recorded in the milestone log.
+    current_work_.kangaroo_type  = config.kangaroo_type;
+    current_work_.start_offset_a = config.start_offset_a;
+    current_work_.start_offset_b = config.start_offset_b;
     work_received_ = true;  // chunk ID 0 is valid; don't use work_id as sentinel
     // per-chunk DP sequence resets at the
     // start of every assignment. The server expects
@@ -2165,11 +2239,22 @@ void JLPPoolClient::log_work_asn_milestone(const JLPServerConfig& config,
     ::collider::hex_encode_lower(work_copy.range_start, 32, range_start_hex);
     ::collider::hex_encode_lower(work_copy.range_end,   32, range_end_hex);
 
+    // v1.5 asymmetric fields land in the milestone too so operators
+    // tailing collider.log can see which half (TAME/WILD) the server
+    // assigned this worker; a stuck round-robin would surface as all
+    // recent assignments showing the same kangaroo_type.
+    const char* type_name = "BOTH(illegal)";
+    if (config.kangaroo_type == 1) type_name = "TAME_ONLY";
+    else if (config.kangaroo_type == 2) type_name = "WILD_ONLY";
     std::ostringstream detail;
     detail << "work_id=" << config.work_id
            << " dp_bits=" << config.dp_bits
            << " range_start=" << range_start_hex
-           << " range_end=" << range_end_hex;
+           << " range_end=" << range_end_hex
+           << " kangaroo_type=" << static_cast<int>(config.kangaroo_type)
+           << "(" << type_name << ")"
+           << " start_offset_a=" << config.start_offset_a
+           << " start_offset_b=" << config.start_offset_b;
     ::collider::log::milestone("work_received", detail.str());
 
     auto seed = build_pool_state_seed(
@@ -2208,6 +2293,9 @@ void JLPPoolClient::handle_stats_rsp(const JLPHeader& /*header*/,
     // sanitize wire floats before downstream
     // uint64_t cast (which is UB on NaN / +/-Inf / >2^64).
     sanitize_stats_rsp_floats(stats_.dps_per_second, stats_.your_share);
+    // Clamp the wire uint64 totals so a buggy or hostile server can't
+    // feed absurd values into the UI panels / JSON exports.
+    sanitize_stats_rsp_uints(stats_.your_dps, stats_.total_dps);
 
     // Legacy aliases for older callers.
     stats_.connected_workers = stats_.active_workers;
@@ -2251,6 +2339,22 @@ void JLPPoolClient::handle_auth_fail(const JLPHeader& /*header*/,
                   << "       Wait for the ban to expire, then restart."
                   << std::endl;
         ::collider::log::milestone("auth_fail", "ip_banned: " + reason);
+    } else if (reason.find("upgrade required: v1.5 asymmetric protocol")
+               != std::string::npos) {
+        // v1.5 pool servers reject v1.4.x clients to lock out the
+        // theft-vulnerable code path. Server's verbatim reason string
+        // (pinned by pool-server-engineer as
+        // KangarooPoolServer.UPGRADE_REQUIRED_REASON):
+        //   "upgrade required: v1.5 asymmetric protocol; v1.4.x clients
+        //    are theft-vulnerable and refused"
+        // Match-string and render a clear operator-facing message
+        // rather than a generic auth failure.
+        std::cerr << "[Pool] UPGRADE REQUIRED -- the pool server rejected "
+                     "this client because v1.4.x is theft-vulnerable.\n"
+                  << "[Pool] Download the v1.5+ binary from "
+                     "https://collisionprotocol.com/download and re-run."
+                  << std::endl;
+        ::collider::log::milestone("auth_fail", "upgrade_required: " + reason);
     } else {
         std::cerr << "[Pool] Authentication rejected by server";
         if (!reason.empty()) std::cerr << ": " << reason;
@@ -2272,19 +2376,29 @@ void JLPPoolClient::handle_dp_ack(const JLPHeader& /*header*/,
 
 void JLPPoolClient::handle_solution(const JLPHeader& /*header*/,
                                     const std::vector<uint8_t>& payload) {
-    std::cout << "[Pool] SOLUTION FOUND!" << std::endl;
-    // route through dedup helper so a server-side
-    // retransmit (or any duplicate SOLUTION delivery) does not
-    // fire the user's solution callback twice. Pre-1.4.1 the
-    // raw callback was read and called without a lock.
-    // Session log: record the SOLUTION event WITHOUT the
-    // 32-byte pubkey payload. We log only the current work_id
-    // so an operator can correlate against the recovered_keys/
-    // *.json that the JLPPoolClient writes (which is the
-    // authoritative source for the key bytes); duplicating the
-    // pubkey in the session log would inflate the file and
-    // expose the same material in two places when one is
-    // sufficient.
+    // v1.5: SOLUTION is now strictly a server-to-client BROADCAST.
+    // The pool server (collision-protocol's collision_detector) is the
+    // sole entity that sees DPs of both tame and wild type and the
+    // sole entity that computes the recovered private key. When the
+    // server detects a collision and finishes its own automated sweep
+    // of the puzzle funds, it broadcasts SOLUTION to all connected
+    // workers as a "stop grinding, the pool solved this chunk" signal.
+    //
+    // The 32-byte payload of this message MAY carry the recovered
+    // private key bytes (server's choice for transparency / audit), but
+    // the v1.5 worker DOES NOT STORE THEM:
+    //   - No recovered_keys/<ts>.json file is ever written (that surface
+    //     was deleted).
+    //   - The bytes are not echoed to stdout/stderr in a copy-paste
+    //     friendly form.
+    //   - The bytes are passed through fire_solution_callback purely so
+    //     dedup against retransmits stays robust. The caller (PoolManager
+    //     -> run_pool_mode) is responsible for treating the bytes as
+    //     stop-signal metadata only and triggering shutdown.
+    //
+    // See .claude/tasks/v1.5-asymmetric-kangaroo.md.
+    std::cout << "[Pool] SOLUTION FOUND BY POOL -- work stopped."
+              << std::endl;
     ::collider::log::milestone(
         "solution_received",
         "work_id=" +

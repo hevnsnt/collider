@@ -85,6 +85,9 @@ extern "C" cudaError_t sha256_batch(
 #include "core/secure_buffer.hpp"      // secure_wipe for key buffers
 #include "core/secure_write.hpp"       // owner-only file open for key/hit logs
 #include "core/types.hpp"
+#include "core/version.hpp"            // collider::kVersion for banner display
+#include "ui/tui/tui_launcher.hpp"     // Phase C: unified TuiApp across modes
+#include "ui/tui/stdio_capture.hpp"    // release_active_capture before launch
 #include "gpu/kangaroo_solver_gpu.hpp"
 #include "gpu/puzzle_gpu.hpp"
 #ifdef COLLIDER_USE_RCKANGAROO
@@ -477,7 +480,7 @@ void display_dispatch_banner(Arguments& args, const GPUDetectionResult& gpu_info
     banner_stats.gpu_names = gpu_info.gpu_names;
     banner_stats.backend = gpu_info.backend;
     banner_stats.estimated_speed = gpu_info.estimated_speed;
-    banner_stats.version = "1.4.0";
+    banner_stats.version = ::collider::kVersion;
 
     // Smart-selection + puzzle-info banner population happen only in
     // puzzle mode. Both used to mutate args in place; preserve that.
@@ -564,6 +567,41 @@ int run_benchmark(const Arguments& args_in, const GPUDetectionResult& gpu_info) 
     // structurally inert; we keep it to avoid two near-identical helpers.
     Arguments args = args_in;
     display_dispatch_banner(args, gpu_info);
+
+    // Phase C: unified TUI shell for benchmark mode too. Even though the
+    // benchmark prints a per-stage table (sha256 / secp / hash160 / fused),
+    // the operator gets the header (mode="Benchmark"), GPU panel (live
+    // utilisation per device during each stage), and the performance
+    // panel's throughput history. The cout/cerr stage output below stays
+    // for headless captures (e.g. > bench.txt); the TUI panels add the
+    // visual telemetry layer per the unified-shell goal.
+    ::collider::ui::tui::LaunchConfig bench_launch_cfg;
+    bench_launch_cfg.mode_label              = "Benchmark";
+    bench_launch_cfg.version                 = std::string(::collider::kVersion);
+    bench_launch_cfg.tui_mode                = ::collider::ui::tui::TuiMode::Benchmark;
+    bench_launch_cfg.gpu_ids                 = args.gpu_ids;
+    bench_launch_cfg.session_start           = std::chrono::steady_clock::now();
+    bench_launch_cfg.initial_phase_name      = "Initializing";
+    bench_launch_cfg.initial_current_chunk   = 0;
+    bench_launch_cfg.initial_total_chunks    = 1;
+    bench_launch_cfg.render_cfg.refresh_hz   = 10;
+    bench_launch_cfg.render_cfg.alt_screen   = true;
+    bench_launch_cfg.guard_opts.alt_screen              = true;
+    bench_launch_cfg.guard_opts.hide_cursor             = true;
+    bench_launch_cfg.guard_opts.install_signal_handlers = true;
+    // Release stdio capture BEFORE launch_session so FTXUI's draw
+    // (which uses std::cout) reaches the terminal alt-screen
+    // instead of the captured ring buffer. SILENT variant: the
+    // captured boot text persists to the tui-boot-<ts>.log file
+    // instead of scrolling on the terminal right before the alt-
+    // screen takes over.
+    ::collider::ui::tui::StdioCapture::release_active_capture_silent();
+    auto bench_tui_session =
+        ::collider::ui::tui::launch_session(bench_launch_cfg);
+    (void)bench_tui_session;  // Held to keep TuiApp + CookedModeGuard alive
+                              // for the duration of run_benchmark. Per-stage
+                              // setter calls land in the bench pipeline
+                              // helpers (follow-up).
 
 #ifndef COLLIDER_PRO
         // Free benchmark: SHA-256 throughput on CPU + GPU/backend info.
@@ -656,6 +694,32 @@ int run_puzzle_mode(const Arguments& args_in, const GPUDetectionResult& gpu_info
     // Display banner + run puzzle smart-selection (mutates args.puzzle_*).
     display_dispatch_banner(args, gpu_info);
 
+    // Phase C: standalone challenge mode gets the unified TuiApp shell
+    // too. The launcher returns a {app, cooked_guard} pair that lives
+    // for the entire run_puzzle_mode body; the iter ctx carries the
+    // app pointer to each backend so RCKangaroo / MultiGPU / CPU
+    // solver progress feeds the panels.
+    ::collider::ui::tui::LaunchConfig chal_launch_cfg;
+    chal_launch_cfg.mode_label              = "Challenge";
+    chal_launch_cfg.version                 = std::string(::collider::kVersion);
+    chal_launch_cfg.tui_mode                = ::collider::ui::tui::TuiMode::Challenge;
+    chal_launch_cfg.gpu_ids                 = args.gpu_ids;
+    chal_launch_cfg.session_start           = std::chrono::steady_clock::now();
+    chal_launch_cfg.initial_phase_name      = "Initializing";
+    chal_launch_cfg.initial_current_chunk   = 0;
+    chal_launch_cfg.initial_total_chunks    = 1;
+    chal_launch_cfg.render_cfg.refresh_hz   = 10;
+    chal_launch_cfg.render_cfg.alt_screen   = true;
+    chal_launch_cfg.guard_opts.alt_screen              = true;
+    chal_launch_cfg.guard_opts.hide_cursor             = true;
+    chal_launch_cfg.guard_opts.install_signal_handlers = true;
+    // Release stdio capture BEFORE launch_session so FTXUI can
+    // draw to the alt-screen. SILENT variant: captured boot text
+    // persists to log file instead of scrolling on terminal.
+    ::collider::ui::tui::StdioCapture::release_active_capture_silent();
+    auto challenge_tui_session =
+        ::collider::ui::tui::launch_session(chal_launch_cfg);
+
     // removed verbose-mode solved-puzzle-zone-distribution
     // printout. The Center-Heavy strategy that consumed it is gone; the
     // distribution itself was selection-bias artifact, not signal.
@@ -691,27 +755,19 @@ int run_puzzle_mode(const Arguments& args_in, const GPUDetectionResult& gpu_info
         for (size_t puzzle_idx = 0; puzzle_idx < puzzles_to_solve.size() && !g_shutdown; puzzle_idx++) {
             int current_puzzle = puzzles_to_solve[puzzle_idx];
 
-            // Show progress for auto-progression mode
-            if (is_multi_puzzle && puzzle_idx > 0) {
-                namespace boxui = ::collider::ui::box;
-                std::cout << "\n\n";
-                boxui::top(std::cout);
-                {
-                    std::ostringstream label;
-                    label << "AUTO-PROGRESSION: Moving to puzzle #" << current_puzzle
-                          << " (" << (puzzle_idx + 1) << "/" << puzzles_to_solve.size() << ")";
-                    boxui::centered(std::cout, label.str());
-                }
-                boxui::bottom(std::cout);
-            }
+            // Per-puzzle banner blocks used to cout here (auto-progression
+            // label + "BITCOIN PUZZLE CHALLENGE" boxed header + Bits /
+            // Target / Search / Backend / Range key-value lines + search
+            // space analysis). All of it ran AFTER launch_session and
+            // was captured into the boot log invisibly. The dashboard
+            // header (mode_label="Challenge") + status panel's challenge
+            // overlay already surface puzzle number / bits / backend /
+            // target each frame; the boxed banner cout was decorative
+            // and unreachable. Deleted in favor of TUI phase-name
+            // updates per puzzle below.
 
         // Get puzzle info
         const PuzzleInfo* puzzle = PuzzleDatabase::get_puzzle(current_puzzle);
-
-        std::cout << "\n";
-        ::collider::ui::box::top(std::cout);
-        ::collider::ui::box::centered(std::cout, "BITCOIN PUZZLE CHALLENGE (1000 BTC)");
-        ::collider::ui::box::top(std::cout);
 
         // Resolve range / target / hash160 for this puzzle. Mirrors the
         // original inline block; on unknown puzzle + no custom range it
@@ -722,21 +778,19 @@ int run_puzzle_mode(const Arguments& args_in, const GPUDetectionResult& gpu_info
         }
         const int bits = tgt.bits;
 
-        {
-            std::ostringstream bits_str;
-            bits_str << bits << " (2^" << (bits - 1) << " keys in range)";
-            ::collider::ui::box::kv(std::cout, "Bits", bits_str.str());
+        // Phase name for this iteration so the dashboard reflects the
+        // current puzzle. Multi-puzzle worklists see the phase change
+        // every iteration, signaling auto-progression to the operator.
+        if (challenge_tui_session.app) {
+            std::ostringstream phase;
+            phase << "Puzzle #" << current_puzzle
+                  << " (" << bits << " bits)";
+            if (is_multi_puzzle) {
+                phase << " " << (puzzle_idx + 1) << "/"
+                      << puzzles_to_solve.size();
+            }
+            challenge_tui_session.app->set_current_phase_name(phase.str());
         }
-        ::collider::ui::box::kv(std::cout, "Target",  tgt.target_address);
-        ::collider::ui::box::kv(std::cout, "Search",  args.puzzle_random ? "Random" : "Sequential");
-        ::collider::ui::box::kv(std::cout, "Backend", gpu_info.backend);
-        ::collider::ui::box::top(std::cout);
-        ::collider::ui::box::kv(std::cout, "Range Start", tgt.range_start.to_hex());
-        ::collider::ui::box::kv(std::cout, "Range End",   tgt.range_end.to_hex());
-        ::collider::ui::box::top(std::cout);
-        std::cout << "\n";
-
-        detail::print_search_space_analysis(bits);
 
         // ======================================================================
         // ALGORITHM SELECTION: pick the right thing for this puzzle, even
@@ -766,7 +820,8 @@ int run_puzzle_mode(const Arguments& args_in, const GPUDetectionResult& gpu_info
         // --resume-kangaroo, SIGINT save, range-reject) live inside the
         // extracted helpers and are individually documented there.
         detail::PuzzleIterContext ctx{
-            args, gpu_info, current_puzzle, puzzle, tgt, is_multi_puzzle
+            args, gpu_info, current_puzzle, puzzle, tgt, is_multi_puzzle,
+            challenge_tui_session.app.get()
         };
         detail::PuzzleStepResult step;
         if (args.puzzle_kangaroo && bits > 40) {
@@ -805,20 +860,21 @@ int run_puzzle_mode(const Arguments& args_in, const GPUDetectionResult& gpu_info
 
         } // End of puzzle iteration for loop
 
-        // All puzzles completed (auto-progression) or single puzzle done
+        // All puzzles completed (auto-progression) or single puzzle done.
+        // Pre-fix this rendered a "AUTO-PROGRESSION COMPLETE" boxed
+        // banner via cout while the TUI was still up, captured into
+        // the boot log. Now: flip the dashboard phase name so the
+        // operator's last visible state on the dashboard names the
+        // completion. The cout summary that ran after the boxed
+        // banner is deleted; the dashboard already shows totals.
         if (is_multi_puzzle && puzzles_to_solve.size() > 1) {
-            namespace boxui = ::collider::ui::box;
-            std::cout << "\n";
-            boxui::top(std::cout);
-            boxui::centered(std::cout, "AUTO-PROGRESSION COMPLETE");
-            boxui::top(std::cout);
-            {
-                std::ostringstream msg;
-                msg << "  All " << puzzles_to_solve.size() << " puzzles have been processed.";
-                boxui::line(std::cout, msg.str());
+            if (challenge_tui_session.app) {
+                std::ostringstream phase;
+                phase << "All " << puzzles_to_solve.size()
+                      << " puzzles processed";
+                challenge_tui_session.app->set_current_phase_name(
+                    phase.str());
             }
-            boxui::bottom(std::cout);
-            std::cout << "\n";
         }
 
         return 0;

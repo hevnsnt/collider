@@ -40,27 +40,16 @@ BloomLoadResult load_bloom_file_into_memory(const std::string& path)
         return out;
     }
 
-    // Reserved bytes are required to be zero in the BLF1 format. A future
-    // builder may use them for new metadata (e.g. a bloom-version tag or a
-    // separate seed for a P2TR-specific sub-bloom). If we see non-zero
-    // reserved bytes today, the file likely came from a newer builder than
-    // this binary knows about; warn (don't reject) so the user can choose
-    // to rebuild or upgrade theCollider. v1.5 will gate this on the version
-    // field. The warning prints inline because err_message is the failure
-    // channel only; success-path warnings go straight to stderr.
-    {
-        bool reserved_nonzero = false;
-        for (size_t i = 0; i < sizeof(out.header.reserved); i++) {
-            if (out.header.reserved[i] != 0) { reserved_nonzero = true; break; }
-        }
-        if (reserved_nonzero) {
-            std::cerr << "[*] WARNING: bloom header reserved bytes are non-zero. "
-                      << "This .blf may have been built by a newer build_bloom "
-                      << "with format extensions this binary does not understand. "
-                      << "Scan will proceed using BLF1 semantics; upgrade if "
-                      << "results look wrong.\n";
-        }
-    }
+    // 2026-05-24 fix (user feedback): the historical "reserved bytes
+    // non-zero" warning was a false-positive trap. The reserved[] area
+    // had no version-gate, so any pre-fix builder that leaked an
+    // uninitialized stack page (e.g. the UTXO CSV's first line "id,
+    // vout,..." landing in reserved offsets 40..47 of the .blf
+    // header) tripped the warning even for blooms built by THIS exact
+    // binary. The warning convinced operators their bloom was
+    // incompatible when it actually worked correctly. Removed; future
+    // format extensions will be gated on the `version` byte at offset
+    // 4 instead of reserved-byte heuristics.
 
     // Refuse pathological header values that the kernel would interpret as
     // "everything matches" (num_hashes == 0 means the for-loop runs zero

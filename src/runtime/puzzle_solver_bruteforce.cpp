@@ -26,6 +26,7 @@
  *   - SIGINT save path via emit_shutdown_message_from_main + state save.
  */
 #include "runtime/puzzle_solver_helpers.hpp"
+#include "ui/tui/tui_app.hpp"   // TuiApp::set_current_phase_name on solve
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -199,6 +200,17 @@ void report_gpu_brute_hit(const PuzzleIterContext& ctx,
         snprintf(key_hex, sizeof(key_hex), "0x%llx", (unsigned long long)found_key_lo);
     }
 
+    // Flip the dashboard phase to SOLVED so the operator sees the
+    // success on the TUI dashboard. The cout boxed banner below
+    // executes too (captured to boot log; puzzle_found.txt is the
+    // durable file record).
+    if (auto* tui_solved =
+            static_cast<::collider::ui::tui::TuiApp*>(ctx.tui_app)) {
+        std::ostringstream solved_phase;
+        solved_phase << "Puzzle #" << current_puzzle
+                     << " SOLVED (GPU brute force)";
+        tui_solved->set_current_phase_name(solved_phase.str());
+    }
     {
         namespace boxui = ::collider::ui::box;
         std::cout << "\n\n";
@@ -696,6 +708,14 @@ void report_cpu_brute_hit(const PuzzleIterContext& ctx,
         snprintf(key_hex, sizeof(key_hex), "0x%llx", (unsigned long long)found_key_lo);
     }
 
+    // Flip dashboard phase to SOLVED (CPU brute force path).
+    if (auto* tui_solved =
+            static_cast<::collider::ui::tui::TuiApp*>(ctx.tui_app)) {
+        std::ostringstream solved_phase;
+        solved_phase << "Puzzle #" << current_puzzle
+                     << " SOLVED (CPU brute force)";
+        tui_solved->set_current_phase_name(solved_phase.str());
+    }
     {
         namespace boxui = ::collider::ui::box;
         std::cout << "\n\n";

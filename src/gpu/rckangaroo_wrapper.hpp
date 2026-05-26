@@ -76,6 +76,14 @@ public:
     bool benchmark_mode = false;
     std::atomic<bool> stop_flag{false};
 
+    // v1.5: asymmetric kangaroo mode (KANG_MODE_BOTH / TAME_ONLY / WILD_ONLY
+    // from third_party/RCKangaroo/defs.h). Default BOTH preserves standalone
+    // behavior; pool mode must set TAME_ONLY or WILD_ONLY before solve() so
+    // the worker can only ever hold half of the tame/wild trail data
+    // (theft-resistance guarantee). Applied to every per-GPU RCGpuKang in
+    // solve() before Prepare(); takes effect for the next solve() call only.
+    int mode = 0;               // 0 = KANG_MODE_BOTH (defs.h)
+
     // Bloom filter configuration
     bool bloom_enabled = false;         // Enable bloom filter checking
     std::string bloom_file;             // Path to .blf bloom filter file

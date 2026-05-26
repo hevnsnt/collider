@@ -1216,6 +1216,13 @@ RCKangarooResult RCKangarooManager::solve() {
 
     // Prepare GPUs
     for (int i = 0; i < s_GpuCnt; i++) {
+        // v1.5: propagate the asymmetric kangaroo mode chosen by the
+        // caller (pool runtime) to each per-GPU RCGpuKang BEFORE its
+        // Prepare() runs. Prepare() snapshots Mode into Kparams.Mode
+        // and configures TAME_ONLY / WILD_ONLY starting points + kernel
+        // dispatch. Default (mode == KANG_MODE_BOTH == 0) preserves
+        // upstream behavior for the standalone solver.
+        s_GpuKangs[i]->Mode = mode;
         if (!s_GpuKangs[i]->Prepare(PntToSolve, Range, DP, s_EcJumps1, s_EcJumps2, s_EcJumps3)) {
             s_GpuKangs[i]->Failed = true;
             std::cerr << "GPU " << s_GpuKangs[i]->CudaIndex << " Prepare failed" << std::endl;
@@ -1286,14 +1293,31 @@ RCKangarooResult RCKangarooManager::solve() {
     }
 #endif
 
-    // Main loop
-    auto last_stats = std::chrono::steady_clock::now();
+    // Main loop. Two cadences run off the same clock:
+    //   * progress_callback fires every 1 s so the TUI dashboard's
+    //     THROUGHPUT row and the pool runner's poll-work-id check
+    //     get a real-time signal (the documented on_progress
+    //     contract is 1 Hz; the older 10 s interval starved the
+    //     dashboard and the operator saw 0 Keys/s for the first
+    //     ~10 s of every session even with kernels at full tilt).
+    //   * the legacy fallback "Speed: ... DPs: ..." stdout line
+    //     (active only when no progress_callback is wired) keeps
+    //     its 10 s cadence so unattended CLI runs don't spam.
+    auto last_progress = std::chrono::steady_clock::now();
+    auto last_stdout   = last_progress;
     while (!s_Solved && !stop_flag.load()) {
         CheckNewPoints();
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
         auto now = std::chrono::steady_clock::now();
-        if (std::chrono::duration_cast<std::chrono::seconds>(now - last_stats).count() >= 10) {
+        const bool progress_due =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - last_progress).count() >= 1000;
+        const bool stdout_due =
+            std::chrono::duration_cast<std::chrono::seconds>(
+                now - last_stdout).count() >= 10;
+
+        if (progress_due || stdout_due) {
             int speed = 0;
             for (int i = 0; i < s_GpuCnt; i++) {
                 // Only query speed from GPUs that haven't failed
@@ -1303,14 +1327,21 @@ RCKangarooResult RCKangarooManager::solve() {
             }
             impl_->current_speed = speed;
 
-            u64 est_dps_cnt = (u64)(ops / dp_val);
-            // Note: Primary progress display is handled by the progress_callback
-            // This is supplementary debug output
-            if (!progress_callback) {
-                // Format speed appropriately (GKeys/s if >= 1000 MKeys/s)
+            if (progress_due && progress_callback) {
+                if (!progress_callback(s_PntTotalOps, s_db.GetBlockCnt(), speed)) {
+                    stop_flag.store(true);
+                }
+                last_progress = now;
+            } else if (progress_due) {
+                last_progress = now;
+            }
+
+            if (stdout_due && !progress_callback) {
+                u64 est_dps_cnt = (u64)(ops / dp_val);
                 std::string speed_str;
                 if (speed >= 1000) {
-                    speed_str = std::to_string(speed / 1000) + "." + std::to_string((speed % 1000) / 100) + " GKeys/s";
+                    speed_str = std::to_string(speed / 1000) + "." +
+                                std::to_string((speed % 1000) / 100) + " GKeys/s";
                 } else {
                     speed_str = std::to_string(speed) + " MKeys/s";
                 }
@@ -1318,13 +1349,7 @@ RCKangarooResult RCKangarooManager::solve() {
                           << ", DPs: " << s_db.GetBlockCnt() << "/" << est_dps_cnt
                           << std::endl;
             }
-
-            if (progress_callback) {
-                if (!progress_callback(s_PntTotalOps, s_db.GetBlockCnt(), speed)) {
-                    stop_flag.store(true);
-                }
-            }
-            last_stats = now;
+            if (stdout_due) last_stdout = now;
         }
     }
 

@@ -34,6 +34,12 @@
     #include <openssl/err.h>
 #endif
 
+namespace collider {
+namespace identity {
+class WorkerIdentity;
+}  // namespace identity
+}  // namespace collider
+
 #ifdef _WIN32
     #include <winsock2.h>
     #include <ws2tcpip.h>
@@ -125,15 +131,81 @@ struct JLPClientHelloV2 {
 static_assert(sizeof(JLPClientHelloV2) == 120,
               "JLPClientHelloV2 must be 120 bytes on the wire");
 
+// B1 wire-v4 AUTH frame (217 bytes). Extends v3 with the compressed
+// public key and the 64-byte raw r||s ECDSA signature over the
+// canonical AUTH message (see worker_identity.hpp + jlp_protocol.py
+// build_auth_canonical_message). The password slot is preserved at
+// offset 64..96 to keep the v3 prefix bit-for-bit compatible with
+// servers that probe by slot index; v4 zeros it because v4 replaces
+// the credential model with signed identity.
+// Field order matches collision-protocol/src/jlp_protocol.py
+// encode_auth_v4 / decode_auth_v4 layout exactly.
+//
+// Defined OUTSIDE the IDL-generated jlp_wire_generated.hpp because the
+// codegen tool refuses to round-trip if hand edits land there. The IDL
+// (protocol/jlp.yaml) will absorb v4 when the server fully cuts over
+// (PROTOCOL_VERSION_MIN bumped to 4); until then v4 is an opt-in
+// client capability gated on a loaded WorkerIdentity.
+namespace jlp_wire {
+// header.flags byte for v4 frames. Servers route to decode_auth_v4
+// when they see this value; servers pinned to v3 reject as wire
+// mismatch (which is fine because operators only flip --worker-key on
+// after the server-side cutover).
+constexpr int PROTOCOL_VERSION_V4 = 4;
+}  // namespace jlp_wire
+
+namespace auth_v4 {
+// Build the canonical signed message body that wire-v4 AUTH covers.
+// MUST match collision-protocol/src/jlp_protocol.py
+// JLPProtocol.build_auth_canonical_message byte-for-byte. Layout:
+//   "COLLIDER-WORKER-AUTH-v1\n" || u8(proto_ver) || u64_le(ts_ms) ||
+//   nonce16 || u8(name_len) || name_bytes.
+// Free function so the KAT test can exercise it without touching the
+// JLPPoolClient class. Pure: no I/O, no state.
+std::vector<uint8_t> build_canonical_message(
+    uint8_t protocol_version,
+    uint64_t timestamp_ms,
+    const uint8_t nonce[16],
+    const std::string& worker_name);
+}  // namespace auth_v4
+
+struct JLPClientHelloV4 {
+    char     worker_name[64];          // Worker identifier (must be bech32(hash160(pubkey)))
+    char     password_padding[32];     // Zero-filled for v4
+    uint64_t timestamp_ms;             // Wall-clock time in ms (LE)
+    uint8_t  nonce[16];                // Per-AUTH random nonce
+    uint8_t  pubkey_compressed[33];    // secp256k1 compressed pubkey
+    uint8_t  signature_raw[64];        // ECDSA over canonical msg, raw r||s (NOT DER)
+};
+static_assert(sizeof(JLPClientHelloV4) == 217,
+              "JLPClientHelloV4 must be 217 bytes on the wire");
+
 // Work assignment structure - must match collision-protocol/src/jlp_protocol.py ServerConfig
-// Python: struct.pack('<33s32s32sIQ', public_key, range_start, range_end, dp_bits, work_id)
+// v1.5 (protocol_version=3): payload grew from 109 to 126 bytes. The three
+// new trailing fields (kangaroo_type, start_offset_a, start_offset_b)
+// carry the asymmetric tame/wild assignment that denies any single worker
+// the data needed to compute the recovered private key locally. The
+// pre-existing fields keep their identical byte offsets and little-endian
+// encoding; old (109-byte) decoders see the longer payload and reject
+// it as malformed -- there is intentionally no v1.4 -> v1.5 interop.
+// Python: struct.pack('<33s32s32sIQBQQ',
+//   public_key, range_start, range_end, dp_bits, work_id,
+//   kangaroo_type, start_offset_a, start_offset_b)
+//
+// Sizeof equality with jlp_wire::WorkAssignment is enforced by static_assert
+// in tests/test_jlp_wire_generated.cpp; any future drift between this
+// handwritten struct and the auto-generated wire struct breaks the build.
 struct JLPServerConfig {
-    uint8_t public_key[33];  // 33 bytes - Compressed public key
-    uint8_t range_start[32]; // 32 bytes - Range start (big-endian)
-    uint8_t range_end[32];   // 32 bytes - Range end (big-endian)
-    uint32_t dp_bits;        // 4 bytes - DP bits (little-endian)
-    uint64_t work_id;        // 8 bytes - Work identifier (little-endian)
-    // Total: 109 bytes
+    uint8_t  public_key[33];  // 33 bytes - Compressed public key
+    uint8_t  range_start[32]; // 32 bytes - Range start (big-endian)
+    uint8_t  range_end[32];   // 32 bytes - Range end (big-endian)
+    uint32_t dp_bits;         // 4 bytes  - DP bits (little-endian)
+    uint64_t work_id;         // 8 bytes  - Work identifier (little-endian)
+    // v1.5 fields (offset 109..125):
+    uint8_t  kangaroo_type;   // 1 byte   - 0=BOTH (illegal in pool), 1=TAME_ONLY, 2=WILD_ONLY
+    uint64_t start_offset_a;  // 8 bytes  - inclusive lower bound (low 64 bits) of worker's offset window
+    uint64_t start_offset_b;  // 8 bytes  - exclusive upper bound (low 64 bits) of worker's offset window
+    // Total: 126 bytes
 };
 
 struct JLPDistinguishedPoint {
@@ -201,6 +273,8 @@ public:
     // the sender for >500 ms during process exit. 2 s still lets a wedged
     // sender give up well before any operator-perceived hang and matches
     // the AUTH_RESPONSE_TIMEOUT_MS / 5 budget proportion.
+    // For the full lifecycle + cross-references see
+    // docs/internals/jlp-v1.5-pool-protocol.md "Drain timeout" section.
     static constexpr uint32_t DRAIN_TIMEOUT_MS = 2000;
 
     JLPPoolClient();
@@ -224,7 +298,16 @@ public:
     bool submit_dps(const std::vector<DistinguishedPoint>& dps) override;
 
     PoolStatsLocal get_stats() override;
-    bool report_solution(const uint8_t* private_key) override;
+
+    // v1.5: client-to-server report_solution() was DELETED. No code path
+    // on the worker may possess the puzzle's private key. The SOLUTION
+    // wire message is now strictly server-to-client (broadcast on solve).
+    // The recovered_keys/<ts>.json persistence file, the 24-hour retry
+    // thread infrastructure, and the SecureBuffer key staging were all
+    // removed together. The server (collision-protocol) is the sole
+    // entity that sees DPs of both tame and wild type and the sole
+    // entity that can compute the recovered key. See
+    // .claude/tasks/v1.5-asymmetric-kangaroo.md.
 
     void set_solution_callback(SolutionCallback cb) override;
     void set_work_callback(WorkCallback cb) override;
@@ -237,6 +320,16 @@ public:
     void set_debug_mode(bool debug) { debug_mode_ = debug; }
     void set_use_tls(bool use_tls) { use_tls_ = use_tls; }
     void set_verify_cert(bool verify) { verify_cert_ = verify; }
+
+    // B1 wire-v4: attach a loaded worker identity (--worker-key). When
+    // set, send_hello emits a 217-byte v4 AUTH frame signed by the
+    // identity's privkey and bumps header.flags to PROTOCOL_VERSION_V4.
+    // When nullptr (default) the client emits v3 AUTH unchanged. The
+    // shared_ptr lets the identity outlive any single reconnect cycle
+    // without forcing the PoolManager to re-load the key on every
+    // supervisor-driven JLPPoolClient re-creation.
+    void set_worker_identity(
+        std::shared_ptr<collider::identity::WorkerIdentity> id);
 
     // dp_sequence_next_ ownership lives in PoolManager
     // so a supervisor-driven reconnect that recreates the JLPPoolClient
@@ -309,6 +402,18 @@ private:
     std::atomic<bool> running_;
     std::atomic<bool> last_receive_was_timeout_;  // Track if last recv was timeout vs disconnect
 
+    // task #34 stream-resync state. Receive_message accumulates partial
+    // recv() into these per-client buffers so a SO_RCVTIMEO mid-message
+    // does not lose stream alignment (the Heisenbug behind v1.5.x
+    // JLPPoolProtocol crashes on Windows: 1ms timeout + MSG_WAITALL +
+    // multi-byte messages = silent partial-byte drops). Both fields are
+    // touched ONLY from the receiver thread while ssl_read_mutex_ is
+    // held, so no atomicity is needed.
+    JLPHeader header_partial_{};
+    size_t    header_partial_progress_  = 0;
+    std::vector<uint8_t> payload_partial_;
+    size_t    payload_partial_progress_ = 0;
+
     // connection-state machine. atomic so the receiver and main
     // threads can both read it without taking a lock on the hot dispatch path.
     std::atomic<AuthState> auth_state_{AuthState::DISCONNECTED};
@@ -365,8 +470,16 @@ private:
     // is the storage owner of record. The client's copy exists only for
     // the duration of one authenticate() call.
     ::collider::SecureString password_;       // optional pool password
-    uint32_t gpu_count_;
-    uint64_t speed_;
+    // historical gpu_count_ / speed_ members lived here for ClientHello
+    // telemetry. v2 wire dropped both fields; deleted 2026-05-23 (audit
+    // finding #23) since nothing transmits them and nothing reads them.
+
+    // B1 wire-v4 (2026-05-23): optional signed-identity material. When
+    // set, send_hello() emits a 217-byte v4 AUTH frame and bumps the
+    // header.flags byte to PROTOCOL_VERSION_V4. nullptr (default) keeps
+    // the existing v3 wire path. Owned by the pool supervisor; shared_ptr
+    // because the same identity outlives any single reconnect.
+    std::shared_ptr<collider::identity::WorkerIdentity> worker_identity_;
 
     // Current work
     WorkAssignment current_work_;
@@ -416,37 +529,12 @@ private:
     std::thread receiver_thread_;
     void receiver_loop();
 
-    // Portable stop-and-join wrapper for solution-upload retry threads.
-    // Bundles the thread handle with a stop flag and CV so cancellation is
-    // interruptible on every platform (replaces std::jthread / std::stop_token
-    // which are unavailable under Apple libc++ prior to the availability gate
-    // opening, even when CMAKE_OSX_DEPLOYMENT_TARGET=15.0).
-    struct RetryThread {
-        std::atomic<bool>       stop_flag{false};
-        std::mutex              cv_mutex;
-        std::condition_variable cv;
-        std::thread             thread;
-
-        RetryThread() = default;
-        ~RetryThread() { request_stop(); if (thread.joinable()) thread.join(); }
-        RetryThread(const RetryThread&)            = delete;
-        RetryThread& operator=(const RetryThread&) = delete;
-        RetryThread(RetryThread&&)                 = delete;
-        RetryThread& operator=(RetryThread&&)      = delete;
-
-        void request_stop() {
-            stop_flag.store(true, std::memory_order_release);
-            cv.notify_all();
-        }
-    };
-
-    // Solution-upload retry threads. Each successful recovered key spawns one
-    // background uploader that retries for up to 24 hours. The vector is
-    // appended to under retry_threads_mutex_ from report_solution() and is
-    // cleared on disconnect() so all threads join BEFORE socket / TLS state
-    // is torn down.
-    std::vector<std::unique_ptr<RetryThread>> retry_threads_;
-    std::mutex retry_threads_mutex_;
+    // v1.5: the RetryThread infrastructure that backed
+    // JLPPoolClient::report_solution() (24-hour retry uploader for
+    // recovered private keys) was DELETED together with report_solution
+    // itself. The pool server is now the sole key-computer; the worker
+    // never holds a recovered key, so there is nothing to retry-upload.
+    // See .claude/tasks/v1.5-asymmetric-kangaroo.md.
 
     // DP queue for batched submission. std::deque is used (vs
     // std::queue) so the sender can push the head of an un-sendable
@@ -536,8 +624,12 @@ public:
     std::vector<DistinguishedPoint> snapshot_dp_queue() const;
 private:
 
-    // Protocol helpers
-    bool send_message(JLPMessageType type, const void* data, size_t size);
+    // Protocol helpers. send_message defaults header.flags to the
+    // currently-active PROTOCOL_VERSION (v3 today). Callers that need
+    // to emit a different wire-version frame (e.g. v4 AUTH) pass
+    // flags_override explicitly.
+    bool send_message(JLPMessageType type, const void* data, size_t size,
+                      uint8_t flags_override = 0xFF);
     bool receive_message(JLPHeader& header, std::vector<uint8_t>& payload);
     bool send_hello();
     void handle_server_message(const JLPHeader& header, const std::vector<uint8_t>& payload);

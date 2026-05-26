@@ -12,6 +12,7 @@
 #include <atomic>
 #include <thread>
 #include <functional>
+#include <deque>
 #include <mutex>
 #include <condition_variable>
 #include <unordered_map>
@@ -37,6 +38,12 @@ struct PoolConfig {
     bool use_tls = false;    // Use TLS encryption (jlps://)
     bool verify_cert = true; // Verify TLS certificate (default true; opt-out only via explicit flag)
 
+    // B1 wire-v4: when non-empty, PoolManager loads the WIF from this
+    // file at first connect and the JLPPoolClient (every fresh instance
+    // including reconnects) gets set_worker_identity() called with the
+    // shared identity. Opt-in: empty path keeps the v3 wire path.
+    std::string worker_key_file;
+
     // Default port by type. Only JLP is supported; HTTP path was deleted.
     static uint16_t default_port(const std::string& type) {
         if (type == POOL_TYPE_JLP) return 17403;
@@ -44,8 +51,13 @@ struct PoolConfig {
     }
 };
 
-// Callback when solution is found
-using SolutionFoundCallback = std::function<void(const uint8_t* private_key, const std::string& worker)>;
+// v1.5: Callback fired on the SOLUTION server-to-client broadcast. The
+// 32-byte solution_payload is the pool-server-computed recovered key
+// (server publishes for transparency); the worker treats it as opaque
+// stop-signal metadata. Caller is responsible for not persisting or
+// echoing it -- see pool_solver.cpp run_pool_mode's set_solution_callback
+// for the v1.5-compliant handler.
+using SolutionFoundCallback = std::function<void(const uint8_t* solution_payload, const std::string& worker)>;
 
 class PoolManager {
 public:
@@ -97,8 +109,13 @@ public:
     uint64_t get_dropped_count() const { return dropped_count_.load(); }
     double get_submission_rate() const;
 
-    // Solution reporting
-    void report_solution(const uint8_t* private_key);
+    // v1.5: client-to-server solution reporting was DELETED. The pool
+    // server (collision-protocol) is the sole entity that computes the
+    // recovered private key; the worker never holds it. The SOLUTION
+    // wire message is now strictly server-to-client (broadcast on solve)
+    // and the SolutionFoundCallback below fires only on the receive
+    // path -- the caller treats the payload as a stop signal, not as a
+    // key to store. See .claude/tasks/v1.5-asymmetric-kangaroo.md.
 
     // Callbacks
     void set_solution_callback(SolutionFoundCallback cb) { solution_callback_ = cb; }
@@ -124,6 +141,20 @@ private:
     std::atomic<uint64_t> enqueued_count_{0};
     std::atomic<uint64_t> sent_count_{0};
     std::atomic<uint64_t> dropped_count_{0};
+
+    // Reconnect-window DP buffer: holds DPs submitted while the
+    // supervisor is mid-reconnect (between connected_.store(false) and
+    // the new client's AUTH_OK + WORK_REQ success). Without this
+    // buffer, every DP in that window was counted as dropped (audit
+    // finding #21). On successful reconnect we replay the buffered DPs
+    // into the new client's queue. Bounded to keep memory usage
+    // predictable when an outage is long. Replays use atomic_swap
+    // semantics so the producer side never blocks on the drain side.
+    static constexpr size_t kReconnectBufferCap = 10000;
+    std::mutex reconnect_buf_mutex_;
+    std::deque<DistinguishedPoint> reconnect_buffer_;
+    std::atomic<uint64_t> reconnect_buffered_total_{0};
+    std::atomic<uint64_t> reconnect_replayed_total_{0};
     std::chrono::steady_clock::time_point start_time_;
     SolutionFoundCallback solution_callback_;
 
@@ -144,6 +175,14 @@ private:
     void update_dp_seq(uint64_t work_id, uint32_t next_seq);
     void reset_dp_seq(uint64_t work_id);
     void wire_client_callbacks(JLPPoolClient* jlp);  // helper for connect / reconnect
+
+    // B1 wire-v4: lazy-loaded shared worker identity. Loaded the first
+    // time apply_worker_identity() is called (typically from connect()
+    // before the first JLPPoolClient::set_worker_identity), reused for
+    // every subsequent reconnect. nullptr means no --worker-key was
+    // configured (legacy v3 wire path).
+    std::shared_ptr<collider::identity::WorkerIdentity> worker_identity_;
+    void apply_worker_identity(JLPPoolClient* jlp);  // load + attach
 
     // WORK_ASN dedup state lives at the manager level
     // because it survives client recreation across reconnects. The

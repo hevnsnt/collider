@@ -36,6 +36,13 @@ Arguments run_puzzle_interactive(Arguments base_args, double gpu_speed_mkeys);
  * detection / build, resume prompt). PRO-only.
  */
 Arguments run_brainwallet_interactive(Arguments base_args);
+
+/**
+ * Run BIP-39 / BIP-32 mnemonic scanner submenu: pick a phrases file,
+ * pick a bloom (auto-detected default), optionally enable the tight
+ * bloom. PRO-only.
+ */
+Arguments run_bip_scan_interactive(Arguments base_args);
 #endif
 
 /**

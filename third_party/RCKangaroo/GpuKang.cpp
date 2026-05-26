@@ -3,6 +3,26 @@
 // License: GPLv3, see "LICENSE.TXT" file
 // https://github.com/RetiredC
 
+// ============================================================================
+// Modifications by SixCyber LLC, licensed under GPLv3 per
+// the original work. See LICENSE at the repository root and
+// THIRD_PARTY_LICENSES.md for the project-wide dependency inventory.
+//
+// Modification history for this file:
+//   2026-05-21 (v1.5.0):
+//     - RCGpuKang::Start now branches on Kparams.Mode and seeds kangaroos
+//       with type-only starting points when Mode is KANG_MODE_TAME_ONLY
+//       or KANG_MODE_WILD_ONLY. A worker configured for one type cannot
+//       walk the other.
+//     - The result.found self-collision detection path is disabled when
+//       Mode is non-BOTH. The pool server detects collisions across the
+//       union of DPs from both kangaroo types; the worker has no
+//       on-device collision signal. This removes the surface where a
+//       worker could compute the puzzle private key locally before
+//       submitting DPs to the pool, which is the architectural basis
+//       for the v1.5 theft-resistance protocol.
+// ============================================================================
+
 
 #include <iostream>
 #include "cuda_runtime.h"
@@ -55,6 +75,10 @@ bool RCGpuKang::Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP* _EcJump
 	Kparams.KernelB_LDS_Size = 64 * JMP_CNT;
 	Kparams.KernelC_LDS_Size = 96 * JMP_CNT;
 	Kparams.IsGenMode = gGenMode;
+	// theCollider v1.5: propagate asymmetric mode into the kernel
+	// parameter struct. KernelGen and the DP type-tag emission consult
+	// this; KernelABC is mode-agnostic.
+	Kparams.Mode = (u32)Mode;
 
 //allocate gpu mem
 	u64 size;
@@ -282,10 +306,24 @@ void RCGpuKang::Stop()
 
 void RCGpuKang::GenerateRndDistances()
 {
+	// theCollider v1.5: in TAME_ONLY / WILD_ONLY pool modes, EVERY
+	// kangaroo gets the corresponding side's distance distribution. In
+	// BOTH (upstream behavior) the original 1/3 tame, 2/3 wild split
+	// is preserved.
+	const bool tame_only = (Mode == KANG_MODE_TAME_ONLY);
+	const bool wild_only = (Mode == KANG_MODE_WILD_ONLY);
 	for (int i = 0; i < KangCnt; i++)
 	{
 		EcInt d;
-		if (i < KangCnt / 3)
+		bool is_tame;
+		if (tame_only)
+			is_tame = true;
+		else if (wild_only)
+			is_tame = false;
+		else
+			is_tame = (i < KangCnt / 3);
+
+		if (is_tame)
 			d.RndBits(Range - 4); //TAME kangs
 		else
 		{
@@ -356,15 +394,44 @@ bool RCGpuKang::Start()
 	u8 buf_PntA[64], buf_PntB[64];
 	PntA.SaveToBuffer64(buf_PntA);
 	PntB.SaveToBuffer64(buf_PntB);
+	// theCollider v1.5: per-kangaroo x0,y0 seeding for the GPU's
+	// KernelGen offset-AddPoints step. In BOTH (upstream) the herd is
+	// split 1/3 zero (tame, KernelGen skips the AddPoints branch),
+	// 1/3 PntA (wild1), 1/3 PntB (wild2 = -PntA). In TAME_ONLY every
+	// slot is zero. In WILD_ONLY every slot is PntA -- we deliberately
+	// drop the wild2 (-PntA) mirror so that on the pool side every DP
+	// from this worker resolves against a single wild branch, and the
+	// type-tag in DPs is simply WILD1. The wild2/WILD2 case is only
+	// useful when both sides of the herd live in one process; in pool
+	// mode the server aggregates DPs from many TAME_ONLY and WILD_ONLY
+	// workers and only needs the canonical wild-side.
 	for (int i = 0; i < KangCnt; i++)
 	{
-		if (i < KangCnt / 3)
+		bool zero_offset; // == "this kangaroo is a tame for KernelGen"
+		const u8* wild_buf = buf_PntA; // overwritten below when applicable
+		if (Mode == KANG_MODE_TAME_ONLY)
+		{
+			zero_offset = true;
+		}
+		else if (Mode == KANG_MODE_WILD_ONLY)
+		{
+			zero_offset = false;
+			wild_buf = buf_PntA;
+		}
+		else // KANG_MODE_BOTH
+		{
+			if (i < KangCnt / 3)
+				zero_offset = true;
+			else
+			{
+				zero_offset = false;
+				wild_buf = (i < 2 * KangCnt / 3) ? buf_PntA : buf_PntB;
+			}
+		}
+		if (zero_offset)
 			memset(RndPnts[i].x, 0, 64);
 		else
-			if (i < 2 * KangCnt / 3)
-				memcpy(RndPnts[i].x, buf_PntA, 64);
-			else
-				memcpy(RndPnts[i].x, buf_PntB, 64);
+			memcpy(RndPnts[i].x, wild_buf, 64);
 	}
 	//copy to gpu
 	err = cudaMemcpy(Kparams.Kangs, RndPnts, KangCnt * 96, cudaMemcpyHostToDevice);
@@ -428,13 +495,21 @@ int RCGpuKang::Dbg_CheckKangs()
 		p = ec.MultiplyG_Fast(dist);
 		if (neg)
 			p.y.NegModP();
-		if (i < KangCnt / 3)
-			p = p;
+		// theCollider v1.5: per-kangaroo expected offset matches the
+		// herd-seeding done in Start() above. In BOTH (upstream) the
+		// 1/3 partitioning maps to {tame=identity, wild1=PntA,
+		// wild2=PntB}; in TAME_ONLY all kangaroos are tames; in
+		// WILD_ONLY all kangaroos are wild1 (PntA offset).
+		if (Mode == KANG_MODE_TAME_ONLY)
+			; // tame: no offset add
+		else if (Mode == KANG_MODE_WILD_ONLY)
+			p = ec.AddPoints(PntA, p);
+		else if (i < KangCnt / 3)
+			; // BOTH, tame third
+		else if (i < 2 * KangCnt / 3)
+			p = ec.AddPoints(PntA, p);
 		else
-			if (i < 2 * KangCnt / 3)
-				p = ec.AddPoints(PntA, p);
-			else
-				p = ec.AddPoints(PntB, p);
+			p = ec.AddPoints(PntB, p);
 		if (!p.IsEqual(Pnt))
 			res++;
 	}

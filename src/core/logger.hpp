@@ -211,18 +211,22 @@ public:
     std::string get_log_path() const { return log_path_; }
 
     ~Logger() {
-        // fix: do the final write WHILE still initialized_, then
-        // atomically clear the flag and release log_file_ under the mutex.
-        // After this destructor returns:
-        //   - any future log() call will see initialized_=false under the
-        //     mutex and return without touching log_file_.
-        //   - any in-flight log() call that already holds a shared_ptr
-        //     snapshot of log_file_ will keep the ofstream alive until it
-        //     drops the snapshot. The actual stream destruction happens at
-        //     the LAST shared_ptr release, not here.
+        // No mutex here on purpose (see runtime/balance.cpp::~BalanceFetcher
+        // and core/session_log.cpp::~SessionLogSink for the same pattern).
+        // This is a Meyers-singleton destructor running during static
+        // teardown after main(). On macOS, Apple's pthread library
+        // invalidates mutex internal state during teardown earlier than
+        // glibc/MSVC, so taking lock_guard<mutex> here throws EINVAL via
+        // std::system_error -- propagates uncaught and aborts the process
+        // AFTER the run finished cleanly. Customer-facing log: clean
+        // session summary followed by abort 6 noise. Drop the lock.
+        //
+        // Safety: by the time we reach this dtor no other thread should
+        // still be calling log() -- main returned, workers joined. The
+        // log_file_ shared_ptr copy is a single 8-byte read; even if a
+        // last-gasp logger thread is racing, worst case is a missed
+        // final line, not a crash.
         if (initialized_.load(std::memory_order_acquire)) {
-            // Direct write under the mutex (avoid recursive log() that would
-            // re-take the mutex and could be slow if a worker is queued).
             auto now = std::chrono::system_clock::now();
             auto time_t = std::chrono::system_clock::to_time_t(now);
             auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -238,19 +242,13 @@ public:
                << "." << std::setfill('0') << std::setw(3) << ms.count()
                << " [INFO ] === Collider Logger Stopped ===\n";
 
-            std::shared_ptr<std::ofstream> file;
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                file = log_file_;
-                if (file) {
-                    (*file) << ss.str();
-                    file->flush();
-                }
-                initialized_.store(false, std::memory_order_release);
-                log_file_.reset();  // Release our owning ref. Other threads
-                                    // holding a shared_ptr keep the ofstream
-                                    // alive until they release it.
+            auto file = log_file_;
+            if (file) {
+                (*file) << ss.str();
+                file->flush();
             }
+            initialized_.store(false, std::memory_order_release);
+            log_file_.reset();
         }
     }
 

@@ -37,6 +37,7 @@
 #include "core/config.hpp"
 #include "core/crypto_cpu.hpp"
 #include "core/puzzle_config.hpp"
+#include "runtime/runtime_control.hpp"   // banner queue (TUI status)
 #include "core/types.hpp"
 #include "gpu/puzzle_gpu.hpp"
 #include "runtime/format.hpp"
@@ -253,60 +254,33 @@ void select_algorithm(Arguments& args,
 
     if (args.puzzle_kangaroo && bits > 40 && !pubkey_known) {
         // User asked for kangaroo but we have no pubkey for this puzzle.
-        // Three paths:
-        //   1. Multi-puzzle worklist (--auto-next / --all-unsolved):
-        //      silently downgrade. Stopping the whole batch on one
-        //      pubkey-less puzzle would be hostile.
-        //   2. Single-puzzle interactive (TTY on stdin): prompt the
-        //      operator for a pubkey -- they may have one from an
-        //      external source. ENTER falls back to brute force.
-        //   3. Single-puzzle non-interactive (piped, CI, etc.):
-        //      silently downgrade and log it.
-#ifdef _WIN32
-        const bool stdin_is_tty = _isatty(_fileno(stdin)) != 0;
-#else
-        const bool stdin_is_tty = isatty(fileno(stdin)) != 0;
-#endif
-        const bool prompt_allowed = !is_multi_puzzle && stdin_is_tty;
-
-        std::cout << "\n[!] Puzzle #" << (puzzle ? puzzle->number : 0)
-                  << " has no bundled public key.\n";
-        std::cout << "    Kangaroo requires a 33-byte compressed pubkey (02.../03...).\n";
-        std::cout << "    Most non-multiples-of-5 in puzzles 71-160 have never had a\n";
-        std::cout << "    spending transaction, so the pubkey is mathematically unknown.\n";
-
-        if (prompt_allowed) {
-            std::cout << "    If you have the pubkey from an external source, paste it now\n";
-            std::cout << "    (66 hex chars, e.g. 02abcdef...). Otherwise press ENTER to\n";
-            std::cout << "    fall back to brute force: ";
-            std::cout.flush();
-            std::string entered;
-            std::getline(std::cin, entered);
-            // Trim whitespace
-            while (!entered.empty() && std::isspace(static_cast<unsigned char>(entered.front())))
-                entered.erase(entered.begin());
-            while (!entered.empty() && std::isspace(static_cast<unsigned char>(entered.back())))
-                entered.pop_back();
-            const bool looks_like_pubkey =
-                (entered.size() == 66 || entered.size() == 130) &&
-                (entered[0] == '0' && (entered[1] == '2' || entered[1] == '3' || entered[1] == '4'));
-            if (looks_like_pubkey) {
-                args.puzzle_pubkey = entered;
-                std::cout << "[*] Pubkey accepted, continuing with Kangaroo.\n";
-            } else {
-                if (!entered.empty()) {
-                    std::cout << "[!] That doesn't look like a 33-byte compressed pubkey; "
-                                 "falling back to brute force.\n";
-                } else {
-                    std::cout << "[*] Falling back to brute force.\n";
-                }
-                args.puzzle_kangaroo = false;
-            }
-        } else {
-            std::cout << "    " << (is_multi_puzzle ? "Auto-progression mode" : "Non-interactive mode")
-                      << ": silently demoting --kangaroo to brute force for this puzzle.\n";
-            args.puzzle_kangaroo = false;
-        }
+        // Pre-fix this branched on stdin TTY-ness and prompted with
+        // std::getline(std::cin, ...) when interactive -- a soft
+        // deadlock under the in-session TUI alt-screen, because the
+        // prompt rendered behind the alt-screen and stdin was being
+        // fought over by the FTXUI input handler. The operator either
+        // saw nothing and force-quit, or the process hung forever.
+        //
+        // Silent demote to brute force in EVERY case now. If the
+        // operator has a pubkey from an external source they pass it
+        // at CLI invocation (--pubkey HEX) or via config.yml -- both
+        // run BEFORE launch_session, so the question is settled
+        // pre-TUI. Mid-run pubkey prompts are bad UX even without
+        // the deadlock.
+        //
+        // The reason is surfaced via the runtime banner queue so the
+        // operator sees it on the dashboard footer, not buried in
+        // the boot log.
+        args.puzzle_kangaroo = false;
+        auto& rc = ::collider::runtime::global_runtime_control();
+        std::lock_guard<std::mutex> lk(rc.banner_mu);
+        std::ostringstream msg;
+        msg << "Puzzle #" << (puzzle ? puzzle->number : 0)
+            << ": no pubkey known, demoted --kangaroo to brute force "
+            << "(pass --pubkey HEX to override)";
+        rc.banner_text = msg.str();
+        rc.banner_set_at = std::chrono::steady_clock::now();
+        (void)is_multi_puzzle;  // No longer branches on this.
     }
 
     if (!args.puzzle_kangaroo && bits > 40) {

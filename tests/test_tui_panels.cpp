@@ -13,6 +13,7 @@
 //      phase name, hits / empty / trying labels appear.
 //   5. Headless render of the footer panel: confirm "q quit" appears.
 
+#include "core/version.hpp"          // collider::kVersion -- source of truth for test fixtures
 #include "ui/tui/keybindings.hpp"
 #include "ui/tui/panels/bloom_picker.hpp"
 #include "ui/tui/panels/footer_panel.hpp"
@@ -158,7 +159,10 @@ int main() {
         hdr.session_keys_per_sec = 1'300'000.0;
         hdr.wordlist_size = 50'000'000ULL;
         hdr.mode_label = "Brainwallet";
-        hdr.version = "1.4.2";
+        // Pin the test fixture to collider::kVersion so a release-time
+        // version bump (version.hpp) does not silently leave a stale
+        // literal here that asserts against the wrong "v1.4.x" string.
+        hdr.version = ::collider::kVersion;
 
         auto el = panels::render_header(hdr, theme);
         std::string out = render_to_string(el, 110, 8);
@@ -172,14 +176,18 @@ int main() {
         auto dbg = panels::debug_header(hdr);
         if (dbg.brand_cell != "theCollider")
             return fail("header[debug]: brand_cell != 'theCollider'");
-        if (dbg.version_cell != "v1.4.2")
-            return fail("header[debug]: version_cell != 'v1.4.2'");
+        const std::string expected_version_cell =
+            std::string("v") + ::collider::kVersion;
+        if (dbg.version_cell != expected_version_cell)
+            return fail(("header[debug]: version_cell='" + dbg.version_cell
+                         + "' want '" + expected_version_cell + "'").c_str());
         if (dbg.mode_cell != "[Brainwallet]")
             return fail("header[debug]: mode_cell != '[Brainwallet]'");
-        // 16,938,402,193 -> "16.94 G" per format_number_short's SI compaction.
-        if (dbg.lifetime_short != "16.94 G")
+        // 16,938,402,193 -> "16.94 B" per format_number_short's "K/M/B/T"
+        // compaction (commit ad5326d swapped " G" -> " B" for billions).
+        if (dbg.lifetime_short != "16.94 B")
             return fail(("header[debug]: lifetime_short='" + dbg.lifetime_short
-                         + "' want '16.94 G'").c_str());
+                         + "' want '16.94 B'").c_str());
         if (dbg.lifetime_grouped != "16,938,402,193")
             return fail("header[debug]: lifetime_grouped wrong");
         if (dbg.baseline_label != "Resume baseline")
@@ -308,7 +316,7 @@ int main() {
 
         // Static-once setters.
         app.set_mode_label("Brainwallet");
-        app.set_version("1.4.2");
+        app.set_version(::collider::kVersion);
         app.set_session_start(std::chrono::steady_clock::now() -
                                std::chrono::minutes(45));
         app.set_session_baseline(123'456'789ULL);
@@ -366,7 +374,9 @@ int main() {
         hdr.wordlist_size = 50'000'000ULL;
         // These two are the setters' targets:
         hdr.mode_label = "Brainwallet";
-        hdr.version = "1.4.2";
+        // Same source-of-truth pinning as the test-3 fixture above so a
+        // version.hpp bump does not silently break this comparison.
+        hdr.version = ::collider::kVersion;
 
         auto el = panels::render_header(hdr, theme);
         std::string out = render_to_string(el, 110, 8);
@@ -376,9 +386,12 @@ int main() {
         auto dbg = panels::debug_header(hdr);
         if (dbg.mode_cell != "[Brainwallet]")
             return fail("setters[debug]: mode_cell wrong after set_mode_label");
-        if (dbg.version_cell != "v1.4.2")
-            return fail("setters[debug]: version_cell wrong after set_version");
-        if (dbg.lifetime_short != "16.94 G")
+        const std::string expected_version_cell_8 =
+            std::string("v") + ::collider::kVersion;
+        if (dbg.version_cell != expected_version_cell_8)
+            return fail(("setters[debug]: version_cell='" + dbg.version_cell
+                         + "' want '" + expected_version_cell_8 + "'").c_str());
+        if (dbg.lifetime_short != "16.94 B")
             return fail("setters[debug]: lifetime_short wrong after post_scan_snapshot");
 
         if (out.empty())
@@ -1981,6 +1994,212 @@ int main() {
         if (rows.row0.size() != rows.row1.size() ||
             rows.row1.size() != rows.row2.size()) {
             return fail("big_digits: rows have inconsistent lengths");
+        }
+    }
+
+    // =================================================================
+    // F1-combinator-outer: when current_outer_iteration > 0 (Combinator
+    // is the canonical caller) the Phase Progress active row must
+    // surface the outer pass counter as "outer N / inner X/Y" instead
+    // of the bare "X/Y" — otherwise the inner 1<=>2 toggle alone makes
+    // the phase look stuck. With outer_iteration left at 0, the legacy
+    // "X/Y" formatting must still render so non-Combinator phases are
+    // unchanged.
+    // =================================================================
+    {
+        using namespace collider::ui::tui;
+        auto theme = make_theme(ThemeVariant::Default);
+        panels::PerfPanelContext ctx;
+        ctx.current_phase = 3;     // Combinator
+        ctx.current_chunk = 1;
+        ctx.total_chunks  = 2;
+        for (int i = 0; i < 5; ++i)
+            ctx.phase_keys_per_sec[i] = 1'000.0;
+
+        ctx.current_outer_iteration = 0;
+        std::string baseline =
+            render_to_string(panels::render_performance(ctx, theme), 130, 24);
+        if (baseline.find("1/2") == std::string::npos)
+            return fail("F1-combinator-outer: baseline must show '1/2'");
+        if (baseline.find("outer") != std::string::npos)
+            return fail("F1-combinator-outer: baseline must NOT show 'outer'");
+
+        ctx.current_outer_iteration = 3;
+        std::string with_outer =
+            render_to_string(panels::render_performance(ctx, theme), 130, 24);
+        if (with_outer.find("outer 3") == std::string::npos)
+            return fail("F1-combinator-outer: must show 'outer 3' prefix");
+        if (with_outer.find("inner 1/2") == std::string::npos)
+            return fail("F1-combinator-outer: must show 'inner 1/2'");
+    }
+
+    // =================================================================
+    // mode-aware-status-pool: Pool mode renders WORK + DPs SUBMITTED
+    // instead of brainwallet's PHASE row. Smoke-checks that the
+    // pool-specific cells appear in the rendered output and that the
+    // brainwallet PHASE label is suppressed.
+    // =================================================================
+    {
+        using namespace collider::ui::tui;
+        auto theme = make_theme(ThemeVariant::Default);
+        panels::StatusContext st;
+        st.current_keys_per_sec = 850'000.0;
+        st.mode_kind = TuiMode::Pool;
+        st.pool_info.work_id = 0xDEADBEEFCAFE0001ULL;
+        st.pool_info.dp_bits = 24;
+        st.pool_info.kangaroo_type = "TAME_ONLY";
+        st.pool_info.dps_submitted = 4242;
+        st.pool_info.pool_total_dps = 999'999;
+        st.pool_info.your_share = 0.0042;
+        st.pool_info.pool_endpoint = "pool.example:8333";
+        std::string out = render_to_string(
+            panels::render_status(st, theme), 140, 16);
+        if (out.find("DPs SUBMITTED") == std::string::npos)
+            return fail("mode-aware-status-pool: DPs SUBMITTED row missing");
+        if (out.find("WORK") == std::string::npos)
+            return fail("mode-aware-status-pool: WORK row missing");
+        if (out.find("TAME_ONLY") == std::string::npos)
+            return fail("mode-aware-status-pool: kangaroo_type label missing");
+        if (out.find("PHASE") != std::string::npos)
+            return fail("mode-aware-status-pool: brainwallet PHASE row leaked");
+    }
+
+    // =================================================================
+    // mode-aware-status-challenge: Challenge mode renders KANGAROO OPS
+    // + PUZZLE rows; brainwallet PHASE row is suppressed.
+    // =================================================================
+    {
+        using namespace collider::ui::tui;
+        auto theme = make_theme(ThemeVariant::Default);
+        panels::StatusContext st;
+        st.current_keys_per_sec = 1'000'000'000.0;
+        st.mode_kind = TuiMode::Challenge;
+        st.challenge_info.puzzle_number = 68;
+        st.challenge_info.puzzle_bits   = 68;
+        st.challenge_info.ops_completed = 1'234'567'890ULL;
+        st.challenge_info.expected_ops  = 274'877'906'944ULL;  // ~2^38
+        st.challenge_info.dps_found     = 17;
+        st.challenge_info.backend_name  = "RCKangaroo";
+        std::string out = render_to_string(
+            panels::render_status(st, theme), 140, 16);
+        if (out.find("KANGAROO OPS") == std::string::npos)
+            return fail("mode-aware-status-challenge: ops row missing");
+        if (out.find("PUZZLE") == std::string::npos)
+            return fail("mode-aware-status-challenge: PUZZLE row missing");
+        if (out.find("RCKangaroo") == std::string::npos)
+            return fail("mode-aware-status-challenge: backend label missing");
+    }
+
+    // =================================================================
+    // mode-aware-status-bipscan: BipScan mode renders PHRASES +
+    // ADDRESSES + (when non-zero) HITS marker.
+    // =================================================================
+    {
+        using namespace collider::ui::tui;
+        auto theme = make_theme(ThemeVariant::Default);
+        panels::StatusContext st;
+        st.current_keys_per_sec = 50'000.0;
+        st.mode_kind = TuiMode::BipScan;
+        st.bip_scan_info.phrases_read = 12345;
+        st.bip_scan_info.phrases_valid = 9876;
+        st.bip_scan_info.addresses_probed = 1'200'000;
+        st.bip_scan_info.bloom_hits = 3;
+        std::string out = render_to_string(
+            panels::render_status(st, theme), 140, 16);
+        if (out.find("PHRASES") == std::string::npos)
+            return fail("mode-aware-status-bipscan: PHRASES row missing");
+        if (out.find("ADDRESSES") == std::string::npos)
+            return fail("mode-aware-status-bipscan: ADDRESSES row missing");
+        if (out.find("HITS") == std::string::npos)
+            return fail("mode-aware-status-bipscan: HITS marker missing");
+    }
+
+    // =================================================================
+    // mode-aware-status-bipscan-workers: WORKERS row variants. Pins
+    // the regression-prone surface where stale strings ("PBKDF2 is
+    // CPU-bound", "BIP scan runs on CPU") have appeared repeatedly.
+    //
+    // Case 1: GPU success path renders the all-on-GPU breadcrumb.
+    // Case 2: --no-bip-gpu renders the explicit flag breadcrumb.
+    // Case 3: init failure renders the dispatcher error message.
+    // Case 4: partial init renders "M of N GPU active" + warn row.
+    // =================================================================
+    {
+        using namespace collider::ui::tui;
+        auto theme = make_theme(ThemeVariant::Default);
+
+        // Case 1: all GPUs online, PBKDF2 + EC on GPU.
+        {
+            panels::StatusContext st;
+            st.mode_kind = TuiMode::BipScan;
+            st.bip_scan_info.worker_threads      = 23;
+            st.bip_scan_info.gpu_count           = 2;
+            st.bip_scan_info.gpu_count_requested = 2;
+            st.bip_scan_info.pbkdf_gpu_active    = true;
+            const std::string out = render_to_string(
+                panels::render_status(st, theme), 140, 24);
+            if (out.find("23 CPU") == std::string::npos)
+                return fail("workers case1: CPU count missing");
+            if (out.find("+ 2 GPU") == std::string::npos)
+                return fail("workers case1: GPU count missing");
+            if (out.find("PBKDF2 + EC + bloom on GPU") == std::string::npos)
+                return fail("workers case1: full-GPU breadcrumb missing");
+            // Regression guard: the OLD stale string MUST NOT appear.
+            if (out.find("PBKDF2 is CPU-bound") != std::string::npos)
+                return fail("workers case1: stale 'CPU-bound' string regressed");
+        }
+
+        // Case 2: --no-bip-gpu flag set, no GPU count.
+        {
+            panels::StatusContext st;
+            st.mode_kind = TuiMode::BipScan;
+            st.bip_scan_info.worker_threads        = 23;
+            st.bip_scan_info.gpu_count             = 0;
+            st.bip_scan_info.gpu_count_requested   = 2;
+            st.bip_scan_info.gpu_disabled_by_flag  = true;
+            const std::string out = render_to_string(
+                panels::render_status(st, theme), 140, 24);
+            if (out.find("--no-bip-gpu") == std::string::npos)
+                return fail("workers case2: --no-bip-gpu breadcrumb missing");
+        }
+
+        // Case 3: dispatcher init failed entirely.
+        {
+            panels::StatusContext st;
+            st.mode_kind = TuiMode::BipScan;
+            st.bip_scan_info.worker_threads      = 23;
+            st.bip_scan_info.gpu_count           = 0;
+            st.bip_scan_info.gpu_count_requested = 1;
+            st.bip_scan_info.gpu_init_message    = "cudaSetDevice failed";
+            const std::string out = render_to_string(
+                panels::render_status(st, theme), 140, 24);
+            if (out.find("GPU init failed") == std::string::npos)
+                return fail("workers case3: init-failure breadcrumb missing");
+            if (out.find("cudaSetDevice failed") == std::string::npos)
+                return fail("workers case3: cuda error string missing");
+        }
+
+        // Case 4: partial init (1 of 2 GPUs online), plus a per-GPU
+        // fault row should render in warn color.
+        {
+            panels::StatusContext st;
+            st.mode_kind = TuiMode::BipScan;
+            st.bip_scan_info.worker_threads      = 23;
+            st.bip_scan_info.gpu_count           = 1;
+            st.bip_scan_info.gpu_count_requested = 2;
+            st.bip_scan_info.pbkdf_gpu_active    = true;
+            BipScanInfo::FaultedDevice fd;
+            fd.device_id = 1;
+            fd.error     = "out of memory";
+            st.bip_scan_info.gpu_faulted_devices.push_back(fd);
+            const std::string out = render_to_string(
+                panels::render_status(st, theme), 140, 24);
+            if (out.find("1 of 2 GPU") == std::string::npos)
+                return fail("workers case4: partial-init breadcrumb missing");
+            if (out.find("GPU#1") == std::string::npos)
+                return fail("workers case4: per-device fault row missing");
+            if (out.find("out of memory") == std::string::npos)
+                return fail("workers case4: fault detail missing");
         }
     }
 

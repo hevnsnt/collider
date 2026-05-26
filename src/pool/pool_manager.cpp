@@ -4,6 +4,7 @@
 
 #include "core/paths.hpp"
 #include "core/secure_write.hpp"
+#include "core/worker_identity.hpp"  // B1 wire-v4 signed AUTH
 
 #include <chrono>
 #include <cstdio>
@@ -300,11 +301,17 @@ void PoolManager::persist_dp_seq_map() const {
 // behavior is identical in both. The supplied JLPPoolClient* must
 // outlive this call.
 void PoolManager::wire_client_callbacks(JLPPoolClient* jlp) {
-    // Solution callback: existing behavior (route to host solution_callback_).
-    jlp->set_solution_callback([this](const uint8_t* key) {
-        std::cout << "\n[PoolManager] SOLUTION FOUND BY POOL!" << std::endl;
+    // v1.5: Solution-broadcast callback. Fires when the pool server's
+    // SOLUTION frame arrives at the JLPPoolClient. We do NOT echo the
+    // 32-byte payload here -- the host-level callback (run_pool_mode)
+    // is the only place that decides what to do, and the v1.5 contract
+    // is "treat as stop signal, never persist or display the bytes".
+    jlp->set_solution_callback([this](const uint8_t* solution_payload) {
+        std::cout << "\n[PoolManager] SOLUTION FOUND BY POOL "
+                     "-- forwarding stop signal to host."
+                  << std::endl;
         if (solution_callback_) {
-            solution_callback_(key, config_.worker_name);
+            solution_callback_(solution_payload, config_.worker_name);
         }
     });
 
@@ -390,6 +397,10 @@ bool PoolManager::connect() {
         jlp_client->set_verify_cert(config_.verify_cert);
         jlp_raw = jlp_client.get();
         client_ = std::move(jlp_client);
+        // B1 wire-v4: if --worker-key was supplied, load the WIF and
+        // attach the signed identity to this client (and every future
+        // reconnect-created client) so AUTH frames are v4-signed.
+        apply_worker_identity(jlp_raw);
     } else if (config_.type == POOL_TYPE_HTTP) {
         std::cerr << "[PoolManager] HTTP pool deprecated; use jlp:// or jlps://"
                   << std::endl;
@@ -605,10 +616,23 @@ void PoolManager::submit_dp(const uint8_t* x, const uint8_t* d, uint8_t type, ui
 
 void PoolManager::submit_dp(const DistinguishedPoint& dp) {
     if (!is_connected()) {
-        // Queue is decoupled from connection state, but we should not
-        // accept DPs while disconnected -- the supervisor may take a
-        // while to come back, by which point the work_id might have
-        // rolled and these DPs are stale.
+        // Reconnect-window buffer (audit #21): hold the DP in a bounded
+        // side queue until the supervisor brings a new client up + the
+        // post-AUTH_OK WORK_REQ resolves. On successful reconnect the
+        // drain step in supervisor_loop() replays these into the new
+        // client's queue. If the buffer is also full, the DP is truly
+        // dropped (operator-visible via dropped_count_); the cap is
+        // generous enough that only multi-minute outages can hit it.
+        // Stale-work_id concern is moot: the buffered DP carries its
+        // work_id, and the server-side replay-defence rejects stale
+        // ones cheaply at AUTH-time.
+        std::lock_guard<std::mutex> lock(reconnect_buf_mutex_);
+        if (reconnect_buffer_.size() < kReconnectBufferCap) {
+            reconnect_buffer_.push_back(dp);
+            reconnect_buffered_total_.fetch_add(1,
+                                                std::memory_order_relaxed);
+            return;
+        }
         dropped_count_.fetch_add(1, std::memory_order_relaxed);
         return;
     }
@@ -654,14 +678,10 @@ double PoolManager::get_submission_rate() const {
     return static_cast<double>(sent_count_.load()) / elapsed;
 }
 
-void PoolManager::report_solution(const uint8_t* private_key) {
-    if (!is_connected()) {
-        return;
-    }
-
-    std::cout << "[PoolManager] Reporting solution to pool..." << std::endl;
-    client_->report_solution(private_key);
-}
+// v1.5: PoolManager::report_solution() was DELETED together with the
+// underlying PoolClient::report_solution and JLPPoolClient::report_solution
+// surfaces. The pool server (collision-protocol) is the sole key-computer.
+// See .claude/tasks/v1.5-asymmetric-kangaroo.md.
 
 std::string PoolManager::get_status_string() const {
     std::stringstream ss;
@@ -842,6 +862,9 @@ void PoolManager::supervisor_loop() {
         // connect() so seq seeding, WORK_ASN dedup, and on-wire sent
         // counts work identically on reconnect.
         wire_client_callbacks(jlp_raw);
+        // B1 wire-v4: re-attach the cached identity on every fresh
+        // reconnect-created client so v4 AUTH survives drops.
+        apply_worker_identity(jlp_raw);
 
         if (!client_->connect(config_.host, config_.port)) {
             ++consecutive_failures;
@@ -911,6 +934,46 @@ void PoolManager::supervisor_loop() {
         consecutive_auth_failures = 0;
         std::cout << "[PoolManager] Reconnected to pool as "
                   << config_.worker_name << std::endl;
+
+        // Audit #21 drain: replay DPs the producer buffered while we
+        // were mid-reconnect. Lock + swap so the producer is unblocked
+        // for the duration of the (potentially large) replay; new DPs
+        // arriving during the drain go straight to client_->submit_dp
+        // because connected_ is already true at this point.
+        std::deque<DistinguishedPoint> to_replay;
+        {
+            std::lock_guard<std::mutex> lock(reconnect_buf_mutex_);
+            to_replay.swap(reconnect_buffer_);
+        }
+        uint64_t replayed_ok = 0;
+        uint64_t replayed_drop = 0;
+        for (const auto& dp : to_replay) {
+            if (client_->submit_dp(dp)) {
+                ++replayed_ok;
+            } else {
+                ++replayed_drop;
+            }
+        }
+        if (replayed_ok > 0) {
+            reconnect_replayed_total_.fetch_add(replayed_ok,
+                                                std::memory_order_relaxed);
+            enqueued_count_.fetch_add(replayed_ok,
+                                      std::memory_order_relaxed);
+        }
+        if (replayed_drop > 0) {
+            dropped_count_.fetch_add(replayed_drop,
+                                     std::memory_order_relaxed);
+        }
+        if (!to_replay.empty()) {
+            std::cout << "[PoolManager] Replayed "
+                      << replayed_ok << " buffered DP(s) post-reconnect"
+                      << (replayed_drop > 0
+                              ? std::string(" (") +
+                                    std::to_string(replayed_drop) +
+                                    " could not be requeued)"
+                              : std::string{})
+                      << std::endl;
+        }
     }
 }
 
@@ -1006,6 +1069,62 @@ bool parse_pool_url(const std::string& url, PoolConfig& config) {
     }
 
     return true;
+}
+
+void PoolManager::apply_worker_identity(JLPPoolClient* jlp) {
+    if (!jlp) return;
+    if (config_.worker_key_file.empty()) return;  // v3 path; nothing to do.
+
+    // Load once and cache. Subsequent reconnects re-attach the same
+    // shared_ptr so the EC_KEY isn't rebuilt every disconnect.
+    if (!worker_identity_) {
+        std::ifstream f(config_.worker_key_file);
+        if (!f) {
+            std::cerr << "[PoolManager] --worker-key: cannot open "
+                      << config_.worker_key_file
+                      << " (wire-v4 disabled; falling back to v3 AUTH)\n";
+            return;
+        }
+        std::string wif;
+        std::getline(f, wif);
+        // Strip trailing whitespace / CR.
+        while (!wif.empty() && (wif.back() == '\r' || wif.back() == '\n'
+                                || wif.back() == ' ' || wif.back() == '\t')) {
+            wif.pop_back();
+        }
+        if (wif.empty()) {
+            std::cerr << "[PoolManager] --worker-key: file is empty "
+                      << "(wire-v4 disabled)\n";
+            return;
+        }
+        // Mainnet bech32 hrp ("bc"). If the operator is on testnet, a
+        // future --worker-key-testnet flag will pass hrp="tb"; until
+        // then mainnet is the only deployment scenario.
+        auto id = collider::identity::load_from_wif(wif, "bc");
+        // Wipe local string copy as soon as it's been consumed.
+        std::fill(wif.begin(), wif.end(), '\0');
+        if (!id) {
+            std::cerr << "[PoolManager] --worker-key: WIF load failed "
+                      << "(malformed or uncompressed key); wire-v4 disabled\n";
+            return;
+        }
+        // Operator sanity check: bech32 derived from the WIF MUST match
+        // the --worker name. If not, AUTH would fail on the server
+        // anyway; surface the mismatch here so the operator notices
+        // before connect attempts pile up.
+        if (id->bech32_address() != config_.worker_name) {
+            std::cerr << "[PoolManager] --worker-key: bech32 derived "
+                      << "from key (" << id->bech32_address()
+                      << ") does not match --worker (" << config_.worker_name
+                      << "); wire-v4 disabled\n";
+            return;
+        }
+        worker_identity_ =
+            std::make_shared<collider::identity::WorkerIdentity>(std::move(*id));
+        std::cerr << "[PoolManager] wire-v4 signed AUTH enabled "
+                  << "(worker=" << config_.worker_name << ")\n";
+    }
+    jlp->set_worker_identity(worker_identity_);
 }
 
 } // namespace pool

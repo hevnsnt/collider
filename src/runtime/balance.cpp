@@ -92,13 +92,18 @@ public:
     }
 
     ~BalanceFetcher() {
-        // Request stop on every slot first, then join. With the
-        // libcurl/curl-cli backend the HTTP call is bounded by its own
-        // CONNECT_TIMEOUT (curl default 300s) and we cannot interrupt
-        // popen() mid-read. In practice mempool.space responds in <1s
-        // so the join is fast; on shutdown we accept a short wait
-        // rather than leaking a detached process state.
-        std::lock_guard<std::mutex> lk(mu_);
+        // No lock here on purpose. This is a Meyers-singleton destructor
+        // that runs during process teardown after main() returned, so no
+        // other thread can still be calling spawn() against this object
+        // (the runtime is gone, the menu is gone). On macOS, taking the
+        // mutex during static destruction has been observed to throw
+        // std::system_error("mutex lock failed: Invalid argument") at
+        // process exit -- Apple's pthread teardown invalidates the
+        // mutex's internal state earlier than glibc/MSVC do. Skipping
+        // the lock at this point is safe by construction; if it ever
+        // stops being safe, the right fix is to make BalanceFetcher
+        // an explicit lifetime (RAII inside main) rather than a
+        // Meyers singleton, not to reinstate the lock.
         for (auto& s : slots_) {
             s->stop_requested.store(true, std::memory_order_release);
         }

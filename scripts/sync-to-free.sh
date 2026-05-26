@@ -190,8 +190,18 @@ PRO_PATHS=(
 # -----------------------------------------------------------------------------
 # Public-only paths -- the public Free repo owns these, do not overwrite.
 # -----------------------------------------------------------------------------
+# LICENSE was previously in this list because the Free repo had been
+# bootstrapped with an MIT LICENSE and the Pro tree had no LICENSE at all,
+# so preserving the public file was the only sane behavior at sync time.
+# That state was a GPL violation: the Free distribution statically links
+# the GPLv3-licensed third_party/RCKangaroo/ source, so the Free binary
+# distribution (and therefore the Free source tree) must be GPLv3, not
+# MIT. The Pro tree now carries a GPLv3 LICENSE at the root that names
+# SixCyber LLC as the copyright holder of the original code and references
+# THIRD_PARTY_LICENSES.md for the dependency inventory. Removing LICENSE
+# from PRESERVE_PATHS lets that file overwrite Free's stale MIT LICENSE
+# on the next sync, bringing Free into GPLv3 compliance.
 PRESERVE_PATHS=(
-    "LICENSE"
     "build_macos.sh"
     "src/core/edition.hpp"
 

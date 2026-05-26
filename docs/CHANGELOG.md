@@ -8,6 +8,49 @@ This changelog covers both the Free and **(PRO VERSION ONLY)** editions. Pro-onl
 
 ---
 
+## [1.5.0] - 2026-05-21: Theft-Resistance Architecture (Mainnet)
+
+Pool architecture rewrite that closes the v1.4.x worker self-solve theft window. In v1.4.x a pool worker who found the cross-collision computed the puzzle's private key locally and could sweep the funds before the pool ever saw the solution. In v1.5 the algorithm itself denies any single worker the data needed to compute the key: each worker runs ONLY tame kangaroos OR ONLY wild kangaroos, the host-side collision detection is disabled in pool mode, and the pool server is the sole place where cross-type DPs aggregate. The server detects the collision, computes the key, broadcasts a hot-wallet sweep transaction, waits for cross-provider attestation that the sweep has propagated, and only then notifies workers that the puzzle is solved.
+
+The full v1.5 security audit (see `collision-protocol/docs/v1.5-security-audit-report.md` in the pool server repo) cleared all five mainnet-blocking findings. Audit summary: 305 tests pass across both repos, 2 skipped, 0 failures, including the Wave 9 C1-specific end-to-end scenario.
+
+### BREAKING
+
+- **JLP protocol version bump to v3.** v1.4.x clients are refused at AUTH with reason `UPGRADE_REQUIRED`. There is no compatibility shim. The wire-layer reason is theft-resistance: a v1.4.x worker connecting to a v1.5 server would still receive a v3 `WORK_ASN` it cannot interpret, and a v1.4.x worker connecting to a v1.4.x server still computes keys locally. The clean break forces the network to upgrade together.
+- **`report_solution()` removed from the client.** `JLPPoolClient::report_solution`, `PoolManager::report_solution`, the `recovered_keys/` JSON persistence, the SecureBuffer-staged private key in the retry uploader, and the `cb.on_solution` lambda in `pool_solver.cpp` are all deleted. The client never computes nor handles a private key in pool mode. SOLUTION is a server-to-client message only; the server's `_handle_solution` inbound path is removed.
+- **Server-side: `sweep_service.MempoolClient.broadcast()` return type changed** (collision-protocol). Previously returned a bare `str` (the txid hex). v1.5 returns `tuple[str, str] = (txid_hex, broadcast_url)`. The second element identifies which provider accepted the broadcast so the cross-provider attestation step can route its propagation poll to a DIFFERENT provider (the audit C1 fix). Operators with a custom `MempoolClient` stub, a private mempool integration, or any other consumer of the broadcast return value MUST update their call sites to unpack the tuple. Code that does `txid = client.broadcast(raw_hex)` will now bind a tuple to `txid` and fail downstream; rewrite as `txid, broadcast_url = client.broadcast(raw_hex)`. This is a server-only change; no impact on the v1.5 worker client.
+
+### New (PRO VERSION ONLY and Free, pool runtime)
+
+- **Asymmetric tame/wild work assignment.** `RCGpuKang::KangarooMode { BOTH, TAME_ONLY, WILD_ONLY }` in the forked RCKangaroo. `BOTH` is rejected by `CudaRCKangarooBackend::initialize` in pool mode with an explicit "would re-enable v1.4.x theft-vulnerable local solve path" error. The host-side DP hashtable is disabled in type-only modes; DPs flow straight to the network. The `result.found = true` path is removed; the kangaroo loop exits only on external stop. Standalone (non-pool) mode keeps `BOTH` and is unchanged.
+- **Wire schema v3 `WORK_ASN`.** Adds `kangaroo_type: u8`, `start_offset_a: u64`, `start_offset_b: u64`. The protocol IDL is regenerated to Python and C++ codecs from `protocol/jlp.yaml`. Standalone mode does not touch the new fields.
+- **Single-strike permanent ban for type-mismatched DPs.** A v1.5 worker submitting a wild DP while assigned tame (or vice versa) is unambiguous binary modification, not honest-but-buggy behavior. The pool server bans the originating IP permanently on first occurrence, bypassing the rolling-window invalid-DP escalation ladder. The type check fires before bloom insertion and before the pending buffer, so a malicious DP cannot poison the collision search.
+
+### Security
+
+- **All five mainnet-blocking audit findings closed.** The full audit lives in `collision-protocol/docs/v1.5-security-audit-report.md`. Summary:
+  - **C1 (BLOCKING)**: sweep propagation is now gated on cross-provider attestation. The pool server broadcasts the sweep tx via one provider, polls the OTHER provider with a hard timeout, and refuses to release the SOLUTION wire message until the second provider observes the tx. Blind 3-second sleep is gone.
+  - **S1**: legacy P2PKH SIGHASH_ALL signing pinned against the Bitcoin Wiki canonical KAT.
+  - **S2**: BIP-143 P2WPKH signing pinned against the BIP-143 spec KAT.
+  - **A1**: strict integer parsing applied at both the Next.js admin route gate and the Python service layer.
+  - **O1**: `SOLUTION.txt` writes now route through `ServerConfig.data_dir` instead of a hard-coded `./data/SOLUTION.txt`.
+- **Sweep before SOLUTION ordering**. The pool server signs and broadcasts the sweep tx, confirms propagation via the other provider, AND THEN broadcasts SOLUTION. Workers receive a private key whose puzzle UTXOs are already moving (or already moved) and cannot win the race even if they extract the key from the SOLUTION payload.
+- **Cross-provider attestation is symmetric and pinned by name.** The set-subtraction logic that picks the attest provider guarantees broadcast and attestation hit DIFFERENT providers regardless of which one served as primary. The regression tests `test_propagation_attests_via_FALLBACK_when_broadcast_used_PRIMARY` and `test_propagation_attests_via_PRIMARY_when_broadcast_used_FALLBACK` are pinned by name and must not be renamed without auditor sign-off.
+- **Hot wallet hardening (collision-protocol).** argon2id KDF (m=64 MiB, t=3, p=4) + AES-256-GCM, 77-byte encrypted file at mode 0600. The sweep service refuses to broadcast SOLUTION if the wallet cannot decrypt at startup. Per-puzzle key rotation is the recommended deployment posture; see `collision-protocol/docs/HOT-WALLET.md`.
+
+### Operator-facing
+
+- **Migration guide**: `docs/MIGRATION-v1.5.md` documents the v1.4.x to v1.5 upgrade path. Workers must upgrade to v1.5 to keep mining. Pool operators must provision a hot wallet, configure two DISTINCT mempool API providers, and seed at least one Firebase Auth admin before the admin payout UI is functional.
+- **Test coverage**: 304 tests pass across collider-pro plus collision-protocol, 2 skipped, 0 failures. New pinned tests cover cross-provider attestation by name (do not rename without auditor sign-off).
+- **`docs/PRO.md`, `docs/POOL.md` updated** with the v1.5 worker experience: "you are assigned TAME or WILD on connect; you never see the puzzle's private key; payouts are operator-triggered via the admin UI to your registered Bitcoin address."
+
+### Removed
+
+- **`report_solution` plumbing in `JLPPoolClient` and `PoolManager`** including the retry uploader jthread, the SecureBuffer key staging, and the `recovered_keys/*.json` persistence path. No code path in the v1.5 client receives or computes a private key in pool mode.
+- **Legacy `_handle_solution` inbound path in the pool server**. SOLUTION is now server-originated only.
+
+---
+
 ## [1.4.2] - 2026-05-17
 
 A-tier stabilization release. Three waves of fixes across performance honesty, security posture, code quality, and build/sync hygiene. Driven by a six-reviewer adversarial validation pass on the v1.4.2 line. The headline correctness work is the full-pipeline benchmark, the dynamic per-GPU work balancer, the kangaroo `cudaMemcpy` hoisting, and the secret-handling cleanup (`SecureBuffer`, `secure_open_ofstream`, constant-time license compare).

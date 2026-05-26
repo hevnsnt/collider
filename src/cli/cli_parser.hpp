@@ -89,6 +89,53 @@ private:
  */
 struct Arguments {
     std::vector<int> gpu_ids = {};  // Empty = auto-detect available GPUs
+    // v1.5.x: kangaroo backend choice. Empty string = pick the default
+    // (collider::kangaroo::default_backend(), which prefers CUDA > Metal
+    // > CPU). Set via --backend cpu|cuda|metal. Pool / puzzle solvers
+    // call collider::kangaroo::parse_backend_kind on this; unknown values
+    // are a hard error at args validation time. Pre-1.5 this was a
+    // compile-time decision; runtime selection lets a single binary
+    // expose every backend the build pulled in.
+    std::string backend_kind;
+    // v1.5.x Phase F2: standalone-challenge algorithm choice.
+    //   "" (default)      -> Kangaroo (RCKangaroo / MultiGPU / CPU)
+    //   "bsgs"            -> GPU BSGS (capped at bits<=48 for the
+    //                        first cut; see gpu/bsgs_solver_gpu.hpp)
+    // Set via --solver bsgs. Pool mode ignores this (pool is
+    // kangaroo-only by protocol design).
+    std::string solver;
+    // v1.5.x BIP scanner mode (--bip-scan + --bip-scan-wordlist).
+    // bip_scan_mode: true when --bip-scan is passed; main.cpp routes
+    // to run_bip_scan_mode instead of the brainwallet / puzzle paths.
+    // bip_scan_wordlist: path to a file of candidate mnemonic phrases
+    // (one per line, whitespace-separated 12/15/18/21/24 words).
+    bool bip_scan_mode = false;
+    std::string bip_scan_wordlist;
+    // v1.5.0: exhaustive entropy-space enumeration. When set, the BIP
+    // scanner ignores bip_scan_wordlist and instead iterates every
+    // possible BIP-39 entropy value starting from
+    // bip_combinatorial_start (default: resumed from
+    // ~/.collider/bip_combinatorial.json). Word count is
+    // bip_combinatorial_word_count (default 12). The search space is
+    // 2^128 / 2^160 / 2^192 / 2^224 / 2^256 depending on word count;
+    // exhausting it is not physically possible, but the scanner makes
+    // checkpoint-resumable progress and can be left running.
+    bool bip_combinatorial = false;
+    int  bip_combinatorial_word_count = 12;  // 12/15/18/21/24
+    // GPU dispatch: every derived priv key flows through the shared
+    // MultiAddressSession kernel (secp256k1 + hash160 + bloom probe)
+    // by default. --no-bip-gpu falls back to the pure-CPU path,
+    // useful for KAT validation or when GPU dispatch is unavailable.
+    bool bip_no_gpu = false;
+    // v1.5.x: kangaroo count override (K). 0 = backend default
+    // (CPU: thread-driven, MultiGPU: 1<<18 per GPU, RCKangaroo:
+    // kernel-grid-driven). When set, MultiGPU uses this as the per-GPU
+    // kangaroo count. RCKangaroo's count is derived from the kernel
+    // launch shape (mpCnt * BLOCK_SIZE * PNT_GROUP_CNT in the third-
+    // party kernel); --kangaroos is accepted but informational there.
+    // Higher K = more VRAM (linear in K) and faster DP generation up
+    // to GPU saturation, then diminishing returns.
+    int num_kangaroos = 0;
     size_t batch_size = 4'000'000;
     // When true, the runner auto-sizes batch_size to fit the configured rule
     // engine's worst-case per-GPU passphrase fan-out before allocating GPU
@@ -235,6 +282,16 @@ struct Arguments {
                                           // CR/LF. Wins over --pool-password
                                           // when both are supplied.
     std::string pool_api_key;             // API key for HTTP pools (optional)
+
+    // B1 wire-v4: path to a 0600 WIF file that holds the worker's BTC
+    // private key. When set, the JLPPoolClient signs AUTH frames with
+    // this key and emits wire-v4 (217-byte) AUTH; otherwise it emits
+    // wire-v3 unchanged. The derived bech32 address MUST equal
+    // --worker; mismatch surfaces as AUTH_FAIL on the server side.
+    // Operators only set this flag once the pool server has cut over
+    // to PROTOCOL_VERSION_MIN=4. See docs/internals/jlp-pool-client.md
+    // "wire-v4 cutover" once that lands.
+    std::string pool_worker_key_file;
 
     // Config file
     std::string config_file;              // Custom config file path (default: ./config.yml)

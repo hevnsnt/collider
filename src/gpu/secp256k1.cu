@@ -14,6 +14,7 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 #include <cstdio>
+#include <iostream>
 
 // Tier 1 perf (F-inv): shared addition-chain mod_inv (see header for
 // rationale; also consumed by fused_pipeline.cu against its own
@@ -915,7 +916,14 @@ cudaError_t secp256k1_init_table(cudaStream_t stream) {
     if (err != cudaSuccess) return err;
 
     if (device_id >= MAX_GPU_DEVICES) {
-        fprintf(stderr, "[EC] Device ID %d exceeds max supported devices (%d)\n", device_id, MAX_GPU_DEVICES);
+        // Route through std::cerr (not fprintf) so the TUI's
+        // StdioCapture hijack at boot intercepts the line and
+        // routes it to the boot log instead of leaking onto the
+        // alt-screen background. fprintf writes directly to the
+        // file descriptor and bypasses the rdbuf swap.
+        std::cerr << "[EC] Device ID " << device_id
+                  << " exceeds max supported devices (" << MAX_GPU_DEVICES
+                  << ")\n";
         return cudaErrorInvalidDevice;
     }
 
@@ -928,24 +936,52 @@ cudaError_t secp256k1_init_table(cudaStream_t stream) {
     size_t table_size = EC_NUM_WINDOWS * EC_TABLE_SIZE * sizeof(PrecomputedPoint);
     err = cudaMalloc(&g_precomputed_tables[device_id], table_size);
     if (err != cudaSuccess) {
-        fprintf(stderr, "[EC] GPU %d: Failed to allocate precomputed table: %s\n", device_id, cudaGetErrorString(err));
+        std::cerr << "[EC] GPU " << device_id
+                  << ": Failed to allocate precomputed table: "
+                  << cudaGetErrorString(err) << "\n";
         return err;
     }
 
-    // Generate table on this device
-    generate_precomputed_table_kernel<<<1, 1, 0, stream>>>(g_precomputed_tables[device_id]);
+    // Drain any sticky context error BEFORE the launch. On a fresh
+    // secondary device the primary CUDA context is created lazily and
+    // the first kernel launch into a user stream sometimes inherits a
+    // benign cudaErrorNotReady / cudaErrorInvalidValue from the lazy-
+    // init transition that makes the subsequent cudaGetLastError()
+    // report "invalid argument" even though the launch itself was
+    // configured correctly. (User report 2026-05-26: 2nd device in
+    // cudaSetDevice enumeration order consistently fails generate-
+    // table launch with `err=invalid argument` while the 1st device
+    // succeeds.) Force context materialization with a tiny no-op
+    // device call, then clear any residual sticky error before the
+    // real launch so the post-launch error check reflects only the
+    // launch we care about.
+    (void)cudaDeviceSynchronize();
+    (void)cudaGetLastError();
+
+    // Generate table on this device. Use the legacy default stream
+    // (0) instead of the runner's per-context stream so this one-time
+    // init doesn't depend on the caller-created stream being fully
+    // attached to the current device's context. The kernel runs once
+    // per device, off the hot path; the per-launch overhead of the
+    // default stream is irrelevant here.
+    generate_precomputed_table_kernel<<<1, 1, 0, 0>>>(g_precomputed_tables[device_id]);
     err = cudaGetLastError();
     if (err != cudaSuccess) {
-        fprintf(stderr, "[EC] GPU %d: Failed to generate table: %s\n", device_id, cudaGetErrorString(err));
+        std::cerr << "[EC] GPU " << device_id
+                  << ": Failed to generate table: "
+                  << cudaGetErrorString(err) << "\n";
         cudaFree(g_precomputed_tables[device_id]);
         g_precomputed_tables[device_id] = nullptr;
         return err;
     }
 
-    // Wait for generation to complete
-    err = cudaStreamSynchronize(stream);
+    // Wait for generation to complete on the default stream. Pair with
+    // the launch on stream 0 above.
+    err = cudaDeviceSynchronize();
     if (err != cudaSuccess) {
-        fprintf(stderr, "[EC] GPU %d: Table generation sync failed: %s\n", device_id, cudaGetErrorString(err));
+        std::cerr << "[EC] GPU " << device_id
+                  << ": Table generation sync failed: "
+                  << cudaGetErrorString(err) << "\n";
         return err;
     }
 
