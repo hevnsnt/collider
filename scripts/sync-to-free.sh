@@ -128,6 +128,45 @@ PRO_PATHS=(
     "src/gpu/bloom_filter.cu"
     "src/gpu/fused_pipeline.cu"
 
+    # v1.5.0: BIP scanner runtime + GPU dispatcher + BIP-32/39 helpers.
+    # The runner iterates BIP-39 candidate phrases and derives BIP-32
+    # children across historical + modern derivation paths (pre-BIP-44,
+    # Electrum, MultiBit, BIP-44/49/84); the GPU dispatcher routes the
+    # per-pubkey work through MultiAddressSession (secp256k1 + hash160
+    # + bloom probe). Pro-only; main.cpp's run_bip_scan_mode dispatch
+    # is already gated by #ifdef COLLIDER_PRO but the SOURCE files
+    # would otherwise leak proprietary scan strategy + derivation
+    # plumbing to the free repo and be re-enabled by any fork flipping
+    # COLLIDER_PRO=ON. The supporting GPU primitives (bip39_pbkdf2,
+    # hmac_sha512_device, sha512_device) are exclusively consumed by
+    # BIP scanner code; verified by grep at sync-script extension time
+    # (no bench_pipeline / warpwallet / kangaroo TU includes them).
+    "src/core/bip32.hpp"
+    "src/core/bip39.hpp"
+    "src/gpu/bip39_pbkdf2.cu"
+    "src/gpu/bip39_pbkdf2.cuh"
+    "src/gpu/hmac_sha512_device.cuh"
+    "src/gpu/sha512_device.cuh"
+    "src/runtime/bip_address.hpp"
+    "src/runtime/bip_gpu_dispatcher.cpp"
+    "src/runtime/bip_gpu_dispatcher.hpp"
+    "src/runtime/bip_scanner_runner.cpp"
+    "src/runtime/bip_scanner_runner.hpp"
+
+    # BIP scanner test corpus. Each test links collider_core which in
+    # the free build does NOT have the BIP runtime, so leaving these
+    # in would either fail to link or compile to empty tests. The
+    # CMakeLists already guards each entry with if(EXISTS); shipping
+    # only the harness without the targets just adds dead files.
+    "tests/test_bip32_kat.cpp"
+    "tests/test_bip39_validate.cpp"
+    "tests/test_bip39_pbkdf2_kat.cpp"
+    "tests/test_bip39_pbkdf2_gpu_kat.cpp"
+    "tests/test_bip_gpu_dispatcher.cpp"
+    "tests/test_bip49_p2sh_p2wpkh_kat.cpp"
+    "tests/test_bip_scan_runner_smoke.cpp"
+    "tests/test_device_hmac_sha512.cu"
+
     # Brain-wallet rule files + scraper outputs at repo root
     "rules/"
     "scrapers/"
