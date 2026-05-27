@@ -248,6 +248,17 @@ PRO_PATHS=(
 
     # Template directory: internal to the sync toolchain; never published.
     "scripts/templates/"
+
+    # Internal pre-release audit + pen-test + team-plan markdown at repo
+    # root. These are scratch artifacts from the v1.5.0 GA review wave
+    # (and successors). They contain internal threat-model notes,
+    # auditor names, and unredacted finding IDs that we do not surface
+    # to the public free repo. Glob form so future passes (AUDIT_V1_6_*,
+    # TEAM_PLAN_V1_5_1_*, PENTEST_*) are excluded automatically without
+    # another sync-script edit.
+    "AUDIT_*.md"
+    "PENTEST_*.md"
+    "TEAM_PLAN_*.md"
 )
 
 # -----------------------------------------------------------------------------
@@ -346,6 +357,15 @@ ORPHAN_PATHS=(
     # writing issues that have since been patched). Tracked in Free HEAD
     # but already removed from the working tree.
     "SECURITY-AUDIT-REPORT.md"
+
+    # v1.5.0 GA audit + pen-test + team-plan markdown that leaked to the
+    # free repo before the PRO_PATHS glob (AUDIT_*.md / PENTEST_*.md /
+    # TEAM_PLAN_*.md) was added. Listed explicitly so the next sync
+    # removes them with an auditable log line. The PRO_PATHS glob now
+    # blocks future occurrences automatically.
+    "AUDIT_V1_5_0.md"
+    "AUDIT_V1_5_0_PASS_3.md"
+    "TEAM_PLAN_V1_5_0_GA.md"
 
     # http_pool_client.{cpp,hpp} were deleted from Pro because the HTTP
     # transport silently downgraded https:// pool URLs (CHANGELOG entry
