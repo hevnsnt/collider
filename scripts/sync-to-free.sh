@@ -90,14 +90,38 @@ PRO_PATHS=(
     # overhaul). These are consumed exclusively by brain_wallet_runner;
     # main.cpp, puzzle_solver.cpp, and pool_solver.cpp do not include
     # them. Verified by grep at sync-script extension time.
+    #
+    # NOTE: src/runtime/runtime_control.hpp was previously listed here
+    # but it is ALSO included (hard #include, not just via the TUI
+    # layer) by free-side files: pool_solver.cpp (rc.banner_text +
+    # banner_mu for status messages), puzzle_solver_bsgs.cpp,
+    # puzzle_solver_helpers.cpp, and main.cpp (state reset between
+    # interactive-menu picks). Removing it broke the free build at
+    # v1.5.0 first sync ("fatal error: runtime/runtime_control.hpp:
+    # No such file or directory" in pool_solver.cpp). The header
+    # itself only depends on standard library + gpu_caps.hpp (free)
+    # so it is free-compatible by content.
     "src/runtime/scan_state.hpp"
-    "src/runtime/runtime_control.hpp"
     "src/runtime/runtime_config_yaml.hpp"
     "src/runtime/runtime_config_yaml.cpp"
     "src/runtime/perf_instrumentation.hpp"
     "src/runtime/perf_instrumentation.cpp"
     "src/runtime/empty_hit_writer.hpp"
     "src/runtime/empty_hit_writer.cpp"
+
+    # Interactive menu + TUI settings sidecar (added v1.5.0).
+    # interactive_ui.cpp hard-#includes ui/tui/menu/main_menu.hpp which
+    # lives under the excluded src/ui/tui/ prefix; settings_sidecar.hpp
+    # hard-#includes ui/tui/panels/settings_panel.hpp. Free's pool /
+    # puzzle / benchmark code paths do not need either: in free, mode
+    # selection comes from CLI flags (--puzzle N, --pool, --benchmark)
+    # rather than an interactive menu, and the TUI settings sidecar
+    # only persists state for the brain-wallet dashboard. Free-side
+    # callers in main.cpp / pool_solver.cpp / puzzle_solver_kangaroo.cpp
+    # are #ifdef COLLIDER_PRO-gated.
+    "src/ui/interactive_ui.cpp"
+    "src/ui/interactive_ui.hpp"
+    "src/core/settings_sidecar.hpp"
 
     # Subprocess plugin runner: PRO-only feature wired into brain-wallet
     # pipeline (hit-feed plugins for Slack notify, balance enrich, etc.).
@@ -505,6 +529,42 @@ if [[ -f "$FREE_WORKFLOW_TEMPLATE" ]]; then
     echo "[sync] installed free CI workflow from template"
 else
     echo "[sync] WARNING: free-build-release.yml template not found at $FREE_WORKFLOW_TEMPLATE" >&2
+fi
+
+# -----------------------------------------------------------------------------
+# Install free-side STUB headers at Pro paths.
+#
+# v1.5.0 introduced Pro TUI integration into formerly-free files:
+# pool_solver.cpp, puzzle_solver.cpp, puzzle_solver_kangaroo.cpp,
+# puzzle_solver_bsgs.cpp, puzzle_solver_bruteforce.cpp now reference
+# ui/tui/* symbols (StdioCapture, TuiApp, LaunchConfig, etc.) through
+# unguarded #include + method calls. Rather than #ifdef-gating ~60
+# callsites across those free-shipped files, we install no-op stub
+# headers at the same paths in the free tree. Each stub matches the
+# Pro symbol surface (types + method signatures) so the includes
+# resolve and call sites compile; every method body is a no-op so
+# the free binary just discards TUI updates silently.
+#
+# The stubs live in scripts/templates/free_stubs/ with the same
+# relative paths as the Pro originals. After the wipe + Pro-tree
+# copy (which omits PRO_PATHS entries like src/ui/tui/), we walk
+# the stubs directory and copy each file into the free tree.
+# The Pro originals are NOT copied here (already excluded via
+# PRO_PATHS); the stubs are the ONLY definitions free sees.
+# -----------------------------------------------------------------------------
+FREE_STUBS_ROOT="$PRIVATE_DIR/scripts/templates/free_stubs"
+if [[ -d "$FREE_STUBS_ROOT" ]]; then
+    stub_count=0
+    while IFS= read -r -d '' stub; do
+        rel="${stub#$FREE_STUBS_ROOT/}"
+        dest_dir="$(dirname "$rel")"
+        mkdir -p "$dest_dir"
+        cp "$stub" "$rel"
+        stub_count=$((stub_count + 1))
+    done < <(find "$FREE_STUBS_ROOT" -type f -print0)
+    echo "[sync] installed $stub_count free-side stub header(s) from scripts/templates/free_stubs/"
+else
+    echo "[sync] note: no free-side stubs dir at $FREE_STUBS_ROOT (skipping)"
 fi
 
 # -----------------------------------------------------------------------------

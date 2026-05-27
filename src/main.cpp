@@ -64,10 +64,10 @@
 #include "runtime/runtime_globals.hpp"
 #include "runtime/runtime_control.hpp"      // global_runtime_control reset
 #include "ui/interactive.hpp"               // Interactive::display_header
-#include "ui/interactive_ui.hpp"
 #ifdef COLLIDER_PRO
+#include "ui/interactive_ui.hpp"             // interactive menu (PRO-only: includes TUI menu/panels)
 #include "core/paths.hpp"                    // TR-1: collider_home for logs
-#include "core/settings_sidecar.hpp"        // TR-5: load TUI settings
+#include "core/settings_sidecar.hpp"        // TR-5: load TUI settings (includes panels::SettingsValues)
 #include "runtime/brain_wallet_runner.hpp"
 #include "runtime/bip_scanner_runner.hpp"
 #include "ui/tui/stdio_capture.hpp"          // TR-1 / TR-7: post-menu cout/cerr
@@ -217,13 +217,15 @@ static int main_impl(int argc, char* argv[]) {
         collider::apply_config_to_args(args, app_config, cli_flags);
     }
 
+#ifdef COLLIDER_PRO
     // TR-5: load TUI-modal settings sidecar AFTER config.yml so an
     // operator's last-session edits beat the YAML defaults, but only
     // for fields the CLI did NOT explicitly set (cli flags always win
     // -- they're the most-recent operator intent). Sidecar holds the
     // SettingsValues schema; we project a subset onto Arguments. Fields
     // not represented in Arguments (theme, refresh_hz) are read back
-    // by the TUI on launch.
+    // by the TUI on launch. PRO-only: SettingsValues lives in the TUI
+    // settings_panel which is excluded from the free distribution.
     {
         ::collider::ui::tui::panels::SettingsValues sidecar{};
         if (::collider::settings_sidecar::load(sidecar)) {
@@ -242,6 +244,7 @@ static int main_impl(int argc, char* argv[]) {
             }
         }
     }
+#endif
 
     if (args.help) {
         print_usage();
@@ -363,11 +366,14 @@ static int main_impl(int argc, char* argv[]) {
         ? gpu_info.estimated_speed / 1e6
         : 400.0;
 
+#ifdef COLLIDER_PRO
     if (is_interactive_session) {
         // Cinematic shine-wipe boot banner. ~1.1 s total. Plays BEFORE
         // any TUI takes over the screen so the operator sees the brand
         // animation as the first thing on startup, then the TUI main
-        // menu takes over and offers mode selection.
+        // menu takes over and offers mode selection. PRO-only: the
+        // animation lives in ui/tui/boot_banner.cpp which is excluded
+        // from the free distribution.
         ::collider::ui::tui::play_boot_banner();
     } else {
         // Direct CLI invocation: render the brand header so every mode shows
@@ -375,6 +381,14 @@ static int main_impl(int argc, char* argv[]) {
         ui::Interactive::display_header("theCollider", collider::kVersion);
         std::cout << "\n";
     }
+#else
+    // Free build: no TUI menu. Always render the brand header; the
+    // operator must supply mode flags via CLI (--puzzle / --pool /
+    // --benchmark). is_interactive_session is computed but unused.
+    (void)is_interactive_session;
+    ui::Interactive::display_header("theCollider", collider::kVersion);
+    std::cout << "\n";
+#endif
 
     // Outer loop: in an interactive session, falling out of a mode
     // (quit-key or normal session-complete) returns to the main menu
@@ -384,6 +398,7 @@ static int main_impl(int argc, char* argv[]) {
     // happen per-iteration -- key to letting the menu re-use stdio
     // after the previous mode's TUI restored it.
     while (true) {
+#ifdef COLLIDER_PRO
         if (is_interactive_session) {
             // Reset to baseline so the menu starts fresh, then ALSO
             // clear every mode-selection flag: in an interactive
@@ -472,7 +487,17 @@ static int main_impl(int argc, char* argv[]) {
             if (args.exit_program) return 0;
             if (args.help) { print_usage(); return 0; }
         }
+#else
+        // Free build: no interactive menu. is_interactive_session is
+        // computed (for symmetry with Pro) but unused -- mode comes
+        // exclusively from CLI flags. The outer while(true) loop
+        // still executes; the loop exits after the single mode
+        // dispatch below returns (no break-back-to-menu in free).
+        (void)is_interactive_session;
+        (void)gpu_speed_mkeys;
+#endif
 
+#ifdef COLLIDER_PRO
         // TR-1 / TR-7: install stdout/stderr capture HERE so every line
         // the runner / pool client / GPU init code emits between this
         // point and the end of the mode goes into ~/.collider/logs/tui-
@@ -483,7 +508,8 @@ static int main_impl(int argc, char* argv[]) {
         // capture only POST-menu output. The unique_ptr is per-loop:
         // its dtor restores rdbufs before the next iteration's menu
         // runs, so the menu gets normal stdio back. Captured bytes
-        // flush to disk best-effort.
+        // flush to disk best-effort. PRO-only: StdioCapture lives in
+        // src/ui/tui/ which is excluded from the free distribution.
         std::unique_ptr<::collider::ui::tui::StdioCapture> tui_stdio_capture;
         {
             const bool will_launch_tui =
@@ -499,6 +525,7 @@ static int main_impl(int argc, char* argv[]) {
                         collider::paths::collider_home() / "logs");
             }
         }
+#endif
 
         // ---- Mode dispatch -------------------------------------------------
         // BIP scanner first: an explicit --bip-scan from the CLI overrides any
@@ -541,11 +568,21 @@ static int main_impl(int argc, char* argv[]) {
             return 1;
         }
 
+#ifdef COLLIDER_PRO
         // Tear down capture BEFORE the next iteration's menu runs.
+        // PRO-only: StdioCapture is the Pro-side tee/redirect; the
+        // free build does not install one and has no reset to perform.
         tui_stdio_capture.reset();
+#endif
 
         // CLI invocation: one-shot. Interactive: loop unless the mode
-        // itself returned a non-zero exit (errors propagate out).
+        // itself returned a non-zero exit (errors propagate out). In
+        // free builds is_interactive_session is computed but unused
+        // (there is no interactive menu to loop back to), so we just
+        // return after the single mode dispatch.
+#ifndef COLLIDER_PRO
+        return rc;
+#endif
         if (!is_interactive_session) return rc;
         if (rc != 0) return rc;
         // Successful mode exit (incl. 'q' quit): loop back to menu.

@@ -49,6 +49,13 @@
 #include "ui/banner.hpp"        // ProfessionalUI
 #include "ui/box_render.hpp"    // single-source-of-truth boxed UI
 #include "ui/pool_progress.hpp"
+// TUI infrastructure used by the pool dashboard. In Pro builds these
+// resolve to the real FTXUI-backed implementations; in free builds
+// they resolve to the no-op stubs that sync-to-free.sh installs from
+// scripts/templates/free_stubs/ at the same paths. Either way the
+// includes are unconditional -- the symbol surface matches across
+// both editions, so this TU compiles cleanly under both -DCOLLIDER_PRO=ON
+// and -DCOLLIDER_PRO=OFF without per-callsite gating below.
 #include "core/settings_sidecar.hpp"          // TR-5: persist settings
 #include "ui/tui/panels/settings_panel.hpp"  // TP-1: live settings poll
 #include "ui/tui/tui_launcher.hpp"  // Phase C: unified TuiApp across modes
