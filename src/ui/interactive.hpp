@@ -15,6 +15,13 @@
 #include <filesystem>
 
 #ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>   // SetConsoleOutputCP, GetStdHandle (used by enable_windows_ansi below)
 #include <conio.h>
 #else
 #include <termios.h>
@@ -23,6 +30,33 @@
 
 namespace collider {
 namespace ui {
+
+// Enable Windows console UTF-8 + ANSI escape sequence processing so
+// the brand banner + colored CLI output renders correctly on cmd.exe
+// / PowerShell. Called from main_impl() in both Pro and Free builds.
+// Pro previously kept this in interactive_ui.cpp (excluded from free)
+// which broke the free build with "enable_windows_ansi is not a
+// member of collider::ui". Header-only here so it ships everywhere
+// without a corresponding .cpp.
+inline void enable_windows_ansi() noexcept {
+#ifdef _WIN32
+    // Set console output code page to UTF-8 so Unicode glyphs (arrows,
+    // box-drawing, emoji) render correctly. Without this, the default
+    // CP-437 / CP-1252 console renders our UTF-8 bytes as mojibake.
+    SetConsoleOutputCP(65001);
+
+    // Enable virtual terminal processing for ANSI escape codes (color
+    // sequences, cursor positioning).
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (hOut != INVALID_HANDLE_VALUE) {
+        DWORD dwMode = 0;
+        if (GetConsoleMode(hOut, &dwMode)) {
+            dwMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+            SetConsoleMode(hOut, dwMode);
+        }
+    }
+#endif
+}
 
 /**
  * Interactive mode menu choices.
