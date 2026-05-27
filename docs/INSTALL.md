@@ -118,13 +118,16 @@ nvidia-smi
 
 ### Step 3: clone and build
 
+The two-command path that works on a fresh clone with no extra flags:
+
 ```bash
 git clone https://github.com/hevnsnt/collider.git
 cd collider
-
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
 ```
+
+The free build defaults to producing **only** the user-facing `collider` binary -- tests, benchmarks, and CLI tools (build_bloom, generate_license, etc.) are opt-in. The canonical command above will compile cleanly with no warnings on a fresh checkout.
 
 To target a single CUDA architecture for faster compile times:
 
@@ -137,12 +140,19 @@ When `CMAKE_CUDA_ARCHITECTURES` is not specified, CMake selects a fallback defau
 
 Output: `build/collider`.
 
-### Step 4: run the test suite
+### Step 4: (optional) build and run the test suite
+
+Tests are opt-in for the free edition. Enable them with `-DCOLLIDER_BUILD_TESTS=ON`:
 
 ```bash
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCOLLIDER_BUILD_TESTS=ON
+cmake --build build --parallel
 cd build
 ctest --output-on-failure
 ```
+
+The short alias `-DBUILD_TESTS=ON` is also accepted; CMake will print
+`[alias] BUILD_TESTS=ON forwarded to COLLIDER_BUILD_TESTS` on configure.
 
 ---
 
@@ -186,16 +196,24 @@ cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
 ```
 
-The CMake configure step auto-bootstraps vcpkg in `./vcpkg/` if `VCPKG_ROOT` is not already set. This downloads OpenSSL on first run.
+The free build defaults to producing **only** `build\collider.exe`. Tests, benchmarks, and CLI tools (build_bloom, generate_license) are opt-in.
+
+The CMake configure step auto-bootstraps vcpkg in `.\vcpkg\` if `VCPKG_ROOT` is not already set. This downloads OpenSSL on first run.
 
 Output: `build\collider.exe`.
 
-### Step 5: run the test suite
+### Step 5: (optional) build and run the test suite
+
+Tests are opt-in. Enable with `-DCOLLIDER_BUILD_TESTS=ON`:
 
 ```cmd
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCOLLIDER_BUILD_TESTS=ON
+cmake --build build --parallel
 cd build
 ctest --output-on-failure
 ```
+
+The short alias `-DBUILD_TESTS=ON` is also accepted.
 
 ---
 
@@ -242,16 +260,20 @@ For a deeper Mac-specific reference (CMake options, embedded Metal shaders, trou
 
 CMake options recognized by the project:
 
-| Option                      | Default      | Description                                                                         |
+| Option                      | Free default | Description                                                                         |
 | --------------------------- | ------------ | ----------------------------------------------------------------------------------- |
 | `COLLIDER_USE_CUDA`         | `ON`         | Enable the CUDA backend (Linux / Windows).                                          |
 | `COLLIDER_USE_METAL`        | `ON`         | Enable the Metal backend (macOS).                                                   |
 | `COLLIDER_USE_CPU`          | `ON`         | Enable the CPU fallback backend.                                                    |
-| `COLLIDER_BUILD_TESTS`      | `ON`         | Build unit tests (`ctest` runs from `build/`).                                      |
-| `COLLIDER_BUILD_BENCHMARKS` | `ON`         | Build the benchmark targets.                                                        |
-| `COLLIDER_BUILD_TOOLS`      | `ON`         | Build CLI tools (`build_bloom`, `generate_license`, etc.).                          |
+| `COLLIDER_BUILD_TESTS`      | `OFF`        | Build unit tests (`ctest` runs from `build/`). Alias: `BUILD_TESTS`.                |
+| `COLLIDER_BUILD_BENCHMARKS` | `OFF`        | Build the benchmark targets. Alias: `BUILD_BENCHMARKS`.                             |
+| `COLLIDER_BUILD_TOOLS`      | `OFF`        | Build CLI tools (`build_bloom`, `generate_license`). Alias: `BUILD_TOOLS`.          |
 | `CMAKE_BUILD_TYPE`          | `Release`    | `Release`, `Debug`, or `RelWithDebInfo`.                                            |
 | `CMAKE_CUDA_ARCHITECTURES`  | (no default) | Target SM versions. See the table below. The shipped release uses `"75;86;89;120"`. |
+
+Note on flag spellings: `BUILD_TESTS`, `BUILD_BENCHMARKS`, and `BUILD_TOOLS` are accepted as aliases of their `COLLIDER_`-prefixed canonical names. Using either spelling produces the same result; CMake will log `[alias] BUILD_TESTS=ON forwarded to COLLIDER_BUILD_TESTS` so the alias is visible during configure.
+
+The three `BUILD_*` options default `OFF` in the free build so a plain `cmake -B build && cmake --build build` produces only the user-facing `collider` binary, which is what most users want. Contributors and CI runs that need the full test or tool surface pass `-DCOLLIDER_BUILD_TESTS=ON` (or `-DBUILD_TESTS=ON`) explicitly. The Pro edition keeps these `ON` by default so the development workflow continues to exercise everything on configure.
 
 ### CUDA architecture selection
 

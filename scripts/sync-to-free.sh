@@ -191,6 +191,37 @@ PRO_PATHS=(
     "tests/test_bip_scan_runner_smoke.cpp"
     "tests/test_device_hmac_sha512.cu"
 
+    # Tests that #include Pro-only headers. Without this list the test
+    # source file lands in free but the header it depends on does not,
+    # so any `cmake -DCOLLIDER_BUILD_TESTS=ON` against the free tree
+    # explodes with "Cannot open include file" on every one of these.
+    # The CMakeLists.txt also gates most of them on COLLIDER_PRO, but
+    # gating only helps when the file is also absent -- otherwise the
+    # source still ships, an EXISTS-check guard still fires, and a
+    # casual cmake -B build trips the same C1083 / fatal error.
+    # See issue #6 (free repo) for the precise failure mode that
+    # triggered this exclusion. Defense in depth: tests for Pro-only
+    # subsystems live only in the Pro tree.
+    "tests/test_priority_queue.cpp"
+    "tests/test_kangaroo_mode_asymmetric.cu"
+    "tests/test_brute_resume_state.cpp"
+    "tests/test_bruteforce_generator.cpp"
+    "tests/test_empty_hit_writer.cpp"
+    "tests/test_fused_pipeline_oob.cu"
+    "tests/test_generator_budget.cpp"
+    "tests/test_generator_modes.cpp"
+    "tests/test_input_handler.cpp"
+    "tests/test_license_cache.cpp"
+    "tests/test_nvml_wrapper.cpp"
+    "tests/test_perf_instrumentation.cpp"
+    "tests/test_phase_change_fault.cu"
+    "tests/test_plugin_runner.cpp"
+    "tests/test_resume_iteration_mode.cpp"
+    "tests/test_runtime_yaml.cpp"
+    "tests/test_scan_state_atomics.cpp"
+    "tests/test_sparkline.cpp"
+    "tests/test_tui_panels.cpp"
+
     # Brain-wallet rule files + scraper outputs at repo root
     "rules/"
     "scrapers/"

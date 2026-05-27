@@ -338,11 +338,13 @@ Full schema and precedence rules: [docs/CONFIGURATION.md](docs/CONFIGURATION.md)
 
 ## Build from source
 
-Prebuilt binaries are the path of least resistance ([GitHub Releases](https://github.com/hevnsnt/collider/releases)). For source builds, the canonical entry points are:
+Prebuilt binaries are the path of least resistance ([GitHub Releases](https://github.com/hevnsnt/collider/releases)). For source builds, the canonical two-command path that works on a fresh clone with no extra flags:
 
 - **Linux**: `cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build --parallel`
 - **Windows**: same, from the "x64 Native Tools Command Prompt for VS 2022". vcpkg auto-bootstraps for OpenSSL.
 - **macOS**: `./build_macos.sh free` (sets `OPENSSL_ROOT_DIR` from Homebrew and runs Ninja).
+
+The free build defaults to producing **only** the `collider` binary. Tests, benchmarks, and CLI tools (`build_bloom`, `generate_license`) are opt-in via `-DCOLLIDER_BUILD_TESTS=ON`, `-DCOLLIDER_BUILD_BENCHMARKS=ON`, `-DCOLLIDER_BUILD_TOOLS=ON`. The shorter `-DBUILD_TESTS=ON` / `-DBUILD_BENCHMARKS=ON` / `-DBUILD_TOOLS=ON` are accepted as aliases.
 
 Full per-platform guides:
 

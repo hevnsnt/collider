@@ -77,9 +77,43 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 option(COLLIDER_USE_CUDA "Enable CUDA backend" ON)
 option(COLLIDER_USE_METAL "Enable Metal backend" ON)
 option(COLLIDER_USE_CPU "Enable CPU fallback backend" ON)
-option(COLLIDER_BUILD_TESTS "Build tests" ON)
-option(COLLIDER_BUILD_BENCHMARKS "Build benchmarks" ON)
-option(COLLIDER_BUILD_TOOLS "Build CLI tools" ON)
+
+# COLLIDER_PRO declared early (its full documentation block lives below)
+# so the tests/benchmarks/tools defaults can branch on it. Pro builds keep
+# tests + benchmarks + tools ON by default (contributor + CI workflow);
+# Free builds default everything OFF so a clean
+#   cmake -B build && cmake --build build
+# on a fresh git clone produces only the `collider` binary without
+# touching test sources that reference Pro-only headers.
+option(COLLIDER_PRO "Enable Pro brain-wallet pipeline (requires private sources)" OFF)
+
+if(COLLIDER_PRO)
+    set(_collider_default_tests ON)
+    set(_collider_default_bench ON)
+    set(_collider_default_tools ON)
+else()
+    set(_collider_default_tests OFF)
+    set(_collider_default_bench OFF)
+    set(_collider_default_tools OFF)
+endif()
+
+option(COLLIDER_BUILD_TESTS      "Build tests"      ${_collider_default_tests})
+option(COLLIDER_BUILD_BENCHMARKS "Build benchmarks" ${_collider_default_bench})
+option(COLLIDER_BUILD_TOOLS      "Build CLI tools"  ${_collider_default_tools})
+
+# Friendly alias support: accept the more-natural BUILD_TESTS / BUILD_BENCHMARKS
+# / BUILD_TOOLS spellings and forward them to the COLLIDER_-prefixed canonical
+# options. Without this, `cmake -DBUILD_TESTS=OFF ..` silently no-ops with a
+# generic "Manually-specified variables were not used by the project" warning,
+# which is the exact pattern that produced issue #6.
+foreach(_alias TESTS BENCHMARKS TOOLS)
+    if(DEFINED BUILD_${_alias})
+        set(COLLIDER_BUILD_${_alias} "${BUILD_${_alias}}" CACHE BOOL
+            "Build ${_alias} (alias of BUILD_${_alias})" FORCE)
+        message(STATUS
+            "  [alias] BUILD_${_alias}=${BUILD_${_alias}} forwarded to COLLIDER_BUILD_${_alias}")
+    endif()
+endforeach()
 
 # Pro feature gating (Wave 6, 2026-05-04; wired up 2026-05-05).
 # theCollider Pro adds the brain wallet pipeline. The Free build (default
@@ -99,7 +133,9 @@ option(COLLIDER_BUILD_TOOLS "Build CLI tools" ON)
 #
 # Eventually pro sources will move to a private submodule (hevnsnt/collider-pro)
 # at pro/. See docs/PRO-MIGRATION.md.
-option(COLLIDER_PRO "Enable Pro brain-wallet pipeline (requires private sources)" OFF)
+# COLLIDER_PRO option was declared earlier (alongside COLLIDER_BUILD_TESTS)
+# so the per-target defaults could branch on it. This block applies the
+# compile definition and emits the configuration banner.
 if(COLLIDER_PRO)
     add_compile_definitions(COLLIDER_PRO=1)
     message(STATUS "Building theCollider PRO (brain wallet enabled)")
