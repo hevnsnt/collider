@@ -1,42 +1,71 @@
-# theCollider v1.4.1 -- example config.yml
+# theCollider v1.5.0 -- example config.yml
 #
 # Copy this file to ./config.yml (or ~/.collider/config.yml) and edit
 # in place. Anything unset falls back to the built-in default. CLI
 # flags ALWAYS win over config.yml values when both are supplied.
 #
-# Schema reference: src/core/yaml_config.hpp::AppConfig.
+# Schema reference: src/core/yaml_config.hpp::AppConfig
+# CLI reference:    src/cli/cli_parser.cpp (or `./collider --help`)
+#
+# config.yml covers the persistent settings most operators want to
+# pin once and forget (pool URL, worker address, GPU selection, TUI
+# preference). The runtime-mode switches that change behavior per
+# invocation -- BIP scanner, license activation, kangaroo-only /
+# brute-only forcing, calibration -- live on the CLI only. See
+# "CLI-only features" near the end of this file for a complete list.
 
 # ---------------------------------------------------------------------------
 # Pool mode (distributed solving via the JLP protocol).
 # ---------------------------------------------------------------------------
-# Most users only need `worker` (Bitcoin address) and `url`. password +
+# Most users only need `worker` (Bitcoin address) and `url`. Password +
 # api_key are present for compatibility with non-default pools that
-# require them; Collision Protocol's public pool does not.
+# require them; the public Collision Protocol pool does not.
+#
+# v1.5.0 theft-resistance: the server assigns each worker either
+# TAME-only or WILD-only kangaroos. This is NOT operator-configurable
+# -- it is a server policy. The asymmetric split is what prevents any
+# single worker from locally recovering the puzzle's private key.
+#
+# Related CLI flags: --pool / -p, --worker / -w, --pool-password,
+# --pool-password-file, --pool-api-key, --worker-key.
+# ---------------------------------------------------------------------------
 pool:
   worker: "1YourBitcoinAddressForRewards"
   url: "jlps://collisionprotocol.com:17403" # jlps:// = TLS (recommended)
-  # password: "..."
-  # api_key: "..."
+  # password: "..."                  # CLI: --pool-password (deprecated; use --pool-password-file <path>)
+  # api_key: "..."                   # CLI: --pool-api-key
 
 # ---------------------------------------------------------------------------
 # Standalone puzzle mode (no pool, this machine solves directly).
 # ---------------------------------------------------------------------------
+# Related CLI flags: --puzzle / -P, --kangaroo, --all-unsolved,
+# --auto-next, --puzzle-min-bits, --puzzle-max-bits, --puzzle-target,
+# --puzzle-start, --puzzle-end, --pubkey, --puzzle-checkpoint,
+# --resume-kangaroo, --dp-bits, --random / --sequential, --analyze,
+# --no-smart, --solver kangaroo|bsgs, --kangaroos <N>.
+# ---------------------------------------------------------------------------
 puzzle:
   # number: 71            # Specific puzzle by number (otherwise smart-select)
   # smart_select: true    # ROI-rank when picking among unsolved puzzles
+  # CLI: --no-smart disables ROI ranking
   # min_bits: 71          # Lower bound for --all-unsolved iteration
   # max_bits: 160         # Upper bound for --all-unsolved iteration
   # kangaroo: true        # Force kangaroo (only works on revealed-pubkey puzzles)
+  # CLI: --kangaroo
   # dp_bits: 25           # Distinguished-point bits, 16-28 (default: auto)
+  # CLI: --dp-bits
   # random_search: true   # Random walk within range (default true)
+  # CLI: --random / --sequential
   # auto_next: false      # Advance to next puzzle after solving
+  # CLI: --auto-next
   # checkpoint: "./puzzle.ckpt"
+  # CLI: --puzzle-checkpoint
 
   # ------------------------------------------------------------
-  # v1.4.1: per-run target / range / pubkey override.
+  # Per-run target / range / pubkey override.
   #
   # Use these to scan a custom address + range without modifying the
-  # bundled puzzle data. Most users won't need them; they're for
+  # bundled puzzle data. Most users won't need them; they are for
   # research targets, newly-revealed pubkeys, or testing.
   #
   # Kangaroo requires the public key. The bundled puzzle_history.json
@@ -44,56 +73,137 @@ puzzle:
   # Challenge (multiples of 5 in 71-160 plus all solved puzzles below
   # 71). For a target outside that set, supply `pubkey:` here too.
   # ------------------------------------------------------------
-  # target:  "13zb1hQbWVsc2S7ZTZnP2G4undNNpdh5so"  # Bitcoin address
-  # start:   "0x40000000000000000"                  # Range start (hex)
-  # end:     "0x7ffffffffffffffff"                  # Range end (hex)
-  # pubkey:  "02..."                                # 33-byte compressed pubkey
+  # target:  "13zb1hQbWVsc2S7ZTZnP2G4undNNpdh5so"  # CLI: --puzzle-target
+  # start:   "0x40000000000000000"                  # CLI: --puzzle-start
+  # end:     "0x7ffffffffffffffff"                  # CLI: --puzzle-end
+  # pubkey:  "02..."                                # CLI: --pubkey (33 B compressed)
 
 # ---------------------------------------------------------------------------
 # Brain wallet mode (Pro feature). FREE builds silently ignore this section.
 # ---------------------------------------------------------------------------
+# Related CLI flags: --brainwallet, --brainwallet-v2,
+# --brainwallet-setup, --brainwallet-warpwallet <salt>, --brute,
+# --resume, --save-interval, --cpu-rules.
+# ---------------------------------------------------------------------------
 # brainwallet:
-#   enabled: false
+#   enabled: false                   # CLI: --brainwallet
 #   wordlist: "./wordlists/rockyou.txt"
-#   save_interval: 1000000
-#   resume: false
+#   save_interval: 1000000           # CLI: --save-interval
+#   resume: false                    # CLI: --resume
 
 # ---------------------------------------------------------------------------
 # Bloom filter (Pro feature; .blf file with funded addresses).
 #
-# v1.4.2: companion `verify_set` (UVRF file) eliminates pure bloom
-# false positives before they reach the user. Strongly recommended;
-# without it you'll see one "BLOOM HIT FOUND" box every ~few seconds
-# of GPU time, none of which are real matches. Build via:
+# The bloom filter is the heart of opportunistic scanning. Every key
+# the GPU computes is hashed to a Bitcoin address and probed against
+# this bloom. With ~100M+ funded addresses loaded and a target FP rate
+# of 1e-5, expect roughly one bloom hit per ~100k candidate keys --
+# the vast majority are false positives. That is where the verify_set
+# and bloom_tight files come in.
+#
+# Build the bloom + verify-set companion via:
 #   build_bloom -i utxo.csv -o funded_addresses.blf -v funded_addresses.uvrf
+#
 # The runtime auto-detects funded_addresses.uvrf next to the .blf,
 # so only set verify_set explicitly if the path differs.
+#
+# v1.4.2 introduced the dual-bloom workflow: pair a "loose" GPU bloom
+# (small, fast, fits in GPU memory) with a "tight" CPU bloom (large,
+# accurate). Empty-hit candidates from the loose bloom get re-probed
+# CPU-side against the tight bloom before logging. Reduces noise in
+# the empty-hits log without giving up coverage.
+#
+# Related CLI flags: --bloom <file.blf>, --bloom-tight <file.blf>,
+# --verify-set <file.uvrf>, --verify-set-csv <file.csv>,
+# --track-empty-hits / --no-track-empty-hits, --use-texture-bloom.
 # ---------------------------------------------------------------------------
 # bloom:
 #   file: "./funded_addresses.blf"
 #   verify_set: "./funded_addresses.uvrf"
+#   tight: "./funded_addresses_tight.blf"   # CLI: --bloom-tight
+#   # Default: runner auto-detects (enabled when both tight + verify_set resolve).
+#   # CLI: --track-empty-hits / --no-track-empty-hits.
+#   track_empty_hits: true
+
+# ---------------------------------------------------------------------------
+# TUI dashboard (multi-panel FTXUI). Defaults to enabled when stdout
+# is a TTY; auto-disabled when output is redirected.
+#
+# Related CLI flags: --tui (force on), --no-tui (force off).
+# ---------------------------------------------------------------------------
+# tui:
+#   # Three-state: unset = runner auto-detect; true = force on; false = force off.
+#   enabled: true
 
 # ---------------------------------------------------------------------------
 # GPU configuration.
+#
+# Related CLI flags: --gpus / -g, --batch-size, --backend cuda|metal|cpu,
+# --kangaroos <N>, --calibrate, --force-calibrate.
 # ---------------------------------------------------------------------------
 gpu:
-  # devices: [0, 1]      # Specific GPU IDs (default: auto-detect all)
-  # batch_size: 4000000  # Keys per batch
-  # force_calibrate: false
+  # devices: [0, 1]                  # CLI: --gpus 0,1 (default: auto-detect all)
+  # batch_size: 4000000              # CLI: --batch-size (default: auto-calibrated)
+  # force_calibrate: false           # CLI: --force-calibrate (re-run calibration even if a saved value exists)
 
 # ---------------------------------------------------------------------------
 # General settings.
+#
+# Related CLI flags: --verbose / -v, --debug, --benchmark, --benchmark-time,
+# --perf-instrument, --config / -c, --help / -h.
 # ---------------------------------------------------------------------------
 settings:
-  # verbose: false
-  # debug: false
-  # benchmark_seconds: 30
+  # verbose: false                   # CLI: --verbose / -v
+  # debug: false                     # CLI: --debug
+  # benchmark_seconds: 30            # CLI: --benchmark-time <sec>
 
 # ---------------------------------------------------------------------------
-# Working directories. (Currently parsed but not yet consumed by every
-# subsystem; see track-e finding 7 in the codebase.)
+# Working directories. (Parsed but not yet consumed by every subsystem;
+# see track-e finding 7 in the codebase. Leaving them parsed so future
+# code can opt in -- removing them would break user configs.)
 # ---------------------------------------------------------------------------
 # paths:
 #   data_dir: "./processed"
 #   checkpoint_dir: "./checkpoints"
 #   log_dir: "./logs"
+
+# ---------------------------------------------------------------------------
+# CLI-only features (no config.yml support today)
+# ---------------------------------------------------------------------------
+# The following features are runtime-mode switches rather than persistent
+# settings, and live on the CLI only. Pass them on the command line each
+# run; they intentionally do not auto-resume from config.yml.
+#
+# License (Pro):
+#   --activate <KEY>             Activate a Pro license key once after purchase.
+#                                The HMAC-cached license persists in
+#                                ~/.collider/license.cache (24 h TTL).
+#
+# BIP-39 / BIP-32 mnemonic scanner (Pro, v1.5.0):
+#   --bip-scan                   Enable the BIP-39 mnemonic scanner.
+#   --bip-scan-wordlist <file>   Candidate mnemonic phrases (one per line).
+#   --bip-combinatorial          Exhaustive BIP-39 entropy enumeration.
+#   --bip-combinatorial-words N  Mnemonic length: 12, 15, 18, 21, or 24.
+#   --no-bip-gpu                 Force CPU-side BIP scanner (default: GPU).
+#
+# Weak-PRNG multi-scheme kernel (Pro):
+#   --puzzle-only-v2             Enable the v2 multi-scheme weak-PRNG kernel.
+#   --schemes <list>             Comma-separated scheme list (Milk Sad,
+#                                Profanity, Trust Wallet, glibc, MSVC, Java).
+#   --puzzle-keys <N>            v2 kernel key batch override.
+#
+# Solver / kangaroo control:
+#   --solver kangaroo|bsgs       Pick the standalone solver (v1.5.x).
+#   --kangaroos N                Number of kangaroos (default: GPU-tuned).
+#   --resume-kangaroo            Resume a saved kangaroo herd checkpoint.
+#   --calibrate                  Re-run batch-size calibration only.
+#   --analyze                    Print ROI ranking and exit (no search).
+#
+# Pool credentials from file (preferred over inline `password:`):
+#   --pool-password-file <path>  Read pool password from a file (0600).
+#   --worker-key <hex>           Future: worker-bound signing key.
+#
+# Debug / instrumentation:
+#   --perf-instrument            Enable per-stage perf counters in TUI.
+#
+# All flags also appear in `./collider --help` with one-line descriptions.
