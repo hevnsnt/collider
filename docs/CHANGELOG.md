@@ -51,6 +51,39 @@ The full v1.5 security audit (see `collision-protocol/docs/v1.5-security-audit-r
 
 ---
 
+## [1.4.4] - 2026-05-20
+
+Cross-platform build + CI hardening. No runtime behavior changes; mainly unblocks the free Linux build and tightens the Pro / Free CI split.
+
+### Fixed
+
+- Linux CI now installs `libcurl` so the free build links cleanly. Added a CMake guardrail that fails configure with an actionable message when libcurl is missing on Linux.
+- Cross-platform build fixes for Linux GCC and macOS clang (template instantiation differences and missing `<cstddef>` / `<algorithm>` includes that MSVC tolerated).
+- Pro feature reachability: a Pro-only codepath that was unreachable from the free interactive menu but compiled into the binary is gated correctly now.
+
+### Changed
+
+- CI: gate Pro build steps on `pcfg.hpp` presence in the public repo (the file is in `PRO_PATHS` and excluded from free, so its absence is the canonical signal for "this is a free checkout").
+- CI: macOS release binaries dropped from the release matrix; macOS users build from source via `./build_macos.sh free`.
+
+---
+
+## [1.4.3] - 2026-05-19
+
+Pool mode reliability + edition-aware CI. Driven by a field-reported DP submission bug that surfaced once big-endian x coordinates were exercised against the new pool server.
+
+### Fixed
+
+- Pool DP submission: send the full big-endian x coordinate in CUDA DP submissions. Previous CUDA-side serialization truncated the high half on certain DP-bit configurations, causing the server to reject otherwise-valid DPs.
+- macOS: `std::jthread` replaced with a portable `RetryThread` (libc++ on macOS arm64 was still missing `<stop_token>` at the toolchain version we targeted). `-DCOLLIDER_PRO` flag plumbing fixed in the macOS build path.
+
+### Added
+
+- Pool ban-detection on the client side: when the server signals a ban (rate-limit, invalid-DP escalation, or permanent ban), the client surfaces an explicit message rather than reconnecting in a tight loop.
+- Separate CI/CD pipelines for the Free and Pro editions. Pro builds run in the private repo; the public free repo's CI is now fully edition-aware (skips macOS on plain `main`-branch pushes to conserve minutes; full matrix on tag push).
+
+---
+
 ## [1.4.2] - 2026-05-17
 
 A-tier stabilization release. Three waves of fixes across performance honesty, security posture, code quality, and build/sync hygiene. Driven by a six-reviewer adversarial validation pass on the v1.4.2 line. The headline correctness work is the full-pipeline benchmark, the dynamic per-GPU work balancer, the kangaroo `cudaMemcpy` hoisting, and the secret-handling cleanup (`SecureBuffer`, `secure_open_ofstream`, constant-time license compare).
