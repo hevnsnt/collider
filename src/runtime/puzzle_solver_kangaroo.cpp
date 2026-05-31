@@ -135,7 +135,7 @@ void maybe_load_rckangaroo_bloom_filter(gpu::RCKangarooManager& rc_kangaroo,
     if (rc_kangaroo.load_bloom_filter(args.bloom_file)) {
         std::cout << "[*] Bloom filter loaded - opportunistic address checking enabled\n";
         // Optional: Set hit callback for real-time notifications
-        rc_kangaroo.bloom_hit_callback = [](const gpu::BloomHit& hit) {
+        rc_kangaroo.bloom_hit_callback = [](const gpu::bloom::BloomHit& hit) {
             // Owner-only file permissions: bloom_hits.txt
             // logs (hash160, ops_at_hit) pairs for the
             // operator to follow up on; even though no
@@ -352,6 +352,14 @@ PuzzleStepResult run_kangaroo_rckangaroo(PuzzleIterContext& ctx) {
             ci.expected_ops  = expected_ops;
             ci.dps_found     = dp_count;
             ci.backend_name  = "RCKangaroo";
+#ifdef COLLIDER_PRO
+            // Opportunistic bloom status (Pro). bloom_enabled latches true
+            // when maybe_load_rckangaroo_bloom_filter loaded a .blf; the
+            // probe counter comes straight from the manager. The panel
+            // reuses dps_found for the "entries" figure.
+            ci.bloom_loaded  = rc_kangaroo.bloom_enabled;
+            ci.bloom_checks  = rc_kangaroo.get_bloom_checks();
+#endif
             tui_for_rc->set_challenge_info(ci);
             const uint64_t exp_clip =
                 expected_ops > 0 ? expected_ops : (ops + 1);

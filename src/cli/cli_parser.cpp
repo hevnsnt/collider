@@ -184,6 +184,33 @@ int apply_verbose(int&, int, char* [], Arguments& args, CLIFlags& cli,
     return 0;
 }
 
+// Checked numeric parse: returns true and sets `out` on success; on a bad
+// value (non-numeric, trailing junk, overflow) sets err_msg and returns false
+// so the caller returns -1 down the clean error path. Without this, std::stoi/
+// stoull throw std::invalid_argument / std::out_of_range which were uncaught
+// and aborted the whole process on bad CLI input (audit HIGH-2).
+static bool cli_parse_ll(const char* s, const char* flag, long long& out,
+                         std::string& err_msg) {
+    if (!s || !*s) {
+        err_msg = std::string("[!] ") + flag + ": missing or empty value";
+        return false;
+    }
+    try {
+        const std::string str(s);
+        size_t consumed = 0;
+        long long v = std::stoll(str, &consumed);
+        if (consumed != str.size()) {  // e.g. "12x", "1,2"
+            err_msg = std::string("[!] ") + flag + ": not a valid integer: '" + s + "'";
+            return false;
+        }
+        out = v;
+        return true;
+    } catch (const std::exception&) {
+        err_msg = std::string("[!] ") + flag + ": not a valid integer (or out of range): '" + s + "'";
+        return false;
+    }
+}
+
 int apply_gpus(int& i, int argc, char* argv[], Arguments& args,
                CLIFlags& cli, std::string& err_msg) {
     const char* v = take_value(i, argc, argv, "--gpus", err_msg);
@@ -192,10 +219,16 @@ int apply_gpus(int& i, int argc, char* argv[], Arguments& args,
     std::string gpus = v;
     size_t pos = 0;
     while ((pos = gpus.find(',')) != std::string::npos) {
-        args.gpu_ids.push_back(std::stoi(gpus.substr(0, pos)));
+        long long id;
+        if (!cli_parse_ll(gpus.substr(0, pos).c_str(), "--gpus", id, err_msg)) return -1;
+        if (id < 0) { err_msg = "[!] --gpus: device ids must be >= 0"; return -1; }
+        args.gpu_ids.push_back(static_cast<int>(id));
         gpus.erase(0, pos + 1);
     }
-    args.gpu_ids.push_back(std::stoi(gpus));
+    long long id;
+    if (!cli_parse_ll(gpus.c_str(), "--gpus", id, err_msg)) return -1;
+    if (id < 0) { err_msg = "[!] --gpus: device ids must be >= 0"; return -1; }
+    args.gpu_ids.push_back(static_cast<int>(id));
     cli.gpu_ids_set = true;
     return 0;
 }
@@ -204,7 +237,12 @@ int apply_batch_size(int& i, int argc, char* argv[], Arguments& args,
                      CLIFlags& cli, std::string& err_msg) {
     const char* v = take_value(i, argc, argv, "--batch-size", err_msg);
     if (!v) return -1;
-    args.batch_size = std::stoull(v);
+    long long n;
+    if (!cli_parse_ll(v, "--batch-size", n, err_msg)) return -1;
+    // Preserve legacy semantics: 0 is an accepted CLI override (see the
+    // batch-size-zero-cli-wins test); the guard above only rejects
+    // non-numeric input that previously crashed via std::stoull.
+    args.batch_size = static_cast<uint64_t>(n);
     args.batch_size_auto = false;
     cli.batch_size_set = true;
     return 0;
@@ -340,19 +378,23 @@ int apply_benchmark_time(int& i, int argc, char* argv[], Arguments& args,
                          CLIFlags& cli, std::string& err_msg) {
     const char* v = take_value(i, argc, argv, "--benchmark-time", err_msg);
     if (!v) return -1;
-    args.benchmark_seconds = std::stoi(v);
+    long long bench_n;
+    if (!cli_parse_ll(v, "--benchmark-time", bench_n, err_msg)) return -1;
+    args.benchmark_seconds = static_cast<int>(bench_n);
     cli.benchmark_seconds_set = true;
     return 0;
 }
 
 int apply_puzzle(int& i, int argc, char* argv[], Arguments& args,
-                 CLIFlags& cli, std::string&) {
+                 CLIFlags& cli, std::string& err_msg) {
     // --puzzle [N]: N is optional; only consumed when the next argv exists
     // and doesn't start with '-' (so "--puzzle" alone still selects puzzle
     // mode without pinning a number, which is how auto-select-easiest works).
     args.puzzle_mode = true;
     if (i + 1 < argc && argv[i + 1][0] != '-') {
-        args.puzzle_number = std::stoi(argv[++i]);
+        long long pn;
+        if (!cli_parse_ll(argv[++i], "--puzzle", pn, err_msg)) return -1;
+        args.puzzle_number = static_cast<int>(pn);
         cli.puzzle_number_set = true;
     }
     return 0;
@@ -447,7 +489,9 @@ int apply_puzzle_min_bits(int& i, int argc, char* argv[], Arguments& args,
                           CLIFlags& cli, std::string& err_msg) {
     const char* v = take_value(i, argc, argv, "--puzzle-min-bits", err_msg);
     if (!v) return -1;
-    args.puzzle_min_bits = std::stoi(v);
+    long long minb;
+    if (!cli_parse_ll(v, "--puzzle-min-bits", minb, err_msg)) return -1;
+    args.puzzle_min_bits = static_cast<int>(minb);
     cli.puzzle_min_bits_set = true;
     return 0;
 }
@@ -456,7 +500,9 @@ int apply_puzzle_max_bits(int& i, int argc, char* argv[], Arguments& args,
                           CLIFlags& cli, std::string& err_msg) {
     const char* v = take_value(i, argc, argv, "--puzzle-max-bits", err_msg);
     if (!v) return -1;
-    args.puzzle_max_bits = std::stoi(v);
+    long long maxb;
+    if (!cli_parse_ll(v, "--puzzle-max-bits", maxb, err_msg)) return -1;
+    args.puzzle_max_bits = static_cast<int>(maxb);
     cli.puzzle_max_bits_set = true;
     return 0;
 }
@@ -472,7 +518,9 @@ int apply_dp_bits(int& i, int argc, char* argv[], Arguments& args,
                   CLIFlags& cli, std::string& err_msg) {
     const char* v = take_value(i, argc, argv, "--dp-bits", err_msg);
     if (!v) return -1;
-    args.dp_bits = std::stoi(v);
+    long long dpb;
+    if (!cli_parse_ll(v, "--dp-bits", dpb, err_msg)) return -1;
+    args.dp_bits = static_cast<int>(dpb);
     cli.dp_bits_set = true;
     return 0;
 }
@@ -752,7 +800,10 @@ int apply_save_interval(int& i, int argc, char* argv[], Arguments& args,
                         CLIFlags& cli, std::string& err_msg) {
     const char* v = take_value(i, argc, argv, "--save-interval", err_msg);
     if (!v) return -1;
-    args.save_interval = std::stoull(v);
+    long long si;
+    if (!cli_parse_ll(v, "--save-interval", si, err_msg)) return -1;
+    if (si < 0) { err_msg = "[!] --save-interval: must be >= 0"; return -1; }
+    args.save_interval = static_cast<uint64_t>(si);
     cli.save_interval_set = true;
     return 0;
 }
@@ -972,6 +1023,17 @@ int apply_tui(int&, int, char* [], Arguments& args, CLIFlags&,
     return 0;
 }
 
+// --no-update: disable client self-update in pool mode. An explicit CLI
+// opt-out always wins over config.yml pool.auto_update (we mark the
+// user-set sentinel so apply_config_to_args does not re-enable it).
+int apply_no_update(int&, int, char* [], Arguments& args, CLIFlags&,
+                    std::string&) {
+    args.no_update = true;
+    args.pool_auto_update = false;
+    args.pool_auto_update_user_set = true;
+    return 0;
+}
+
 // ---------------------------------------------------------------------------
 // Flag registry. Order is not load-bearing for dispatch (flat lookup), but
 // the groupings track the layout of the old if/else chain so reviewers can
@@ -1054,6 +1116,7 @@ constexpr FlagSpec kFlagsRaw[] = {
     {"--pool-password-file",    nullptr, apply_pool_password_file, "pool"},
     {"--pool-api-key",          nullptr, apply_pool_api_key,       "pool"},
     {"--worker-key",            nullptr, apply_worker_key,         "pool"},
+    {"--no-update",             nullptr, apply_no_update,          "pool"},
 
     // TUI
     {"--no-tui",                nullptr, apply_no_tui,             "tui"},
@@ -1118,10 +1181,15 @@ int parse_args_core(int argc, char* argv[], Arguments& args,
         std::string_view arg = argv[i];
         const FlagSpec* spec = find_flag(arg);
         if (!spec) {
-            // Unknown flag: silently skip. The legacy parser had this same
-            // behavior (the trailing else of the if/else chain was empty),
-            // so a stray token does NOT abort parsing. Preserved to keep
-            // ctest CLIParser invariants stable.
+            // Unrecognized token. A dash-prefixed token is almost certainly a
+            // typo'd flag (e.g. --puzzel 71); warn loudly so a multi-day run is
+            // not silently launched on the wrong target (audit MEDIUM-4).
+            // Non-dash positional residue is skipped as before to keep the
+            // legacy CLIParser invariants stable.
+            if (!arg.empty() && arg[0] == '-') {
+                std::cerr << "[!] WARNING: unrecognized option '" << arg
+                          << "' ignored. Run --help for the list of valid flags.\n";
+            }
             continue;
         }
         int rc = spec->apply(i, argc, argv, args, cli, err_msg);
@@ -1352,7 +1420,7 @@ Brainwallet Mode (PRO):
   --pool, -p <url>        Connect to pool for distributed Kangaroo solving
                           URL format: jlps://host:port (TLS, recommended)
                                       jlp://host:port (plaintext)
-                          Example: jlps://collisionprotocol.com:17403
+                          Example: jlps://pool.collisionprotocol.com:17403
   --worker, -w <address>  Worker name (your Bitcoin address for rewards)
   --pool-password-file <path>
                           Read the pool password from the first line of
@@ -1417,7 +1485,7 @@ Examples:
            --puzzle-end   0x3ffffffffffffffff
 
   # Join Collision Protocol for distributed solving
-  collider --pool jlps://collisionprotocol.com:17403 --worker 1YourBitcoinAddress...
+  collider --pool jlps://pool.collisionprotocol.com:17403 --worker 1YourBitcoinAddress...
 
   # Pool mode with HTTP API
   collider --pool http://api.collisionprotocol.com --worker 1YourBitcoinAddress...

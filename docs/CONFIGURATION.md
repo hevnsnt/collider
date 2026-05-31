@@ -138,7 +138,7 @@ gpu:
 
 ```yaml
 pool:
-  url: "jlps://collisionprotocol.com:17403"
+  url: "jlps://pool.collisionprotocol.com:17403"
   worker: "1YourBitcoinAddressForRewards"
 ```
 

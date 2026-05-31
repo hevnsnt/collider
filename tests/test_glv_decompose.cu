@@ -319,6 +319,32 @@ int main() {
         cases.push_back(c);
     }
 
+    // Near-n scalars: k = n - rand128(). These land in the top 2^128 of the
+    // range and stress the Babai-rounding carry edge where the decompose
+    // magnitude can reach ~2^128.5 -- the window-coverage assumption
+    // ec_mul_glv depends on (audit solver M1). The prior 8-vector set
+    // under-sampled this; sample it densely.
+    for (int t = 0; t < 128; t++) {
+        TestCase c;
+        c.name = "k=n-rand128";
+        uint64_t r[4] = { rng(), rng(), 0, 0 };
+        host_sub256(c.k, N_HOST, r);   // n - r  in (n - 2^128, n)
+        cases.push_back(c);
+    }
+    // 64 more full-width random scalars for breadth across the range.
+    for (int t = 0; t < 64; t++) {
+        TestCase c;
+        c.name = "k=rand256b";
+        c.k[0] = rng();
+        c.k[1] = rng();
+        c.k[2] = rng();
+        c.k[3] = rng() & 0x7FFFFFFFFFFFFFFFULL;
+        while (host_cmp256(c.k, N_HOST) >= 0) {
+            host_sub256(c.k, c.k, N_HOST);
+        }
+        cases.push_back(c);
+    }
+
     const int N = (int)cases.size();
 
     // Pack k values for GPU.

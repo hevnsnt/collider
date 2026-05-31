@@ -133,6 +133,7 @@ constexpr uint8_t TYPE_STATS_RSP = 0x31;
 constexpr uint8_t TYPE_SOLUTION  = 0x40;
 constexpr uint8_t TYPE_PING      = 0x50;
 constexpr uint8_t TYPE_PONG      = 0x51;
+constexpr uint8_t TYPE_MAINTENANCE = 0x60;  // v1.5.4 back-off signal
 constexpr uint8_t TYPE_MSG_ERROR = 0xFF;
 
 // Build [magic=KANG][type][flags=PROTOCOL_VERSION][len:LE u16][payload].
@@ -143,7 +144,7 @@ constexpr uint8_t TYPE_MSG_ERROR = 0xFF;
 // jlp_wire::PROTOCOL_VERSION; the tests below verify behaviors that
 // are protocol-version agnostic once the handshake completes (work
 // callback firing, dedup, dp_sequence anti-replay, etc.).
-constexpr uint8_t MOCK_PROTOCOL_VERSION = 3;
+constexpr uint8_t MOCK_PROTOCOL_VERSION = 4;  // v1.5.4: header flags = PROTOCOL_VERSION 4
 std::vector<uint8_t> build_frame(uint8_t type, const void* payload, uint16_t len) {
     std::vector<uint8_t> out;
     out.reserve(8 + len);
@@ -1743,6 +1744,139 @@ bool test_stream_resync_fragmented() {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// v1.5.4: AUTH_OK update advert parsing. The server completes AUTH then sends
+// an AUTH_OK whose payload is a 324-byte AuthOkPayload (latest_version,
+// download_url, nonzero sha256, flags=update_available). The client must
+// parse it and expose it via get_update_advert(). We do NOT trigger a real
+// self-update here: this unit context only inspects the parsed advert.
+// ---------------------------------------------------------------------------
+bool test_authok_advert_parsing() {
+    MockJlpServer server;
+    auto client = make_connected(server.port());
+    if (!client) return fail("authok_advert", "connect failed");
+
+    // Build the 324-byte AuthOkPayload by hand (matches
+    // jlp_wire_generated.hpp: latest[16] min[16] flags[1] reserved[3]
+    // url[256] sha256[32]).
+    uint8_t payload[324];
+    std::memset(payload, 0, sizeof(payload));
+    const char* latest = "1.5.9";
+    const char* minv   = "1.5.0";
+    const char* url    = "https://collisionprotocol.com/download/collider.exe";
+    std::memcpy(payload + 0, latest, std::strlen(latest));
+    std::memcpy(payload + 16, minv, std::strlen(minv));
+    payload[32] = 0x01;  // flags bit0 = update_available
+    std::memcpy(payload + 36, url, std::strlen(url));
+    // Nonzero sha256 (deterministic pattern).
+    for (int i = 0; i < 32; ++i) payload[36 + 256 + i] = static_cast<uint8_t>(0xA0 + i);
+
+    std::atomic<bool> ok{false};
+    std::thread t([&] { ok = client->authenticate("worker", ""); });
+    auto auth = server.wait_recv_pop(128, 5000ms);
+    if (auth.size() != 128) {
+        server.close_client();
+        if (t.joinable()) t.join();
+        return fail("authok_advert", "AUTH bytes never arrived");
+    }
+    if (!server.send_frame(TYPE_AUTH_OK, payload, sizeof(payload))) {
+        if (t.joinable()) t.join();
+        return fail("authok_advert", "failed to send AUTH_OK advert");
+    }
+    t.join();
+    if (!ok.load()) return fail("authok_advert", "authenticate() returned false");
+
+    // The advert is parsed inside handle_auth_ok on the receiver thread,
+    // which runs before authenticate() observes AUTH_OK -- but to be safe
+    // against any ordering, poll for the parsed value.
+    JLPPoolClient::UpdateAdvert advert;
+    bool got = wait_for([&] {
+        advert = client->get_update_advert();
+        return advert.present;
+    }, 2000ms);
+    if (!got) return fail("authok_advert", "advert not marked present");
+    if (advert.latest_version != "1.5.9")
+        return fail("authok_advert", "latest_version mismatch");
+    if (advert.min_version != "1.5.0")
+        return fail("authok_advert", "min_version mismatch");
+    if (advert.download_url != url)
+        return fail("authok_advert", "download_url mismatch");
+    if (!advert.update_available)
+        return fail("authok_advert", "update_available flag not set");
+    bool sha_ok = true;
+    for (int i = 0; i < 32; ++i) {
+        if (advert.sha256[static_cast<size_t>(i)] != static_cast<uint8_t>(0xA0 + i)) {
+            sha_ok = false;
+            break;
+        }
+    }
+    if (!sha_ok) return fail("authok_advert", "sha256 mismatch");
+
+    client.reset();
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// v1.5.4: MAINTENANCE frame handling. After AUTH_OK the server sends a
+// MAINTENANCE (0x60) frame with active=1, retry=30, message "upgrading".
+// The client must parse it and fire the maintenance callback.
+// ---------------------------------------------------------------------------
+bool test_maintenance_frame() {
+    std::atomic<bool> fired{false};
+    std::atomic<bool> got_active{false};
+    std::atomic<uint32_t> got_retry{0};
+    std::string got_msg;
+    std::mutex msg_mu;
+
+    MockJlpServer server;
+    auto client = make_connected(server.port());
+    if (!client) return fail("maintenance_frame", "connect failed");
+
+    client->set_maintenance_callback(
+        [&](bool active, uint32_t retry, std::string message) {
+            got_active.store(active);
+            got_retry.store(retry);
+            {
+                std::lock_guard<std::mutex> lk(msg_mu);
+                got_msg = std::move(message);
+            }
+            fired.store(true);
+        });
+
+    if (!drive_auth_ok(server, *client, "maintenance_frame")) return false;
+
+    // Build the 262-byte MaintenancePayload: active[1] reserved[1]
+    // retry_after_secs[4 LE] message[256].
+    uint8_t payload[262];
+    std::memset(payload, 0, sizeof(payload));
+    payload[0] = 1;  // active
+    uint32_t retry = 30;
+    std::memcpy(payload + 2, &retry, 4);
+    const char* msg = "upgrading";
+    std::memcpy(payload + 6, msg, std::strlen(msg));
+
+    if (!server.send_frame(TYPE_MAINTENANCE, payload, sizeof(payload))) {
+        return fail("maintenance_frame", "failed to send MAINTENANCE");
+    }
+
+    if (!wait_for([&] { return fired.load(); }, 2000ms)) {
+        return fail("maintenance_frame", "maintenance callback never fired");
+    }
+    if (!got_active.load())
+        return fail("maintenance_frame", "active flag not true");
+    if (got_retry.load() != 30)
+        return fail("maintenance_frame", "retry_after_secs mismatch");
+    {
+        std::lock_guard<std::mutex> lk(msg_mu);
+        if (got_msg != "upgrading")
+            return fail("maintenance_frame", "message mismatch");
+    }
+
+    client->set_maintenance_callback(nullptr);
+    client.reset();
+    return true;
+}
+
 const TestCase TESTS[] = {
     {"auth_wire_format",          test_auth_wire_format},
     {"authenticate_ok",           test_authenticate_ok},
@@ -1765,6 +1899,8 @@ const TestCase TESTS[] = {
     {"work_callback_dedup",       test_work_callback_dedup},
     {"dp_sequence_anti_replay",   test_dp_sequence_anti_replay},
     {"stream_resync_fragmented",  test_stream_resync_fragmented},
+    {"authok_advert_parsing",     test_authok_advert_parsing},
+    {"maintenance_frame",         test_maintenance_frame},
 };
 
 }  // namespace

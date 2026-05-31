@@ -293,6 +293,19 @@ struct Arguments {
     // "wire-v4 cutover" once that lands.
     std::string pool_worker_key_file;
 
+    // v1.5.4 client self-update. The pool advertises the latest client
+    // version + a signed download URL + sha256 in the AUTH_OK payload.
+    // After the first successful auth, pool mode self-updates when the
+    // advert is newer than collider::kVersion. --no-update disables it;
+    // config.yml pool.auto_update (default true) is the config-level
+    // toggle. Effective auto-update = pool_auto_update AND NOT no_update.
+    // no_update is the explicit "off" switch; pool_auto_update mirrors the
+    // config value (set from config.yml via apply_config_to_args, with the
+    // _user_set sentinel preventing config from stomping a CLI --no-update).
+    bool no_update = false;
+    bool pool_auto_update = true;
+    bool pool_auto_update_user_set = false;
+
     // Config file
     std::string config_file;              // Custom config file path (default: ./config.yml)
 

@@ -44,6 +44,12 @@ struct AppConfig {
     // wiped at the run_pool_mode boundary right after handoff.
     ::collider::SecureString pool_password;
     std::string pool_api_key;
+    // v1.5.4 client self-update toggle. Default true: pool mode applies a
+    // pool-advertised update when it is newer than the running version.
+    // pool_auto_update_set tracks whether the config file pinned the key
+    // so apply_config_to_args does not stomp an explicit CLI --no-update.
+    bool pool_auto_update = true;
+    bool pool_auto_update_set = false;
 
     // Puzzle configuration
     int puzzle_number = 0;
@@ -256,6 +262,10 @@ private:
                 pool_password.assign(value.data(), value.size());
             }
             else if (key == "api_key") pool_api_key = value;
+            else if (key == "auto_update") {
+                pool_auto_update = parse_bool(value);
+                pool_auto_update_set = true;
+            }
         }
         else if (section == "puzzle") {
             if (key == "number") puzzle_number = std::stoi(value);
@@ -510,6 +520,14 @@ void apply_config_to_args(Arguments& args, const AppConfig& config, const CLIFla
     }
     if (!cli.pool_api_key_set && !config.pool_api_key.empty()) {
         args.pool_api_key = config.pool_api_key;
+    }
+    // v1.5.4 self-update toggle: config can pin pool.auto_update, but an
+    // explicit CLI --no-update (args.pool_auto_update_user_set) always wins.
+    if (!args.pool_auto_update_user_set && config.pool_auto_update_set) {
+        args.pool_auto_update = config.pool_auto_update;
+        if (!config.pool_auto_update) {
+            args.no_update = true;
+        }
     }
 
     // ------------------------------------------------------------------------

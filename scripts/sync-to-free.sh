@@ -152,6 +152,16 @@ PRO_PATHS=(
     "src/gpu/bloom_filter.cu"
     "src/gpu/fused_pipeline.cu"
 
+    # Opportunistic bloom address checking during the RCKangaroo walk.
+    # The SOLE home of the kangaroo-side bloom feature (BloomFilter,
+    # CPU hash160, bloom statics, check/probe logic, BloomHit). The
+    # shared src/gpu/rckangaroo_wrapper.{cu,hpp} stay Free-shipped but
+    # reach this feature only under #ifdef COLLIDER_PRO, so a Free
+    # build links zero bloom symbols. Excluding these two files keeps
+    # the bloom SOURCE out of the public repo entirely.
+    "src/gpu/rckangaroo_bloom.cu"
+    "src/gpu/rckangaroo_bloom.hpp"
+
     # v1.5.0: BIP scanner runtime + GPU dispatcher + BIP-32/39 helpers.
     # The runner iterates BIP-39 candidate phrases and derives BIP-32
     # children across historical + modern derivation paths (pre-BIP-44,

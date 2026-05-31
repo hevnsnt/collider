@@ -164,7 +164,7 @@ Pro is the same binary you already run. Features unlock when a valid HMAC-SHA256
 ### Pool mode with opportunistic scanning (the default Pro experience)
 
 ```bash
-./collider_pro --pool jlps://collisionprotocol.com:17403 \
+./collider_pro --pool jlps://pool.collisionprotocol.com:17403 \
                --worker bc1qYourBitcoinAddress \
                --bloom funded_addresses.blf
 ```

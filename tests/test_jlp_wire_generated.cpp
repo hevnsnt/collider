@@ -141,8 +141,9 @@ static_assert(static_cast<uint8_t>(JLPMessageType::MSG_ERROR) ==
 
 // ---- compile-time: protocol constants -------------------------------------
 
-static_assert(jlp_wire::PROTOCOL_VERSION == 3,
-              "v1.5: protocol bumped to 3 for asymmetric tame/wild work assignment");
+static_assert(jlp_wire::PROTOCOL_VERSION == 4,
+              "v1.5.4: protocol bumped to 4 for checkpoint-walk commitment "
+              "(DP_SUBMIT_V3 + CHALLENGE/CHALLENGE_RSP)");
 static_assert(jlp_wire::MAX_BATCH_SIZE == 10000);
 static_assert(jlp_wire::MAX_MESSAGE_SIZE == 1048576);
 

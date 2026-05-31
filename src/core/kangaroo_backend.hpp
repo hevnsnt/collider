@@ -85,6 +85,14 @@ public:
         return false;
     }
 
+    // Opportunistic-bloom probe counter for the status panel. Returns the
+    // number of candidate-address bloom checks performed so far. Pro-only /
+    // CUDA-only feature today; non-CUDA and Free backends return 0 (the
+    // default). Cheap to poll on every progress tick.
+    virtual uint64_t try_get_bloom_checks() const {
+        return 0;
+    }
+
     // Run the solve loop until BackendCallbacks::should_continue returns
     // false, on_progress returns false, or the chunk completes. Blocks
     // for the lifetime of the worker session; the pool driver loops

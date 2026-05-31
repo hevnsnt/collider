@@ -20,6 +20,9 @@ namespace collider::runtime {
  * The local PoolManager's destructor disconnects automatically, so error
  * paths can `return 1;` without manual cleanup.
  */
-int run_pool_mode(const Arguments& args, const GPUDetectionResult& gpu_info);
+// argc/argv are threaded through so the v1.5.4 client self-update path can
+// relaunch the freshly-installed binary with the original command line.
+int run_pool_mode(const Arguments& args, const GPUDetectionResult& gpu_info,
+                  int argc, char** argv);
 
 }  // namespace collider::runtime

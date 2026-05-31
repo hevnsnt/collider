@@ -138,23 +138,30 @@ static void test_v1_stretch_self_consistent() {
     const std::string seed = "deadbeefdeadbeefdeadbeefdeadbeef";
     uint8_t expected[32];
     {
-        // Inline reference: x_0 = sha256(seed); x_{n+1} = sha256(x_n || seed).
-        // (Same as v1_stretch_hex_seed; this isn't a different algorithm,
-        // it's a sanity "is the function still doing what its docstring says".)
+        // Independent reference implementing Electrum's documented
+        // _stretch_key exactly: x_0 = seed, x_{n+1} = sha256(x_n || seed),
+        // 100000 rounds. Deliberately NOT a copy of v1_stretch_hex_seed's
+        // structure (this uses a growing-then-32B vector chain) so the two
+        // only agree if both correctly implement x_0 = seed (audit Electrum
+        // HIGH: the prior reference re-implemented the buggy x_0 = sha256(seed)
+        // chain and masked the defect).
         const auto* sp = reinterpret_cast<const uint8_t*>(seed.data());
         size_t sn = seed.size();
-        sha256(sp, sn, expected);
-        std::vector<uint8_t> buf(32 + sn);
+        std::vector<uint8_t> x(sp, sp + sn);   // x_0 = seed
+        uint8_t dg[32];
+        std::vector<uint8_t> buf;
         for (uint32_t i = 0; i < 100000; ++i) {
-            std::memcpy(buf.data(), expected, 32);
-            std::memcpy(buf.data() + 32, sp, sn);
-            sha256(buf.data(), buf.size(), expected);
+            buf.assign(x.begin(), x.end());
+            buf.insert(buf.end(), sp, sp + sn);
+            sha256(buf.data(), buf.size(), dg);
+            x.assign(dg, dg + 32);
         }
+        std::memcpy(expected, x.data(), 32);
     }
     uint8_t got[32];
     v1_stretch_hex_seed(seed, got);
     CHECK(std::memcmp(expected, got, 32) == 0,
-          "v1 stretch matches inline reference");
+          "v1 stretch matches Electrum _stretch_key spec (x_0 = seed)");
 }
 
 int main() {

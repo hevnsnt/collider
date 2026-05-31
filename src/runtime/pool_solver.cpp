@@ -46,6 +46,7 @@
 #include "core/version.hpp"
 #include "pool/pool_manager.hpp"
 #include "runtime/runtime_control.hpp"  // banner queue for TUI status messages
+#include "runtime/self_update.hpp"      // v1.5.4 client self-update
 #include "ui/banner.hpp"        // ProfessionalUI
 #include "ui/box_render.hpp"    // single-source-of-truth boxed UI
 #include "ui/pool_progress.hpp"
@@ -181,8 +182,14 @@ void attempt_save_herd(::collider::kangaroo::IKangarooBackend* backend,
 // without manual cleanup; the explicit disconnect at end-of-flow exists
 // only so the final "Disconnected from pool" message lands deterministically
 // before the session summary.
-int run_pool_mode(const Arguments& args, const GPUDetectionResult& gpu_info) {
+int run_pool_mode(const Arguments& args, const GPUDetectionResult& gpu_info,
+                  int argc, char** argv) {
     using namespace ::collider::pool;
+
+    // v1.5.4: sweep any leftover self-update artifacts ("<exe>.old" / temp
+    // download) from a prior update before doing anything else. Best-effort;
+    // never throws.
+    ::collider::update::cleanup_stale_update_artifacts();
 
     // POOL MODE banner used to cout here (top/centered/bottom box plus
     // an explanatory paragraph about asymmetric protocol v3). All of
@@ -299,6 +306,60 @@ int run_pool_mode(const Arguments& args, const GPUDetectionResult& gpu_info) {
 
     if (pool_tui) pool_tui->set_current_phase_name("Connected; requesting work");
 
+    // v1.5.4 client self-update: pool_manager.connect() completed the first
+    // successful authentication, so the AUTH_OK advert is now available.
+    // Effective auto-update = config/CLI toggle AND not --no-update. When
+    // enabled and the pool advertises a newer version with a usable download
+    // URL + nonzero sha256, fetch + verify + relaunch. perform_self_update
+    // exits the process on success; if it returns false we keep mining on
+    // the current version. The check runs at most once per process: connect()
+    // is only called here at startup (the supervisor handles reconnects),
+    // so no latch is needed across reconnects.
+    {
+        const bool auto_update = args.pool_auto_update && !args.no_update;
+        const auto advert = pool_manager.get_update_advert();
+        bool sha_nonzero = false;
+        for (uint8_t b : advert.sha256) {
+            if (b != 0) { sha_nonzero = true; break; }
+        }
+        const bool newer =
+            advert.present &&
+            ::collider::update::semver_less(std::string(::collider::kVersion),
+                                            advert.latest_version);
+        bool updated_or_attempted = false;
+        if (auto_update && advert.present && !advert.download_url.empty() &&
+            sha_nonzero && newer) {
+            ::collider::log::milestone(
+                "self_update_begin",
+                std::string("cur=") + ::collider::kVersion +
+                    " latest=" + advert.latest_version);
+            if (pool_tui) {
+                pool_tui->set_current_phase_name("Updating client");
+            }
+            updated_or_attempted = true;
+            const bool ok = ::collider::update::perform_self_update(
+                advert.download_url, advert.sha256, argc, argv);
+            // perform_self_update relaunches + ExitProcess on success, so
+            // reaching here means it failed. Continue on the current version.
+            if (!ok) {
+                ::collider::log::milestone("self_update_failed",
+                                           "update could not be applied; "
+                                           "continuing on current version");
+            }
+        }
+        // If we are below the pool's advertised minimum version and could
+        // not (or chose not to) update, surface a clear milestone so the
+        // operator understands why work may be refused. Do not crash.
+        if (advert.present && !updated_or_attempted &&
+            ::collider::update::semver_less(
+                std::string(::collider::kVersion), advert.min_version)) {
+            ::collider::log::milestone(
+                "update_required",
+                std::string("min=") + advert.min_version +
+                    " cur=" + ::collider::kVersion);
+        }
+    }
+
     // Get initial work assignment.
     WorkAssignment work;
     if (!pool_manager.get_work(work)) {
@@ -390,6 +451,10 @@ int run_pool_mode(const Arguments& args, const GPUDetectionResult& gpu_info) {
         }
     }
     std::unique_ptr<::collider::kangaroo::IKangarooBackend> backend;
+    // Latched true once the opportunistic bloom filter loads on the first
+    // chunk (Pro only). Read on the progress tick to gate the status
+    // panel's BLOOM row + populate its checks counter from the backend.
+    bool bloom_active = false;
     try {
         backend = ::collider::kangaroo::create_kangaroo_backend(
             backend_kind, args.gpu_ids);
@@ -440,7 +505,8 @@ int run_pool_mode(const Arguments& args, const GPUDetectionResult& gpu_info) {
     };
     cb.on_progress = [&progress, &pool_manager, &poll_work_id_change,
                       &restart_pending, pool_tui,
-                      &current_work_id, &work, &pool_config](
+                      &current_work_id, &work, &pool_config,
+                      &backend, &bloom_active](
                           double ops_per_sec,
                           uint64_t local_dps) -> bool {
         if (g_shutdown.load()) return false;
@@ -501,6 +567,20 @@ int run_pool_mode(const Arguments& args, const GPUDetectionResult& gpu_info) {
             pi.your_share     = ps.your_share;
             pi.pool_endpoint  = pool_config.host + ":" +
                                 std::to_string(pool_config.port);
+#ifdef COLLIDER_PRO
+            // Opportunistic bloom status (Pro only). bloom_hits is not
+            // surfaced over the wire (hits land in bloom_hits.txt via the
+            // backend's hit callback), so only the loaded-state + probe
+            // counter are plumbed here; the panel reuses pool_total_dps for
+            // the "entries" figure. try_get_bloom_checks() returns 0 on
+            // backends without the feature. Gated on COLLIDER_PRO because
+            // the Free build replaces tui::PoolInfo with a stub that omits
+            // these fields (the bloom feature is Pro-only end to end).
+            pi.bloom_loaded   = bloom_active;
+            pi.bloom_checks   = backend ? backend->try_get_bloom_checks() : 0;
+#else
+            (void)bloom_active;
+#endif
             pool_tui->set_pool_info(pi);
             // Bridge the TUI quit signal ('q' / Ctrl+C inside FTXUI) into
             // the global shutdown latch the solve loop already honours.
@@ -630,6 +710,7 @@ int run_pool_mode(const Arguments& args, const GPUDetectionResult& gpu_info) {
         // not in a captured log.
         if (first_chunk && !args.bloom_file.empty()) {
             if (backend->try_set_bloom_filter(args.bloom_file)) {
+                bloom_active = true;
                 auto& rc = ::collider::runtime::global_runtime_control();
                 std::lock_guard<std::mutex> lk(rc.banner_mu);
                 rc.banner_text = "Bloom filter loaded";

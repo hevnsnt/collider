@@ -31,7 +31,7 @@
 # ---------------------------------------------------------------------------
 pool:
   worker: "1YourBitcoinAddressForRewards"
-  url: "jlps://collisionprotocol.com:17403" # jlps:// = TLS (recommended)
+  url: "jlps://pool.collisionprotocol.com:17403" # jlps:// = TLS (recommended)
   # password: "..."                  # CLI: --pool-password (deprecated; use --pool-password-file <path>)
   # api_key: "..."                   # CLI: --pool-api-key
 

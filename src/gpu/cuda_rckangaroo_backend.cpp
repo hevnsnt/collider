@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <iostream>
 #include <ostream>
 #include <sstream>
 
@@ -118,6 +119,7 @@ bool CudaRCKangarooBackend::initialize(const collider::pool::WorkAssignment& wor
     return true;
 }
 
+#ifdef COLLIDER_PRO
 bool CudaRCKangarooBackend::try_set_bloom_filter(const std::string& path) {
     if (!rc_.load_bloom_filter(path)) return false;
     // Match the standalone-kangaroo path's hit-log contract: every bloom
@@ -127,7 +129,7 @@ bool CudaRCKangarooBackend::try_set_bloom_filter(const std::string& path) {
     // "opportunistic address checking" feature look broken even when it
     // was running. See puzzle_solver_kangaroo.cpp:maybe_load_rckangaroo_
     // bloom_filter for the original pattern; this is the pool-side mirror.
-    rc_.bloom_hit_callback = [](const gpu::BloomHit& hit) {
+    rc_.bloom_hit_callback = [](const gpu::bloom::BloomHit& hit) {
         std::ofstream hitlog =
             ::collider::secure_open_ofstream("bloom_hits.txt", std::ios::app);
         if (hitlog) {
@@ -141,6 +143,11 @@ bool CudaRCKangarooBackend::try_set_bloom_filter(const std::string& path) {
     };
     return true;
 }
+
+uint64_t CudaRCKangarooBackend::try_get_bloom_checks() const {
+    return rc_.get_bloom_checks();
+}
+#endif
 
 void CudaRCKangarooBackend::solve(BackendCallbacks cb) {
     if (!initialized_) {
@@ -164,6 +171,17 @@ void CudaRCKangarooBackend::solve(BackendCallbacks cb) {
         return cb.on_progress(ops_per_sec, dp_count);
     };
 
+    // Arm the herd save BEFORE solve() so the patched RCGpuKang populates
+    // the per-GPU SaveKangsHost buffers as it runs. RCKangaroo requires
+    // arming up front; the pool runner only calls save_herd_state(path)
+    // once at teardown (AFTER solve), at which point arming would be too
+    // late to capture this run's state. request_save_on_stop() takes no
+    // path (it only flips the arm flag); the destination is supplied at
+    // write time by save_herd_state(path) below. Re-arming after an
+    // explicit pre-solve save_herd_state() call is harmless (idempotent
+    // flag set), so we always arm here.
+    rc_.request_save_on_stop();
+
     gpu::RCKangarooResult result = rc_.solve();
     // v1.5: the result.found path that invoked cb.on_solution with the
     // recovered private key was DELETED. In pool mode rc_.mode is always
@@ -176,6 +194,19 @@ void CudaRCKangarooBackend::solve(BackendCallbacks cb) {
     // Reading result.private_key here would re-introduce the theft
     // surface v1.5 was designed to eliminate, so the read is gone too.
     (void)result;
+
+    // Post-solve: if the runner armed an explicit destination via a
+    // pre-solve save_herd_state(path) call, flush now. The common pool path
+    // instead calls save_herd_state(path) AFTER solve() returns (at
+    // teardown); that call writes the file directly. Either way the buffers
+    // are populated at this point.
+    if (!pending_save_path_.empty()) {
+        if (rc_.save_herd_state(pending_save_path_)) {
+            std::cerr << "[*] Saved kangaroo herd to "
+                      << pending_save_path_ << "\n";
+        }
+        pending_save_path_.clear();
+    }
 }
 
 std::string CudaRCKangarooBackend::device_summary() const {
@@ -183,6 +214,42 @@ std::string CudaRCKangarooBackend::device_summary() const {
     std::ostringstream oss;
     oss << num_gpus_ << " CUDA GPU" << (num_gpus_ == 1 ? "" : "s");
     return oss.str();
+}
+
+bool CudaRCKangarooBackend::save_herd_state(const std::string& path) {
+    if (!initialized_) return false;
+
+    // Two-phase, mirroring rc_kangaroo_backend.cpp. RCKangaroo must be
+    // armed BEFORE solve() to populate the per-GPU SaveKangsHost buffers.
+    //
+    //   Pre-solve call:  arm rc_.request_save_on_stop(), stash the
+    //                     destination in pending_save_path_, and return
+    //                     true. solve() writes the file when it returns.
+    //   Post-solve call: solve() already armed and ran (request_save_on_stop
+    //                     fired at its entry) and the buffers are populated,
+    //                     so write the file now. This is the path the pool
+    //                     runner takes (it calls save_herd_state once at
+    //                     teardown). RCKangarooManager::save_herd_state
+    //                     returns false if no solve ever ran or a GPU's
+    //                     buffer is empty; that is reported, not faked.
+    if (pending_save_path_.empty()) {
+        if (!rc_.request_save_on_stop()) return false;
+        pending_save_path_ = path;
+        return true;
+    }
+    const bool ok = rc_.save_herd_state(path);
+    pending_save_path_.clear();
+    return ok;
+}
+
+bool CudaRCKangarooBackend::load_herd_state(const std::string& path) {
+    if (!initialized_) return false;
+    // Arms InitKangsHost on each RCGpuKang from the file so the next
+    // solve()'s Start() resumes the herd instead of regenerating it.
+    // RCKangarooManager::load_herd_state validates magic / version /
+    // GPU-count / KangCnt / config-hash and returns false on any mismatch,
+    // in which case the fresh herd seeded by initialize() proceeds.
+    return rc_.load_herd_state(path);
 }
 
 }  // namespace kangaroo

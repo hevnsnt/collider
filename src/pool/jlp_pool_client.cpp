@@ -1043,9 +1043,18 @@ bool JLPPoolClient::send_hello() {
     auto auth_milestone = [](const char* event, const std::string& detail) {
         ::collider::log::milestone(event, detail);
     };
+    // header.flags carries this client's PROTOCOL_VERSION on EVERY send (the
+    // v1.4.2 B.5 contract). This is a v1.5.4 client, so it always advertises
+    // version 4 regardless of whether the AUTH body is the signed v4 identity
+    // form or the unsigned 120-byte form. The version (flags) and the
+    // signed/unsigned body shape are orthogonal axes; downgrading the
+    // unsigned path to 3 would get this client refused by a strict-mode pool
+    // (floor 4). The "wire=" label reflects the actual flags byte sent.
+    const uint8_t auth_wire_flags =
+        static_cast<uint8_t>(jlp_wire::PROTOCOL_VERSION);
     auth_milestone("auth_build_begin",
-                   std::string("wire=") +
-                       (worker_identity_ ? "v4" : "v3"));
+                   std::string("wire=v") +
+                       std::to_string(static_cast<int>(auth_wire_flags)));
 
     if (worker_identity_) {
         JLPClientHelloV4 hv4;
@@ -1081,8 +1090,7 @@ bool JLPPoolClient::send_hello() {
                        std::string("payload_bytes=") +
                            std::to_string(sizeof(hv4)));
         const bool sent = send_message(
-            JLPMessageType::AUTH, &hv4, sizeof(hv4),
-            static_cast<uint8_t>(jlp_wire::PROTOCOL_VERSION_V4));
+            JLPMessageType::AUTH, &hv4, sizeof(hv4), auth_wire_flags);
         auth_milestone(sent ? "auth_send_end" : "auth_send_failed",
                        sent ? std::string("payload_bytes=") +
                                   std::to_string(sizeof(hv4))
@@ -1094,7 +1102,12 @@ bool JLPPoolClient::send_hello() {
     auth_milestone("auth_send_begin",
                    std::string("payload_bytes=") +
                        std::to_string(sizeof(hello)));
-    const bool sent = send_message(JLPMessageType::AUTH, &hello, sizeof(hello));
+    // Stamp header.flags = v3 explicitly. The default would apply
+    // PROTOCOL_VERSION (now 4), which would mislabel this v3-shaped
+    // JLPClientHelloV2 body as v4 and make the server route it to the v4
+    // decoder (size + signature mismatch -> AUTH_FAIL).
+    const bool sent = send_message(
+        JLPMessageType::AUTH, &hello, sizeof(hello), auth_wire_flags);
     auth_milestone(sent ? "auth_send_end" : "auth_send_failed",
                    sent ? std::string("payload_bytes=") +
                               std::to_string(sizeof(hello))
@@ -1248,6 +1261,17 @@ void JLPPoolClient::set_dp_sequence_progress_callback(DpSeqProgressCallback cb) 
 void JLPPoolClient::set_work_id_assigned_callback(WorkIdAssignedCallback cb) {
     std::lock_guard<std::mutex> lock(callbacks_mutex_);
     work_id_assigned_callback_ = std::move(cb);
+}
+
+void JLPPoolClient::set_kangaroo_type_changed_callback(
+        KangarooTypeChangedCallback cb) {
+    std::lock_guard<std::mutex> lock(callbacks_mutex_);
+    kangaroo_type_changed_callback_ = std::move(cb);
+}
+
+void JLPPoolClient::set_maintenance_callback(MaintenanceCallback cb) {
+    std::lock_guard<std::mutex> lock(callbacks_mutex_);
+    maintenance_callback_ = std::move(cb);
 }
 
 void JLPPoolClient::snapshot_dp_sequence(uint64_t& out_work_id,
@@ -1733,13 +1757,18 @@ void JLPPoolClient::sender_loop() {
         // to avoid a deadlock cycle.
         uint64_t current_work_id = 0;
         uint32_t seq_start = 0;
+        uint8_t expected_type = kAnyDpType;
         {
             std::lock_guard<std::mutex> wlock(work_mutex_);
             current_work_id = current_work_.work_id;
             seq_start = dp_sequence_next_;
+            // Derive the permitted wire type from kangaroo_type (KANG_MODE):
+            // 1=TAME_ONLY -> 0 (tame), 2=WILD_ONLY -> 1 (wild). Anything
+            // else (0/illegal/unset) disables the filter.
+            expected_type = kang_type_to_dp_type(current_work_.kangaroo_type);
         }
 
-        drain_dp_queue_into_batch(current_work_id, seq_start, batch);
+        drain_dp_queue_into_batch(current_work_id, seq_start, expected_type, batch);
 
         if (!batch.empty()) {
             // Optimistically advance the per-chunk sequence counter to
@@ -1795,6 +1824,7 @@ void JLPPoolClient::wait_for_send_signal() {
 size_t JLPPoolClient::drain_dp_queue_into_batch(
         uint64_t current_work_id,
         uint32_t seq_start,
+        uint8_t expected_type,
         std::vector<JLPDistinguishedPointV2>& batch) {
     // Drain up to kSenderMaxBatchDps DPs under dp_mutex_ alone. The lock
     // is held only long enough to copy out the batch and pop the source
@@ -1803,9 +1833,26 @@ size_t JLPPoolClient::drain_dp_queue_into_batch(
     // so this remains correct on big-endian builds. Manual byte assembly
     // avoids the missing-htole64 portability headache (Windows lacks it).
     const size_t before = batch.size();
+    uint64_t dropped_this_call = 0;
     std::lock_guard<std::mutex> lock(dp_mutex_);
     while (!dp_queue_.empty() && batch.size() < kSenderMaxBatchDps) {
         const auto& dp = dp_queue_.front();
+
+        // v1.5 client-side type-mismatch safety net. The currently-assigned
+        // kangaroo_type permits exactly one DP wire type (0=tame, 1=wild).
+        // A DP carrying the other type can only be a stale leak from the
+        // prior herd or a backend bug; shipping it makes the server drop and
+        // penalize us, so we drop it locally instead. expected_type ==
+        // kAnyDpType disables the filter (no asymmetric assignment active),
+        // preserving legacy behavior. Dropped DPs do NOT consume a sequence
+        // number: only batch.size() (the shipped count) drives seq, so the
+        // shipped stream stays contiguous.
+        if (expected_type != kAnyDpType && dp.type != expected_type) {
+            dp_queue_.pop_front();
+            ++dropped_this_call;
+            continue;
+        }
+
         JLPDistinguishedPointV2 jlp_dp;
         {
             uint8_t* p = reinterpret_cast<uint8_t*>(&jlp_dp.work_id);
@@ -1827,6 +1874,25 @@ size_t JLPPoolClient::drain_dp_queue_into_batch(
         jlp_dp.dp_bits = static_cast<uint8_t>(dp.dp_bits & 0xFF);
         batch.push_back(jlp_dp);
         dp_queue_.pop_front();
+    }
+
+    if (dropped_this_call != 0) {
+        const uint64_t total =
+            dropped_type_mismatch_.fetch_add(dropped_this_call,
+                                             std::memory_order_relaxed)
+            + dropped_this_call;
+        // Throttled WARN (every Nth drop, power-of-two mask) so a sustained
+        // mismatch storm cannot flood the log.
+        constexpr uint64_t kWarnEvery = 256;
+        if ((total & (kWarnEvery - 1)) < dropped_this_call) {
+            std::cerr << "[Pool] WARN dropped " << dropped_this_call
+                      << " DP(s) with type != assigned (expected="
+                      << static_cast<int>(expected_type)
+                      << "); " << total
+                      << " total since startup. Client-side safety net for "
+                         "v1.5 asymmetric assignment; these never reached the "
+                         "server." << std::endl;
+        }
     }
     return batch.size() - before;
 }
@@ -2006,12 +2072,14 @@ void JLPPoolClient::perform_final_drain_pass(
            && auth_state_.load() == AuthState::AUTH_OK) {
         uint64_t wid = 0;
         uint32_t seq = 0;
+        uint8_t expected_type = kAnyDpType;
         {
             std::lock_guard<std::mutex> wlock(work_mutex_);
             wid = current_work_.work_id;
             seq = dp_sequence_next_;
+            expected_type = kang_type_to_dp_type(current_work_.kangaroo_type);
         }
-        drain_dp_queue_into_batch(wid, seq, batch);
+        drain_dp_queue_into_batch(wid, seq, expected_type, batch);
         if (batch.empty()) break;
         advance_dp_sequence_if_unchanged(
             wid, seq + static_cast<uint32_t>(batch.size()));
@@ -2090,6 +2158,7 @@ void JLPPoolClient::handle_server_message(const JLPHeader& header,
         case JLPMessageType::DP_ACK:     handle_dp_ack(header, payload);              break;
         case JLPMessageType::SOLUTION:   handle_solution(header, payload);            break;
         case JLPMessageType::PING:       handle_ping(header, payload);                break;
+        case JLPMessageType::MAINTENANCE: handle_maintenance(header, payload);        break;
         case JLPMessageType::MSG_ERROR:  handle_msg_error(header, payload, s);        break;
         default:                         handle_default_unknown(header, payload);     break;
     }
@@ -2111,7 +2180,12 @@ void JLPPoolClient::handle_work_asn(const JLPHeader& /*header*/,
         std::cerr << std::endl;
     }
 
-    if (payload.size() < sizeof(JLPServerConfig)) {
+    // Require an EXACT-size payload (audit pool HIGH-2). A '<' bound silently
+    // accepted an oversized WORK_ASN and ignored the trailing bytes, which
+    // violates the project's own doctrine that a decoder seeing a longer-than-
+    // expected payload must reject it as malformed (a future field-growing
+    // WORK_ASN should bump the version, not be silently truncated here).
+    if (payload.size() != sizeof(JLPServerConfig)) {
         return;
     }
 
@@ -2199,27 +2273,75 @@ void JLPPoolClient::apply_work_asn_assignment(const JLPServerConfig& config,
     // outside any lock. Pre-1.4.1 this was inlined here
     // and only protected by work_mutex_; a concurrent
     // set_work_callback could race with the read.
-    std::lock_guard<std::mutex> lock(work_mutex_);
-    memcpy(current_work_.public_key, config.public_key, 33);
-    memcpy(current_work_.range_start, config.range_start, 32);
-    memcpy(current_work_.range_end, config.range_end, 32);
-    current_work_.dp_bits = config.dp_bits;
-    current_work_.work_id = config.work_id;
-    // v1.5 asymmetric assignment fields. The backend
-    // (CudaRCKangarooBackend::initialize) maps kangaroo_type to a
-    // KANG_MODE_* and rejects 0/BOTH in pool mode (server bug if it
-    // ever arrives). start_offset_a/_b are propagated for future
-    // per-worker chunk-slicing and recorded in the milestone log.
-    current_work_.kangaroo_type  = config.kangaroo_type;
-    current_work_.start_offset_a = config.start_offset_a;
-    current_work_.start_offset_b = config.start_offset_b;
-    work_received_ = true;  // chunk ID 0 is valid; don't use work_id as sentinel
-    // per-chunk DP sequence resets at the
-    // start of every assignment. The server expects
-    // sequences to start at 0 and grow monotonically
-    // for each (worker, work_id) pair.
-    dp_sequence_next_ = 0;
-    out_work_copy = current_work_;
+    // v1.5 type-mismatch epoch race: when the server reassigns this worker
+    // to the OTHER half (TAME_ONLY <-> WILD_ONLY), every DP still queued
+    // from the prior herd carries the old type byte. Shipping those under
+    // the new work_id makes the server drop and penalize us. We detect the
+    // change under work_mutex_ and flush our own dp_queue_, then notify
+    // PoolManager (which owns the reconnect-window buffer) AFTER releasing
+    // every lock. prev_kangaroo_type==0 is the first assignment (no prior
+    // herd) and is not treated as a change.
+    bool type_changed = false;
+    uint8_t prev_kangaroo_type = 0;
+    size_t flushed_in_flight = 0;
+    {
+        std::lock_guard<std::mutex> lock(work_mutex_);
+        // Capture the previously-applied kangaroo_type BEFORE the overwrite.
+        prev_kangaroo_type = current_work_.kangaroo_type;
+        memcpy(current_work_.public_key, config.public_key, 33);
+        memcpy(current_work_.range_start, config.range_start, 32);
+        memcpy(current_work_.range_end, config.range_end, 32);
+        current_work_.dp_bits = config.dp_bits;
+        current_work_.work_id = config.work_id;
+        // v1.5 asymmetric assignment fields. The backend
+        // (CudaRCKangarooBackend::initialize) maps kangaroo_type to a
+        // KANG_MODE_* and rejects 0/BOTH in pool mode (server bug if it
+        // ever arrives). start_offset_a/_b are propagated for future
+        // per-worker chunk-slicing and recorded in the milestone log.
+        current_work_.kangaroo_type  = config.kangaroo_type;
+        current_work_.start_offset_a = config.start_offset_a;
+        current_work_.start_offset_b = config.start_offset_b;
+        work_received_ = true;  // chunk ID 0 is valid; don't use work_id as sentinel
+        // per-chunk DP sequence resets at the
+        // start of every assignment. The server expects
+        // sequences to start at 0 and grow monotonically
+        // for each (worker, work_id) pair.
+        dp_sequence_next_ = 0;
+        out_work_copy = current_work_;
+
+        type_changed = (prev_kangaroo_type != 0 &&
+                        prev_kangaroo_type != config.kangaroo_type);
+        if (type_changed) {
+            // dp_queue_ is ours; cleared here under dp_mutex_, taken AFTER
+            // work_mutex_ per the documented lock order (work_mutex_ then
+            // dp_mutex_).
+            std::lock_guard<std::mutex> dlock(dp_mutex_);
+            flushed_in_flight = dp_queue_.size();
+            dp_queue_.clear();
+        }
+    }
+
+    if (type_changed) {
+        std::cout << "[Pool] INFO kangaroo_type changed "
+                  << static_cast<int>(prev_kangaroo_type) << "->"
+                  << static_cast<int>(config.kangaroo_type)
+                  << "; flushed " << flushed_in_flight
+                  << " stale-type in-flight DP(s) for new work_id="
+                  << config.work_id << std::endl;
+
+        // Notify PoolManager to flush its reconnect-window buffer. Copy the
+        // callback pointer under callbacks_mutex_ and invoke OUTSIDE every
+        // other lock (matches fire_work_callback's discipline) so the
+        // manager callback can never deadlock against work_mutex_/dp_mutex_.
+        KangarooTypeChangedCallback cb_copy;
+        {
+            std::lock_guard<std::mutex> clock(callbacks_mutex_);
+            cb_copy = kangaroo_type_changed_callback_;
+        }
+        if (cb_copy) {
+            cb_copy(prev_kangaroo_type, config.kangaroo_type);
+        }
+    }
 }
 
 void JLPPoolClient::log_work_asn_milestone(const JLPServerConfig& config,
@@ -2303,10 +2425,8 @@ void JLPPoolClient::handle_stats_rsp(const JLPHeader& /*header*/,
 }
 
 void JLPPoolClient::handle_auth_ok(const JLPHeader& /*header*/,
-                                   const std::vector<uint8_t>& /*payload*/) {
+                                   const std::vector<uint8_t>& payload) {
     std::cout << "[Pool] Authentication successful" << std::endl;
-    auth_state_.store(AuthState::AUTH_OK);
-    auth_cv_.notify_all();
     // the supervisor in PoolManager resets its
     // own backoff and consecutive_failures counters on every
     // successful reconnect. The previously-client-local
@@ -2317,6 +2437,109 @@ void JLPPoolClient::handle_auth_ok(const JLPHeader& /*header*/,
     // about for "are we actually working?". worker_name_ holds
     // the payout BTC address (= JLP "worker" identifier).
     ::collider::log::milestone("auth_ok", worker_name_);
+
+    // v1.5.4: parse the AUTH_OK update advert (324-byte AuthOkPayload).
+    // A legacy server sends a zero-payload AUTH_OK; treat anything
+    // shorter than the advert struct as "no advert" and clear the cached
+    // value. A longer-than-expected payload reads the leading 324 bytes
+    // (additive growth is reserved via the struct's reserved[] field).
+    UpdateAdvert advert;  // present=false by default
+    if (payload.size() >= sizeof(jlp_wire::AuthOkPayload)) {
+        jlp_wire::AuthOkPayload p;
+        std::memcpy(&p, payload.data(), sizeof(p));
+
+        // Helper: read a null-padded ASCII field into a std::string,
+        // stopping at the first NUL (or the field end).
+        const auto read_cstr = [](const uint8_t* buf, size_t cap) {
+            size_t n = 0;
+            while (n < cap && buf[n] != 0) ++n;
+            return std::string(reinterpret_cast<const char*>(buf), n);
+        };
+
+        advert.present          = true;
+        advert.latest_version   = read_cstr(p.latest_version,
+                                            sizeof(p.latest_version));
+        advert.min_version      = read_cstr(p.min_version,
+                                            sizeof(p.min_version));
+        advert.download_url     = read_cstr(p.download_url,
+                                            sizeof(p.download_url));
+        std::memcpy(advert.sha256.data(), p.sha256, advert.sha256.size());
+        advert.update_available   = (p.flags & 0x01) != 0;
+        advert.maintenance_active = (p.flags & 0x02) != 0;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(callbacks_mutex_);
+        update_advert_ = advert;
+    }
+
+    if (advert.present) {
+        std::string detail =
+            "latest=" + advert.latest_version +
+            " min=" + advert.min_version +
+            " update=" + (advert.update_available ? "1" : "0") +
+            " maint=" + (advert.maintenance_active ? "1" : "0") +
+            " url_present=" + (advert.download_url.empty() ? "0" : "1");
+        ::collider::log::milestone("authok_advert", detail);
+    }
+
+    // Publish AUTH_OK only AFTER the advert is parsed and stored. The
+    // release-store here pairs with the acquire-load in the authenticate()
+    // waiter, so any consumer that observes AUTH_OK (e.g. pool_solver
+    // reading get_update_advert() right after connect() returns) is
+    // guaranteed to see the fully-written advert. Storing/notifying before
+    // the parse let the consumer read a stale empty advert and silently skip
+    // a self-update the server had advertised.
+    auth_state_.store(AuthState::AUTH_OK);
+    auth_cv_.notify_all();
+}
+
+JLPPoolClient::UpdateAdvert JLPPoolClient::get_update_advert() const {
+    std::lock_guard<std::mutex> lock(callbacks_mutex_);
+    return update_advert_;
+}
+
+void JLPPoolClient::handle_maintenance(const JLPHeader& /*header*/,
+                                       const std::vector<uint8_t>& payload) {
+    // Require the full MaintenancePayload (262 bytes). Reject anything
+    // shorter as malformed (do not act on a partial frame).
+    if (payload.size() < sizeof(jlp_wire::MaintenancePayload)) {
+        return;
+    }
+    jlp_wire::MaintenancePayload p;
+    std::memcpy(&p, payload.data(), sizeof(p));
+
+    const bool active = (p.active != 0);
+    const uint32_t retry = p.retry_after_secs;
+
+    // Decode the operator note as printable ASCII, stopping at the first
+    // NUL and replacing control characters (same anti-injection approach
+    // as handle_auth_fail / handle_msg_error).
+    std::string message;
+    message.reserve(sizeof(p.message));
+    for (size_t i = 0; i < sizeof(p.message) && p.message[i] != 0; ++i) {
+        unsigned char c = p.message[i];
+        message.push_back((c >= 0x20 && c < 0x7F) ? static_cast<char>(c) : '.');
+    }
+
+    std::string detail =
+        "active=" + std::string(active ? "1" : "0") +
+        " retry=" + std::to_string(retry) +
+        " msg=" + message;
+    ::collider::log::milestone("pool_maintenance", detail);
+
+    // Copy the callback out under the lock, fire it OUTSIDE the lock so
+    // the PoolManager hook (which takes its own mutexes) can never
+    // deadlock against callbacks_mutex_. Mirrors the kangaroo-type and
+    // solution callback patterns.
+    MaintenanceCallback cb_copy;
+    {
+        std::lock_guard<std::mutex> lock(callbacks_mutex_);
+        cb_copy = maintenance_callback_;
+    }
+    if (cb_copy) {
+        cb_copy(active, retry, message);
+    }
 }
 
 void JLPPoolClient::handle_auth_fail(const JLPHeader& /*header*/,

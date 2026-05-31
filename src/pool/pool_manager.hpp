@@ -133,6 +133,24 @@ public:
     uint32_t reconnect_successes() const { return reconnect_successes_.load(); }
     bool reconnect_supervisor_gave_up() const { return supervisor_gave_up_.load(); }
 
+    // v1.5.4 maintenance status (surfaced to the host so the TUI / logs
+    // can tell the operator the pool asked everyone to back off). The
+    // flag is set when a MAINTENANCE(active=1) frame arrives and cleared
+    // on the next successful AUTH that does not re-assert maintenance.
+    bool is_in_maintenance() const {
+        return maintenance_active_.load(std::memory_order_acquire);
+    }
+    std::string maintenance_message() const {
+        std::lock_guard<std::mutex> lock(maintenance_mutex_);
+        return maintenance_message_;
+    }
+
+    // v1.5.4: surface the update advert parsed from the current client's
+    // AUTH_OK so the host (run_pool_mode) can decide whether to self-update
+    // after the first successful authentication. Returns a not-present
+    // advert when there is no JLP client or no advert was parsed.
+    JLPPoolClient::UpdateAdvert get_update_advert() const;
+
 private:
     PoolConfig config_;
     std::unique_ptr<PoolClient> client_;
@@ -212,11 +230,38 @@ private:
     std::atomic<uint32_t>   reconnect_successes_{0};
     std::atomic<bool>       supervisor_gave_up_{false};
 
+    // v1.5.4 maintenance back-off state. Set by the MaintenanceCallback
+    // the manager registers on every fresh client (wire_client_callbacks).
+    // When active, supervisor_loop uses maintenance_retry_secs_ (jittered)
+    // as the reconnect wait instead of the exponential backoff, and does
+    // NOT count the lost session as a failure or a churn event (a
+    // maintenance window is expected, not a fault). maintenance_active_ is
+    // atomic so is_in_maintenance() and the supervisor can read it without
+    // the mutex; the message string is guarded by maintenance_mutex_.
+    std::atomic<bool>       maintenance_active_{false};
+    std::atomic<uint32_t>   maintenance_retry_secs_{0};
+    mutable std::mutex      maintenance_mutex_;
+    std::string             maintenance_message_;
+
     static constexpr uint32_t kMaxReconnectAttempts = 16;
     static constexpr uint32_t kInitialBackoffMs     = 1000;
     // The cap on reconnect backoff lives in pool_config.hpp as
     // MAX_RECONNECT_BACKOFF_MS, shared with JLPPoolClient so the two
     // reconnect paths can never disagree on the upper bound.
+
+    // Reconnect-churn circuit-breaker. A session that passes AUTH +
+    // WORK_ASN resets consecutive_failures to 0, so a worker that keeps
+    // getting dropped IMMEDIATELY after auth (server flapping it, a poison
+    // work_id, a one-way-reachability NAT issue) would otherwise hot-loop
+    // forever: connect, auth, get dropped in under a second, repeat, with
+    // the failure counter never climbing. We treat a successful session
+    // that lasted less than kSustainedSessionMs as "not sustained" and, if
+    // kMaxChurnReconnects of those happen back-to-back on the SAME work_id,
+    // trip supervisor_gave_up_ instead of spinning. Genuine transient
+    // drops (sessions that DID sustain, or a new work_id) reset the churn
+    // counter so normal reconnect behavior is preserved.
+    static constexpr uint32_t kMaxChurnReconnects = 5;
+    static constexpr uint32_t kSustainedSessionMs = 30'000;
 
     void start_supervisor();
     void stop_supervisor();

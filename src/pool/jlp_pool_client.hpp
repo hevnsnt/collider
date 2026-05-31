@@ -99,6 +99,11 @@ enum class JLPMessageType : uint8_t {
     PING      = 0x50,
     PONG      = 0x51,
 
+    // Maintenance (v1.5.4, protocol_version=4): server -> client back-off
+    // signal. Carries a MaintenancePayload (262 bytes). active=1 means
+    // "back off"; active=0 is an all-clear. See jlp_wire_generated.hpp.
+    MAINTENANCE = 0x60,
+
     // Error (named MSG_ERROR to avoid Windows ERROR macro conflict)
     MSG_ERROR = 0xFF
 };
@@ -147,6 +152,12 @@ static_assert(sizeof(JLPClientHelloV2) == 120,
 // (PROTOCOL_VERSION_MIN bumped to 4); until then v4 is an opt-in
 // client capability gated on a loaded WorkerIdentity.
 namespace jlp_wire {
+// header.flags byte for the unsigned (no worker-identity) AUTH frame.
+// That frame carries the v3-shaped JLPClientHelloV2 body (name +
+// password + timestamp + nonce), so the header MUST advertise v3 to
+// match it. PROTOCOL_VERSION is now 4, so we cannot let the default
+// stamp apply here or the worker would claim v4 while sending a v3 body.
+constexpr int PROTOCOL_VERSION_V3 = 3;
 // header.flags byte for v4 frames. Servers route to decode_auth_v4
 // when they see this value; servers pinned to v3 reject as wire
 // mismatch (which is fine because operators only flip --worker-key on
@@ -260,7 +271,9 @@ class JLPPoolClient : public PoolClient {
 public:
     // Queue limits to prevent unbounded memory growth
     static constexpr size_t MAX_DP_QUEUE_SIZE = 100000;  // ~6.5MB of DPs max
-    static constexpr uint8_t SUPPORTED_PROTOCOL_VERSION = 1;
+    // Protocol version is sourced from jlp_wire::PROTOCOL_VERSION (the
+    // IDL-generated constant, currently 4); a stale local copy lived here
+    // through the v2->v3->v4 migrations and is removed (audit pool HIGH-1).
 
     // Bound the time we wait for an AUTH_OK / AUTH_FAIL response after
     // sending the AUTH message.
@@ -347,10 +360,54 @@ public:
         std::function<void(uint64_t work_id, uint32_t next_seq)>;
     using WorkIdAssignedCallback =
         std::function<void(uint64_t work_id)>;
+    // Fired from apply_work_asn_assignment when a new WORK_ASN changes the
+    // assigned kangaroo_type (KANG_MODE: 1=TAME_ONLY, 2=WILD_ONLY) relative
+    // to the previously-applied assignment. The client has already flushed
+    // its own dp_queue_; this lets PoolManager flush the reconnect-window
+    // buffer (reconnect_buffer_) it owns, so stale-type DPs from the prior
+    // herd can never ship under the new work_id (v1.5 server drops and
+    // penalizes type mismatches). Args: (prev_type, new_type).
+    using KangarooTypeChangedCallback =
+        std::function<void(uint8_t prev_type, uint8_t new_type)>;
+
+    // Fired from handle_maintenance when the server sends a MAINTENANCE
+    // (0x60) frame. PoolManager registers it (see wire_client_callbacks)
+    // so the supervisor can switch from exponential backoff to the
+    // operator-suggested retry_after_secs window and avoid counting the
+    // maintenance window as a churn failure. Args: (active, retry_after_secs,
+    // operator message). active=1 means "back off"; active=0 is an
+    // explicit all-clear. Same lock-copy-fire pattern as the kangaroo-type
+    // callback so the manager hook can never deadlock against an internal
+    // mutex.
+    using MaintenanceCallback =
+        std::function<void(bool active, uint32_t retry_after_secs,
+                           std::string message)>;
+
+    // v1.5.4: update advert parsed from the AUTH_OK payload. `present`
+    // is false on a legacy (zero-payload) AUTH_OK. download_url empty or
+    // sha256 all-zero means auto-update is disabled by the operator. The
+    // host (run_pool_mode) reads this via get_update_advert() after the
+    // first successful authentication to decide whether to self-update.
+    struct UpdateAdvert {
+        bool present = false;
+        std::string latest_version;
+        std::string min_version;
+        std::string download_url;
+        std::array<uint8_t, 32> sha256{};
+        bool update_available = false;     // AuthOkPayload flags bit0
+        bool maintenance_active = false;   // AuthOkPayload flags bit1 (advisory)
+    };
+
+    // Snapshot of the most recently parsed AUTH_OK advert. Returns a copy
+    // under callbacks_mutex_ so a concurrent re-auth on the receiver thread
+    // cannot tear the strings mid-read.
+    UpdateAdvert get_update_advert() const;
 
     void seed_dp_sequence(uint64_t work_id, uint32_t next_seq);
     void set_dp_sequence_progress_callback(DpSeqProgressCallback cb);
     void set_work_id_assigned_callback(WorkIdAssignedCallback cb);
+    void set_kangaroo_type_changed_callback(KangarooTypeChangedCallback cb);
+    void set_maintenance_callback(MaintenanceCallback cb);
 
     // emit the plaintext warning before any bytes are
     // written to the wire (AUTH carries credentials). Called by
@@ -522,8 +579,22 @@ private:
     // manager-side filter decides whether to surface it to the host.
     DpSeqProgressCallback   dp_seq_progress_callback_;
     WorkIdAssignedCallback  work_id_assigned_callback_;
+    KangarooTypeChangedCallback kangaroo_type_changed_callback_;
+    MaintenanceCallback     maintenance_callback_;
+    // Most recent AUTH_OK advert. Guarded by callbacks_mutex_ (same lock
+    // as the std::function slots; get_update_advert returns a copy).
+    UpdateAdvert            update_advert_;
     void fire_solution_callback(const uint8_t* pubkey_bytes);
     void fire_work_callback(const WorkAssignment& work);
+
+    // Count of DPs the sender refused to ship because their wire type byte
+    // (0=tame, 1=wild) did not match the currently-assigned kangaroo_type
+    // (1=TAME_ONLY maps to expected 0, 2=WILD_ONLY maps to expected 1).
+    // Client-side safety net for the v1.5 asymmetric assignment: a stale or
+    // buggy DP leaking from the prior herd can never reach the server and
+    // trigger a mismatch ban. Throttled WARN is emitted from
+    // drain_dp_queue_into_batch.
+    std::atomic<uint64_t> dropped_type_mismatch_{0};
 
     // Receiver thread
     std::thread receiver_thread_;
@@ -567,10 +638,29 @@ private:
     void wait_for_send_signal();
     // Drain up to 100 DPs from dp_queue_ into `batch`, encoded for the
     // wire under current_work_id / seq_start. The caller has already
-    // sampled current_work_id and dp_sequence_next_ under work_mutex_;
-    // we hold dp_mutex_ alone for the drain. Returns the number drained.
+    // sampled current_work_id, dp_sequence_next_, and the expected DP type
+    // under work_mutex_; we hold dp_mutex_ alone for the drain. Returns the
+    // number drained (added to batch). expected_type is the wire type byte
+    // (0=tame, 1=wild) the currently-assigned kangaroo_type permits, or
+    // kAnyDpType (0xFF) to disable the v1.5 client-side type filter (no
+    // asymmetric assignment active). Any queued DP whose type does not match
+    // expected_type is dropped (never shipped) and counted in
+    // dropped_type_mismatch_; this prevents a stale or buggy DP from the
+    // prior herd from triggering a server-side mismatch ban.
+    static constexpr uint8_t kAnyDpType = 0xFF;
+    // Map a v1.5 WORK_ASN kangaroo_type (KANG_MODE: 1=TAME_ONLY,
+    // 2=WILD_ONLY) to the DP wire type byte the worker may submit (0=tame,
+    // 1=wild). Any other value (0=BOTH/illegal/unset) returns kAnyDpType,
+    // disabling the client-side type filter. Single source of truth shared
+    // by both sender_loop call sites and the drain helper.
+    static uint8_t kang_type_to_dp_type(uint8_t kangaroo_type) {
+        if (kangaroo_type == 1) return 0;  // TAME_ONLY -> tame DP
+        if (kangaroo_type == 2) return 1;  // WILD_ONLY -> wild DP
+        return kAnyDpType;                 // 0/BOTH/illegal: no filter
+    }
     size_t drain_dp_queue_into_batch(uint64_t current_work_id,
                                      uint32_t seq_start,
+                                     uint8_t expected_type,
                                      std::vector<JLPDistinguishedPointV2>& batch);
     // Compare-and-set dp_sequence_next_ for current_work_id: only write
     // if the chunk under work_mutex_ still matches (a racing WORK_ASN
@@ -653,6 +743,8 @@ private:
     void handle_dp_ack(const JLPHeader& header, const std::vector<uint8_t>& payload);
     void handle_stats_rsp(const JLPHeader& header, const std::vector<uint8_t>& payload);
     void handle_ping(const JLPHeader& header, const std::vector<uint8_t>& payload);
+    void handle_maintenance(const JLPHeader& header,
+                            const std::vector<uint8_t>& payload);
     void handle_default_unknown(const JLPHeader& header,
                                 const std::vector<uint8_t>& payload);
 

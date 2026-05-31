@@ -57,7 +57,13 @@ public:
                                int range_bits,
                                int dp_bits);
 
+#ifdef COLLIDER_PRO
+    // Opportunistic bloom checking is a Pro-only feature; Free builds fall
+    // back to IKangarooBackend::try_set_bloom_filter (returns false) /
+    // try_get_bloom_checks (returns 0).
     bool try_set_bloom_filter(const std::string& path) override;
+    uint64_t try_get_bloom_checks() const override;
+#endif
     void solve(BackendCallbacks cb) override;
 
     std::string name()           const override { return "RCKangaroo"; }

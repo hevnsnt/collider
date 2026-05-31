@@ -215,7 +215,7 @@ jobs:
 
             ```
             ./collider --puzzle 71
-            ./collider --pool jlps://collisionprotocol.com:17403 --worker <btc-address>
+            ./collider --pool jlps://pool.collisionprotocol.com:17403 --worker <btc-address>
             ```
 
             ### Pro upgrade

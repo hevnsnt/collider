@@ -553,6 +553,11 @@ set(CORE_SOURCES
     # v1.4.1 A.3: pool-mode runtime driver extracted from main.cpp. Free +
     # Pro both build it; the bloom-filter feature inside is #ifdef-gated.
     src/runtime/pool_solver.cpp
+    # v1.5.4 client self-update: downloads + sha256-verifies + self-replaces
+    # the running binary when the pool advertises a newer version in AUTH_OK.
+    # Uses libcurl (COLLIDER_HAVE_CURL) for the download and OpenSSL EVP for
+    # the hash; both are already linked into collider_core below.
+    src/runtime/self_update.cpp
     # v1.4.1 A.3 (5/6): puzzle-mode + benchmark runtime drivers extracted
     # from main.cpp. Available in BOTH Free and Pro builds; the brain-wallet
     # benchmark variant inside is gated by #ifdef COLLIDER_PRO at the call
@@ -1413,6 +1418,14 @@ if(COLLIDER_BUILD_TESTS)
         add_executable(test_priority_queue tests/test_priority_queue.cpp)
         target_link_libraries(test_priority_queue collider_core)
         add_test(NAME PriorityQueue COMMAND test_priority_queue)
+    endif()
+
+    # v1.5.4 CHALLENGE_RSP wire codec: cross-checks the client payload builder
+    # + Merkle proofs against the frozen Python reference output.
+    if(COLLIDER_PRO AND EXISTS "${CMAKE_SOURCE_DIR}/tests/test_challenge_response.cpp" AND TARGET collider_core)
+        add_executable(test_challenge_response tests/test_challenge_response.cpp)
+        target_link_libraries(test_challenge_response collider_core)
+        add_test(NAME ChallengeResponse COMMAND test_challenge_response)
     endif()
 
     # v1.4.2: per-GPU work balancer used by the brain wallet runtime to
@@ -2322,6 +2335,23 @@ if(COLLIDER_BUILD_TESTS)
                 RESOURCE_LOCK gpu)
         endif()
 
+        # v1.5.4 scheme->bloom discovery KAT. Proves a derived priv from any
+        # DerivationScheme (not just the fused-kernel SHA256_PW) flows through
+        # v2_derive_priv_batch -> secp256k1_batch_mul_simple ->
+        # v2_multi_address_check and discovers a funded wallet in the bloom.
+        if(COLLIDER_PRO AND EXISTS "${CMAKE_SOURCE_DIR}/tests/test_v2_scheme_bloom.cu" AND TARGET collider_core)
+            add_executable(test_v2_scheme_bloom tests/test_v2_scheme_bloom.cu)
+            set_target_properties(test_v2_scheme_bloom PROPERTIES
+                CUDA_SEPARABLE_COMPILATION ON
+                CUDA_RUNTIME_LIBRARY Shared
+            )
+            target_link_libraries(test_v2_scheme_bloom collider_gpu collider_core CUDA::cudart)
+            add_test(NAME V2SchemeBloom COMMAND test_v2_scheme_bloom)
+            set_tests_properties(V2SchemeBloom PROPERTIES
+                SKIP_RETURN_CODE 77
+                RESOURCE_LOCK gpu)
+        endif()
+
         # EC scalar multiplication known-answer test. Hands the GPU a few well
         # known privkeys (1, 2, 3, 7), reads back the affine pubkey, encodes
         # it as the standard 33-byte compressed pubkey, and compares against
@@ -2658,6 +2688,18 @@ if(COLLIDER_BUILD_TESTS)
             add_executable(test_session_log tests/test_session_log.cpp)
             target_link_libraries(test_session_log collider_core)
             add_test(NAME SessionLog COMMAND test_session_log)
+        endif()
+
+        # v1.5.4 self-update: semver_less unit tests. Links collider_core
+        # for the collider::update::semver_less symbol (self_update.cpp is
+        # part of CORE_SOURCES). No curl / OpenSSL needed at the test level
+        # (semver_less is pure string parsing), but collider_core pulls them
+        # in transitively, which is fine.
+        if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_self_update.cpp"
+           AND TARGET collider_core)
+            add_executable(test_self_update tests/test_self_update.cpp)
+            target_link_libraries(test_self_update collider_core)
+            add_test(NAME SelfUpdate COMMAND test_self_update)
         endif()
 
         # Bloom false-positive-rate KAT (Tier 4 T7). Pins the empirical FP

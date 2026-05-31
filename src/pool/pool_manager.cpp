@@ -352,6 +352,78 @@ void PoolManager::wire_client_callbacks(JLPPoolClient* jlp) {
         jlp->seed_dp_sequence(work_id, seed);
     });
 
+    // Kangaroo-type-changed hook (v1.5 type-mismatch epoch race): when the
+    // server reassigns this worker from TAME_ONLY <-> WILD_ONLY, the JLP
+    // client has already flushed its own dp_queue_. The reconnect-window
+    // buffer (reconnect_buffer_) lives here in the manager and may still
+    // hold DPs of the OLD type captured while a reconnect was in flight.
+    // Drop them now so they can never be replayed and shipped under the
+    // new work_id (the server drops + penalizes type mismatches).
+    jlp->set_kangaroo_type_changed_callback(
+        [this](uint8_t prev_type, uint8_t new_type) {
+            size_t dropped = 0;
+            {
+                std::lock_guard<std::mutex> lock(reconnect_buf_mutex_);
+                dropped = reconnect_buffer_.size();
+                reconnect_buffer_.clear();
+            }
+            if (dropped != 0) {
+                dropped_count_.fetch_add(dropped, std::memory_order_relaxed);
+                std::cout << "[PoolManager] kangaroo_type changed "
+                          << static_cast<int>(prev_type) << "->"
+                          << static_cast<int>(new_type)
+                          << "; flushed " << dropped
+                          << " stale-type DP(s) from the reconnect-window "
+                             "buffer." << std::endl;
+            }
+        });
+
+    // Maintenance hook (v1.5.4): the server asked workers to back off.
+    // Record the state so supervisor_loop uses the operator-suggested
+    // retry window (not the exponential backoff) and does NOT treat the
+    // lost session as a failure / churn. active=1 also requests a
+    // graceful disconnect so the supervisor reconnect path takes over;
+    // active=0 is an explicit all-clear that wakes the supervisor early.
+    jlp->set_maintenance_callback(
+        [this](bool active, uint32_t retry_after_secs, std::string message) {
+            if (active) {
+                maintenance_active_.store(true, std::memory_order_release);
+                maintenance_retry_secs_.store(retry_after_secs,
+                                              std::memory_order_release);
+                {
+                    std::lock_guard<std::mutex> lock(maintenance_mutex_);
+                    maintenance_message_ = std::move(message);
+                }
+                std::cout << "[PoolManager] Pool entered MAINTENANCE; "
+                          << "backing off for ~" << retry_after_secs
+                          << "s as requested by the operator." << std::endl;
+                // Drop the host sentinel so is_connected() reports down and
+                // the supervisor takes over the maintenance-aware reconnect
+                // wait WITHOUT counting it as a fault. We must NOT call
+                // client_->disconnect() here: this callback runs ON the
+                // receiver thread (handle_maintenance), and disconnect()
+                // joins that same thread, which would deadlock. The
+                // supervisor thread owns teardown of the old client in its
+                // reconnect-drive block; flipping connected_ is enough to
+                // route control there.
+                connected_.store(false, std::memory_order_release);
+            } else {
+                // All-clear: clear the flag and wake the supervisor so it
+                // reconnects promptly instead of waiting out the window.
+                maintenance_active_.store(false, std::memory_order_release);
+                {
+                    std::lock_guard<std::mutex> lock(maintenance_mutex_);
+                    maintenance_message_.clear();
+                }
+                std::cout << "[PoolManager] Pool maintenance cleared "
+                             "(all-clear); resuming." << std::endl;
+            }
+            {
+                std::lock_guard<std::mutex> lock(supervisor_mutex_);
+                supervisor_cv_.notify_all();
+            }
+        });
+
     // DP-seq-progress hook: mirror the client's bumped counter back
     // into the manager's map so a supervisor-driven reconnect that
     // recreates the client seeds it with the right next value, AND
@@ -572,6 +644,15 @@ bool PoolManager::is_connected() const {
     return connected_ && client_ && client_->is_connected();
 }
 
+JLPPoolClient::UpdateAdvert PoolManager::get_update_advert() const {
+    if (client_) {
+        if (auto* jlp = dynamic_cast<JLPPoolClient*>(client_.get())) {
+            return jlp->get_update_advert();
+        }
+    }
+    return JLPPoolClient::UpdateAdvert{};
+}
+
 bool PoolManager::get_work(WorkAssignment& work) {
     if (!is_connected()) {
         return false;
@@ -764,6 +845,17 @@ void PoolManager::supervisor_loop() {
     // was deleted). Cap at MAX_AUTH_FAIL_ATTEMPTS so a stale credential
     // doesn't hammer the pool forever.
     uint32_t consecutive_auth_failures = 0;
+
+    // Reconnect-churn circuit-breaker state. last_session_start marks when
+    // the most recent reconnect went fully live (post-WORK_ASN); a
+    // default-constructed time_point means "no live session yet". When the
+    // receiver later exits we measure how long that session lasted: a
+    // sub-kSustainedSessionMs lifetime on the SAME work_id is churn, and
+    // kMaxChurnReconnects of those in a row trips the breaker. Any sustained
+    // session, or a session on a new work_id, resets churn_count.
+    std::chrono::steady_clock::time_point last_session_start{};
+    uint64_t   last_session_work_id = 0;
+    uint32_t   churn_count = 0;
     std::random_device rd;
     std::mt19937 rng(rd());
 
@@ -787,7 +879,95 @@ void PoolManager::supervisor_loop() {
             continue;
         }
 
-        // Receiver has exited. Drive a full reconnect.
+        // v1.5.4 maintenance: if the pool put us into a maintenance window,
+        // the lost session is EXPECTED, not a fault. Skip churn evaluation
+        // and the failure counters entirely, wait the operator-suggested
+        // retry window (jittered), and loop back to drive a reconnect.
+        // The maintenance flag is cleared by a subsequent successful AUTH
+        // that does not re-assert maintenance (see below), or by an
+        // explicit all-clear MAINTENANCE(active=0) frame.
+        bool from_maintenance = false;
+        if (maintenance_active_.load(std::memory_order_acquire)) {
+            from_maintenance = true;
+            // Consume the lost session marker so we don't double-evaluate
+            // it as churn once maintenance clears.
+            last_session_start = {};
+            uint32_t retry = maintenance_retry_secs_.load(
+                std::memory_order_acquire);
+            // Clamp to [1s, 24h] before scaling to milliseconds. A buggy or
+            // hostile server could advertise retry_after_secs near UINT32_MAX,
+            // and `retry * 1000` (or the +50% jitter) would overflow uint32
+            // and wrap to a tiny or zero wait, defeating the back-off. Compute
+            // the window in uint64 and clamp the ceiling so it cannot wrap.
+            if (retry < 1) retry = 1;
+            constexpr uint32_t kMaxRetrySecs = 86400u;  // 24h
+            if (retry > kMaxRetrySecs) retry = kMaxRetrySecs;
+            const uint64_t retry_ms = static_cast<uint64_t>(retry) * 1000ull;
+            // Jitter in [retry, 1.5*retry] so a fleet does not reconnect in
+            // lockstep when the window ends.
+            std::uniform_int_distribution<uint64_t> mjitter(
+                retry_ms, retry_ms + retry_ms / 2ull);
+            const uint64_t mdelay = mjitter(rng);
+            std::cerr << "[PoolManager] Maintenance window active; waiting ~"
+                      << (mdelay / 1000.0)
+                      << "s before reconnecting (not counted as a failure)."
+                      << std::endl;
+            for (uint32_t slept = 0;
+                 slept < mdelay &&
+                 !supervisor_stop_.load(std::memory_order_acquire) &&
+                 maintenance_active_.load(std::memory_order_acquire);
+                 slept += 100) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            if (supervisor_stop_.load(std::memory_order_acquire)) break;
+            // Reset the backoff so a post-maintenance failure starts fresh.
+            // The normal jitter sleep below is skipped (from_maintenance).
+            backoff_ms = kInitialBackoffMs;
+        }
+        // Receiver has exited. Before driving a reconnect, evaluate churn:
+        // if the session we just lost came up post-WORK_ASN but died almost
+        // immediately on the SAME work_id, the worker is hot-looping with no
+        // useful uptime. Trip the breaker rather than spin. We evaluate this
+        // exactly once per lost session by clearing last_session_start after
+        // reading it.
+        else if (last_session_start.time_since_epoch().count() != 0) {
+            const auto session_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - last_session_start)
+                    .count();
+            uint64_t cur_work_id = 0;
+            {
+                std::lock_guard<std::mutex> lock(work_mutex_);
+                cur_work_id = current_work_.work_id;
+            }
+            if (session_ms < kSustainedSessionMs &&
+                cur_work_id == last_session_work_id) {
+                ++churn_count;
+            } else {
+                // Either the session was sustained or it was on a different
+                // work_id: this is normal reconnect territory.
+                churn_count = 0;
+            }
+            last_session_start = {};  // consume; one evaluation per session
+
+            if (churn_count >= kMaxChurnReconnects) {
+                std::cerr << "[PoolManager] Reconnect supervisor: "
+                          << churn_count
+                          << " back-to-back short-lived sessions (< "
+                          << (kSustainedSessionMs / 1000)
+                          << "s each) on the same work_id="
+                          << last_session_work_id
+                          << "; the worker keeps getting dropped right after "
+                             "AUTH. Backing off hard and giving up to avoid "
+                             "hammering the pool. Restart, or check that this "
+                             "work_id is not poisoned and the network path is "
+                             "stable." << std::endl;
+                supervisor_gave_up_.store(true, std::memory_order_release);
+                return;
+            }
+        }
+
+        // Drive a full reconnect.
         if (consecutive_failures >= kMaxReconnectAttempts) {
             std::cerr << "[PoolManager] Reconnect supervisor: "
                       << kMaxReconnectAttempts
@@ -799,19 +979,23 @@ void PoolManager::supervisor_loop() {
             return;
         }
 
-        // Jitter: pick uniform delay in [backoff/2, backoff].
-        std::uniform_int_distribution<uint32_t> jitter(backoff_ms / 2, backoff_ms);
-        const uint32_t delay = jitter(rng);
-        std::cerr << "[PoolManager] Reconnect attempt " << (consecutive_failures + 1)
-                  << "/" << kMaxReconnectAttempts
-                  << " in " << (delay / 1000.0) << "s..." << std::endl;
-        // Sleep with periodic wake-on-stop so shutdown is responsive.
-        for (uint32_t slept = 0; slept < delay && !supervisor_stop_.load(std::memory_order_acquire);
-             slept += 100)
-        {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        // Jitter: pick uniform delay in [backoff/2, backoff]. Skipped when
+        // we already waited the maintenance retry window above (otherwise
+        // we would double-sleep on top of the operator-suggested back-off).
+        if (!from_maintenance) {
+            std::uniform_int_distribution<uint32_t> jitter(backoff_ms / 2, backoff_ms);
+            const uint32_t delay = jitter(rng);
+            std::cerr << "[PoolManager] Reconnect attempt " << (consecutive_failures + 1)
+                      << "/" << kMaxReconnectAttempts
+                      << " in " << (delay / 1000.0) << "s..." << std::endl;
+            // Sleep with periodic wake-on-stop so shutdown is responsive.
+            for (uint32_t slept = 0; slept < delay && !supervisor_stop_.load(std::memory_order_acquire);
+                 slept += 100)
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            if (supervisor_stop_.load(std::memory_order_acquire)) break;
         }
-        if (supervisor_stop_.load(std::memory_order_acquire)) break;
 
         reconnect_attempts_.fetch_add(1, std::memory_order_relaxed);
 
@@ -866,9 +1050,21 @@ void PoolManager::supervisor_loop() {
         // reconnect-created client so v4 AUTH survives drops.
         apply_worker_identity(jlp_raw);
 
+        // Clear maintenance optimistically before this attempt: if the
+        // pool is still in maintenance, the fresh client's AUTH_OK is
+        // followed by a MAINTENANCE(active=1) frame whose callback
+        // re-asserts the flag (and disconnects us again). If the pool is
+        // back up, the flag stays cleared and we resume normally. A
+        // request_work() failure caused by that re-assertion must NOT
+        // count as a fault, so the failure paths below check
+        // maintenance_active_ before bumping consecutive_failures.
+        maintenance_active_.store(false, std::memory_order_release);
+
         if (!client_->connect(config_.host, config_.port)) {
-            ++consecutive_failures;
-            backoff_ms = std::min(MAX_RECONNECT_BACKOFF_MS, backoff_ms * 2);
+            if (!maintenance_active_.load(std::memory_order_acquire)) {
+                ++consecutive_failures;
+                backoff_ms = std::min(MAX_RECONNECT_BACKOFF_MS, backoff_ms * 2);
+            }
             continue;
         }
         if (!client_->authenticate(config_.worker_name, config_.password)) {
@@ -913,9 +1109,15 @@ void PoolManager::supervisor_loop() {
             WorkAssignment fresh_work;
             if (!client_->request_work(fresh_work)) {
                 client_->disconnect();
-                ++consecutive_failures;
-                backoff_ms =
-                    std::min(MAX_RECONNECT_BACKOFF_MS, backoff_ms * 2);
+                // A MAINTENANCE(active=1) frame arriving right after
+                // AUTH_OK disconnects us mid-WORK_REQ; that is expected,
+                // not a fault, so do not bump the failure counters when
+                // maintenance is active (the loop top will wait the window).
+                if (!maintenance_active_.load(std::memory_order_acquire)) {
+                    ++consecutive_failures;
+                    backoff_ms =
+                        std::min(MAX_RECONNECT_BACKOFF_MS, backoff_ms * 2);
+                }
                 continue;
             }
             {
@@ -932,6 +1134,13 @@ void PoolManager::supervisor_loop() {
         backoff_ms = kInitialBackoffMs;
         consecutive_failures = 0;
         consecutive_auth_failures = 0;
+        // Mark the session live for the churn circuit-breaker. The next
+        // time the receiver exits we will measure how long this lasted.
+        last_session_start   = std::chrono::steady_clock::now();
+        {
+            std::lock_guard<std::mutex> lock(work_mutex_);
+            last_session_work_id = current_work_.work_id;
+        }
         std::cout << "[PoolManager] Reconnected to pool as "
                   << config_.worker_name << std::endl;
 

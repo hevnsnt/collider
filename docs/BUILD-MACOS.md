@@ -101,7 +101,7 @@ For Free builds, `build/collider` is the only artifact. For Pro builds, the scri
 ### Pool mode (Free or Pro)
 
 ```bash
-./build/collider --pool jlps://collisionprotocol.com:17403 \
+./build/collider --pool jlps://pool.collisionprotocol.com:17403 \
                  --worker bc1qYourBitcoinAddress
 ```
 

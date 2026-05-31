@@ -95,9 +95,15 @@ bool RCKangarooBackend::initialize_standalone(const std::string& pubkey_hex_comp
     return true;
 }
 
+#ifdef COLLIDER_PRO
 bool RCKangarooBackend::try_set_bloom_filter(const std::string& path) {
     return rc_.load_bloom_filter(path);
 }
+
+uint64_t RCKangarooBackend::try_get_bloom_checks() const {
+    return rc_.get_bloom_checks();
+}
+#endif
 
 void RCKangarooBackend::solve(BackendCallbacks cb) {
     if (!initialized_) {

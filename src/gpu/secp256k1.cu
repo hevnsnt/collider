@@ -14,6 +14,7 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 #include <cstdio>
+#include <climits>
 #include <iostream>
 
 // Tier 1 perf (F-inv): shared addition-chain mod_inv (see header for
@@ -1038,13 +1039,29 @@ cudaError_t secp256k1_batch_mul_simple(
 ) {
     if (count == 0) return cudaSuccess;
 
-    // Get table for current device
+    // Get table for current device. cudaGetDevice can itself fail if the
+    // context is in a bad state; surface that rather than reading a stale
+    // device_id.
     int device_id = 0;
-    cudaGetDevice(&device_id);
+    cudaError_t dev_rc = cudaGetDevice(&device_id);
+    if (dev_rc != cudaSuccess) return dev_rc;
     PrecomputedPoint* table = (device_id < MAX_GPU_DEVICES) ? g_precomputed_tables[device_id] : nullptr;
 
+    // The kernel REQUIRES the per-device precomputed table. If it is null
+    // (secp256k1_init_table never ran, or ran on a different current device)
+    // the windowed multiply would read a null pointer and fault. Refuse loudly
+    // with cudaErrorNotReady instead of launching into undefined behavior.
+    if (table == nullptr) return cudaErrorNotReady;
+
     const int threads_per_block = 64;  // Lower due to register pressure
-    const int blocks = (count + threads_per_block - 1) / threads_per_block;
+    // Compute the grid size in size_t so a large `count` does not truncate
+    // when count > ~137M (where (count + tpb - 1) overflows a 32-bit int).
+    // CUDA grid dimension x is itself a 32-bit field, so guard against a
+    // block count that cannot be represented before narrowing to int.
+    const size_t blocks_sz =
+        (count + threads_per_block - 1) / threads_per_block;
+    if (blocks_sz > static_cast<size_t>(INT_MAX)) return cudaErrorInvalidValue;
+    const int blocks = static_cast<int>(blocks_sz);
 
     ec_mul_batch_kernel<<<blocks, threads_per_block, 0, stream>>>(
         reinterpret_cast<const uint256*>(d_private_keys),

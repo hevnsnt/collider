@@ -79,7 +79,7 @@ To target a specific puzzle:
 To join the public pool and distribute the work:
 
 ```bash
-./collider --pool jlps://collisionprotocol.com:17403 \
+./collider --pool jlps://pool.collisionprotocol.com:17403 \
            --worker 1YourBitcoinAddress...
 ```
 
@@ -128,7 +128,7 @@ theCollider treats kangaroo, brute force, and the brain-wallet path (Pro) as one
 For puzzles above #135, no single machine has the compute budget to finish in a reasonable time. The pool solves this by sharding the search range across many workers and letting them share distinguished points (DPs). When a collision is detected on the server, the private key falls out of the math.
 
 ```bash
-./collider --pool jlps://collisionprotocol.com:17403 --worker 1YourBitcoinAddressForRewards
+./collider --pool jlps://pool.collisionprotocol.com:17403 --worker 1YourBitcoinAddressForRewards
 ```
 
 What happens after AUTH:
@@ -318,7 +318,7 @@ Minimum pool config:
 ```yaml
 pool:
   worker: "1YourBitcoinAddressForRewards"
-  url: "jlps://collisionprotocol.com:17403"
+  url: "jlps://pool.collisionprotocol.com:17403"
 ```
 
 Standalone with a custom range:

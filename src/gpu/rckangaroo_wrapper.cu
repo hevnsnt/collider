@@ -48,6 +48,15 @@
 
 #include "cuda_runtime.h"
 
+#ifdef COLLIDER_PRO
+// Opportunistic bloom address checking lives entirely in this Pro-only
+// translation unit. The wrapper calls the collider::gpu::bloom hook below
+// only under COLLIDER_PRO, so a Free build links zero bloom symbols and
+// ships zero bloom source (the file is excluded from the Free repo via
+// scripts/sync-to-free.sh and from the Free build via CMake).
+#include "rckangaroo_bloom.hpp"
+#endif
+
 // T4.8: keep the RCKangaroo upper bound aligned with the runtime's
 // per-GPU phase-array bound. If a future edit nudges either constant,
 // the build fails here rather than silently leaving one of the two
@@ -63,7 +72,10 @@ bool gGenMode = false;      // Tames generation mode
 u32 gTotalErrors = 0;       // Error counter
 
 // ============================================================================
-// CPU-side SHA256 for bloom filter checking
+// CPU-side SHA256. Shared host helper used by compute_config_hash() for the
+// herd-state on-disk fingerprint (NOT a bloom-only helper; the bloom
+// feature carries its own self-contained copy in rckangaroo_bloom.cu so it
+// stays fully removable at the source level for Free builds).
 // ============================================================================
 
 static const uint32_t SHA256_K[64] = {
@@ -86,13 +98,9 @@ static const uint32_t SHA256_K[64] = {
 };
 
 // rotr now lives in hash_rounds.cuh (host+device).
-// rotl32 stays local because it's only used by the inline RIPEMD-160
-// implementation below; RIPEMD's left-rotate is unified in
-// ripemd160_device.cuh in a follow-up task.
 inline uint32_t rotr32(uint32_t x, int n) {
     return collider::gpu::sha256::rotr(x, n);
 }
-inline uint32_t rotl32(uint32_t x, int n) { return (x << n) | (x >> (32 - n)); }
 
 static void cpu_sha256(const uint8_t* data, size_t len, uint8_t* hash) {
     uint32_t H[8] = {
@@ -150,227 +158,13 @@ static void cpu_sha256(const uint8_t* data, size_t len, uint8_t* hash) {
     }
 }
 
-// ============================================================================
-// CPU-side RIPEMD160 for bloom filter checking
-// ============================================================================
-
-static const uint32_t RIPEMD160_KL[5] = {0x00000000, 0x5A827999, 0x6ED9EBA1, 0x8F1BBCDC, 0xA953FD4E};
-static const uint32_t RIPEMD160_KR[5] = {0x50A28BE6, 0x5C4DD124, 0x6D703EF3, 0x7A6D76E9, 0x00000000};
-static const int RIPEMD160_RL[80] = {
-    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
-    7, 4, 13, 1, 10, 6, 15, 3, 12, 0, 9, 5, 2, 14, 11, 8,
-    3, 10, 14, 4, 9, 15, 8, 1, 2, 7, 0, 6, 13, 11, 5, 12,
-    1, 9, 11, 10, 0, 8, 12, 4, 13, 3, 7, 15, 14, 5, 6, 2,
-    4, 0, 5, 9, 7, 12, 2, 10, 14, 1, 3, 8, 11, 6, 15, 13
-};
-static const int RIPEMD160_RR[80] = {
-    5, 14, 7, 0, 9, 2, 11, 4, 13, 6, 15, 8, 1, 10, 3, 12,
-    6, 11, 3, 7, 0, 13, 5, 10, 14, 15, 8, 12, 4, 9, 1, 2,
-    15, 5, 1, 3, 7, 14, 6, 9, 11, 8, 12, 2, 10, 0, 4, 13,
-    8, 6, 4, 1, 3, 11, 15, 0, 5, 12, 2, 13, 9, 7, 10, 14,
-    12, 15, 10, 4, 1, 5, 8, 7, 6, 2, 13, 14, 0, 3, 9, 11
-};
-static const int RIPEMD160_SL[80] = {
-    11, 14, 15, 12, 5, 8, 7, 9, 11, 13, 14, 15, 6, 7, 9, 8,
-    7, 6, 8, 13, 11, 9, 7, 15, 7, 12, 15, 9, 11, 7, 13, 12,
-    11, 13, 6, 7, 14, 9, 13, 15, 14, 8, 13, 6, 5, 12, 7, 5,
-    11, 12, 14, 15, 14, 15, 9, 8, 9, 14, 5, 6, 8, 6, 5, 12,
-    9, 15, 5, 11, 6, 8, 13, 12, 5, 12, 13, 14, 11, 8, 5, 6
-};
-static const int RIPEMD160_SR[80] = {
-    8, 9, 9, 11, 13, 15, 15, 5, 7, 7, 8, 11, 14, 14, 12, 6,
-    9, 13, 15, 7, 12, 8, 9, 11, 7, 7, 12, 7, 6, 15, 13, 11,
-    9, 7, 15, 11, 8, 6, 6, 14, 12, 13, 5, 14, 13, 13, 7, 5,
-    15, 5, 8, 11, 14, 14, 6, 14, 6, 9, 12, 9, 12, 5, 15, 8,
-    8, 5, 12, 9, 12, 5, 14, 6, 8, 13, 6, 5, 15, 13, 11, 11
-};
-
-static void cpu_ripemd160(const uint8_t* data, size_t len, uint8_t* hash) {
-    uint32_t H[5] = {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0};
-
-    // Pad message
-    size_t padded_len = ((len + 9 + 63) / 64) * 64;
-    std::vector<uint8_t> padded(padded_len, 0);
-    memcpy(padded.data(), data, len);
-    padded[len] = 0x80;
-    uint64_t bit_len = len * 8;
-    // Little-endian length
-    for (int i = 0; i < 8; i++) {
-        padded[padded_len - 8 + i] = (bit_len >> (i * 8)) & 0xff;
-    }
-
-    auto f0 = [](uint32_t x, uint32_t y, uint32_t z) { return x ^ y ^ z; };
-    auto f1 = [](uint32_t x, uint32_t y, uint32_t z) { return (x & y) | (~x & z); };
-    auto f2 = [](uint32_t x, uint32_t y, uint32_t z) { return (x | ~y) ^ z; };
-    auto f3 = [](uint32_t x, uint32_t y, uint32_t z) { return (x & z) | (y & ~z); };
-    auto f4 = [](uint32_t x, uint32_t y, uint32_t z) { return x ^ (y | ~z); };
-
-    for (size_t block = 0; block < padded_len; block += 64) {
-        uint32_t X[16];
-        for (int i = 0; i < 16; i++) {
-            X[i] = padded[block + i*4] | (padded[block + i*4 + 1] << 8) |
-                   (padded[block + i*4 + 2] << 16) | (padded[block + i*4 + 3] << 24);
-        }
-
-        uint32_t al = H[0], bl = H[1], cl = H[2], dl = H[3], el = H[4];
-        uint32_t ar = H[0], br = H[1], cr = H[2], dr = H[3], er = H[4];
-
-        for (int j = 0; j < 80; j++) {
-            uint32_t fl, fr;
-            int round = j / 16;
-            switch (round) {
-                case 0: fl = f0(bl, cl, dl); fr = f4(br, cr, dr); break;
-                case 1: fl = f1(bl, cl, dl); fr = f3(br, cr, dr); break;
-                case 2: fl = f2(bl, cl, dl); fr = f2(br, cr, dr); break;
-                case 3: fl = f3(bl, cl, dl); fr = f1(br, cr, dr); break;
-                case 4: fl = f4(bl, cl, dl); fr = f0(br, cr, dr); break;
-            }
-
-            uint32_t tl = rotl32(al + fl + X[RIPEMD160_RL[j]] + RIPEMD160_KL[round], RIPEMD160_SL[j]) + el;
-            al = el; el = dl; dl = rotl32(cl, 10); cl = bl; bl = tl;
-
-            uint32_t tr = rotl32(ar + fr + X[RIPEMD160_RR[j]] + RIPEMD160_KR[round], RIPEMD160_SR[j]) + er;
-            ar = er; er = dr; dr = rotl32(cr, 10); cr = br; br = tr;
-        }
-
-        uint32_t t = H[1] + cl + dr;
-        H[1] = H[2] + dl + er;
-        H[2] = H[3] + el + ar;
-        H[3] = H[4] + al + br;
-        H[4] = H[0] + bl + cr;
-        H[0] = t;
-    }
-
-    for (int i = 0; i < 5; i++) {
-        hash[i*4] = H[i] & 0xff;
-        hash[i*4 + 1] = (H[i] >> 8) & 0xff;
-        hash[i*4 + 2] = (H[i] >> 16) & 0xff;
-        hash[i*4 + 3] = (H[i] >> 24) & 0xff;
-    }
-}
-
-// Hash160 = RIPEMD160(SHA256(data))
-static void cpu_hash160(const uint8_t* data, size_t len, uint8_t* hash160) {
-    uint8_t sha256_hash[32];
-    cpu_sha256(data, len, sha256_hash);
-    cpu_ripemd160(sha256_hash, 32, hash160);
-}
-
-// ============================================================================
-// Bloom filter structure for CPU checking
-// ============================================================================
-
-struct BloomFilter {
-    std::vector<uint8_t> data;
-    uint64_t num_bits;
-    uint32_t num_hashes;
-    uint32_t seed;
-    bool loaded = false;
-
-    bool load(const std::string& filename) {
-        std::ifstream file(filename, std::ios::binary);
-        if (!file) return false;
-
-        // Read header (128 bytes)
-        struct Header {
-            char magic[4];
-            uint32_t version;
-            uint64_t num_bits;
-            uint32_t num_hashes;
-            uint32_t seed;
-            uint64_t num_elements;
-            double target_fp_rate;
-            uint64_t data_offset;
-            uint8_t reserved[80];
-        } header;
-
-        file.read(reinterpret_cast<char*>(&header), sizeof(header));
-        if (std::string(header.magic, 4) != "BLF1") {
-            std::cerr << "Invalid bloom filter format" << std::endl;
-            return false;
-        }
-
-        num_bits = header.num_bits;
-        num_hashes = header.num_hashes;
-        seed = header.seed;
-
-        size_t data_size = (num_bits + 7) / 8;
-        data.resize(data_size);
-
-        file.seekg(header.data_offset);
-        file.read(reinterpret_cast<char*>(data.data()), data_size);
-
-        loaded = true;
-        std::cout << "[Bloom] Loaded: " << (data_size / (1024*1024)) << " MB, "
-                  << header.num_elements << " addresses, k=" << num_hashes << std::endl;
-        return true;
-    }
-
-    // MurmurHash3 fmix64
-    static uint64_t fmix64(uint64_t k) {
-        k ^= k >> 33;
-        k *= 0xff51afd7ed558ccdULL;
-        k ^= k >> 33;
-        k *= 0xc4ceb9fe1a85ec53ULL;
-        k ^= k >> 33;
-        return k;
-    }
-
-    bool check(const uint8_t* h160) const {
-        if (!loaded) return false;
-
-        // MurmurHash3 128-bit for 20-byte input
-        const uint64_t c1 = 0x87c37b91114253d5ULL;
-        const uint64_t c2 = 0x4cf5ad432745937fULL;
-
-        uint64_t h1 = seed;
-        uint64_t h2 = seed;
-
-        // First 16 bytes
-        uint64_t k1 = *reinterpret_cast<const uint64_t*>(h160);
-        uint64_t k2 = *reinterpret_cast<const uint64_t*>(h160 + 8);
-
-        k1 *= c1; k1 = (k1 << 31) | (k1 >> 33); k1 *= c2; h1 ^= k1;
-        h1 = (h1 << 27) | (h1 >> 37); h1 += h2; h1 = h1 * 5 + 0x52dce729;
-
-        k2 *= c2; k2 = (k2 << 33) | (k2 >> 31); k2 *= c1; h2 ^= k2;
-        h2 = (h2 << 31) | (h2 >> 33); h2 += h1; h2 = h2 * 5 + 0x38495ab5;
-
-        // Last 4 bytes (tail)
-        uint64_t k1_tail = 0;
-        k1_tail ^= uint64_t(h160[19]) << 24;
-        k1_tail ^= uint64_t(h160[18]) << 16;
-        k1_tail ^= uint64_t(h160[17]) << 8;
-        k1_tail ^= uint64_t(h160[16]);
-        k1_tail *= c1; k1_tail = (k1_tail << 31) | (k1_tail >> 33); k1_tail *= c2;
-        h1 ^= k1_tail;
-
-        // Finalization
-        h1 ^= 20; h2 ^= 20;
-        h1 += h2; h2 += h1;
-        h1 = fmix64(h1); h2 = fmix64(h2);
-        h1 += h2; h2 += h1;
-
-        // Check all k hash positions
-        for (uint32_t i = 0; i < num_hashes; i++) {
-            uint64_t hash = h1 + i * h2;
-            uint64_t bit_idx = hash % num_bits;
-            uint64_t byte_idx = bit_idx / 8;
-            uint32_t bit_offset = bit_idx % 8;
-
-            if (!((data[byte_idx] >> bit_offset) & 1)) {
-                return false;  // Definitely not in set
-            }
-        }
-        return true;  // Probably in set
-    }
-};
-
-static BloomFilter s_bloom_filter;
-static std::atomic<uint64_t> s_bloom_checks{0};
-static std::vector<collider::gpu::BloomHit> s_bloom_hits;
-static std::mutex s_bloom_hits_mutex;
-static std::function<void(const collider::gpu::BloomHit&)> s_bloom_hit_callback;
+// Bloom filter checking (CPU SHA256/RIPEMD160 hash160 derivation + bloom
+// membership) lives entirely in the Pro-only rckangaroo_bloom.cu. The
+// statics that backed it (s_bloom_filter, s_bloom_checks, s_bloom_hits,
+// s_bloom_hits_mutex, s_bloom_hit_callback) moved there; this file only
+// reaches the feature through the collider::gpu::bloom hook under
+// #ifdef COLLIDER_PRO. The DP-export callback below is NOT a bloom symbol
+// and stays here (pool mode uses it to submit DPs to the server).
 static std::function<void(const uint8_t*, const uint8_t*, uint8_t)> s_dp_callback;
 
 // ============================================================================
@@ -516,85 +310,6 @@ struct DBRec {
 };
 #pragma pack(pop)
 
-// Compute compressed public key from EC point (33 bytes: 02/03 + X)
-static void compress_pubkey(const EcPoint& pnt, uint8_t* out33) {
-    // Prefix: 02 if Y is even, 03 if Y is odd (check lowest bit of y.data[0])
-    out33[0] = (pnt.y.data[0] & 1) ? 0x03 : 0x02;
-    // X coordinate in big-endian
-    for (int i = 0; i < 32; i++) {
-        out33[1 + i] = ((uint8_t*)pnt.x.data)[31 - i];
-    }
-}
-
-// Check a single DP against bloom filter
-static void check_dp_bloom(const DBRec& nrec, Ec& ec) {
-    if (!s_bloom_filter.loaded) return;
-
-    // Extract distance from record
-    EcInt dist;
-    memset(dist.data, 0, sizeof(dist.data));
-    memcpy(dist.data, nrec.d, sizeof(nrec.d));
-    if (nrec.d[21] == 0xFF) memset(((u8*)dist.data) + 22, 0xFF, 18);
-
-    // Compute the public key at this DP position
-    EcPoint dp_pubkey;
-    if (nrec.type == TAME) {
-        // TAME: pubkey = G * (half_range + dist)
-        EcInt pk = s_Int_HalfRange;
-        pk.Add(dist);
-        dp_pubkey = ec.MultiplyG(pk);
-    } else {
-        // WILD: pubkey = target_point + G * dist (or - G * dist)
-        EcPoint dp = ec.MultiplyG(dist);
-        dp_pubkey = ec.AddPoints(s_PntToSolve, dp);
-    }
-
-    // Compress public key and compute Hash160
-    uint8_t compressed[33];
-    compress_pubkey(dp_pubkey, compressed);
-
-    uint8_t h160[20];
-    cpu_hash160(compressed, 33, h160);
-
-    s_bloom_checks++;
-
-    // Check bloom filter
-    if (s_bloom_filter.check(h160)) {
-        // Potential hit! Record it
-        collider::gpu::BloomHit hit;
-
-        // Compute the private key for this position
-        EcInt priv_key;
-        if (nrec.type == TAME) {
-            priv_key = s_Int_HalfRange;
-            priv_key.Add(dist);
-        } else {
-            // For WILD, we need the actual private key which requires solving
-            // For now, store the distance - would need full solve to get actual key
-            priv_key = dist;
-        }
-        memcpy(hit.private_key.data(), priv_key.data, 32);
-        memcpy(hit.hash160.data(), h160, 20);
-        hit.ops_at_hit = s_PntTotalOps;
-
-        // Convert H160 to hex for logging
-        char h160_hex[41];
-        ::collider::hex_encode_lower(h160, 20, h160_hex);
-
-        std::cout << "\n[BLOOM HIT] Potential match! H160=" << h160_hex << std::endl;
-
-        // Store and callback
-        {
-            std::lock_guard<std::mutex> lock(s_bloom_hits_mutex);
-            s_bloom_hits.push_back(hit);
-        }
-
-        if (s_bloom_hit_callback) {
-            s_bloom_hit_callback(hit);
-        }
-    }
-}
-
 // Check new distinguished points for collisions
 static void CheckNewPoints() {
     s_csAddPoints.Enter();
@@ -608,7 +323,12 @@ static void CheckNewPoints() {
     s_PntIndex = 0;
     s_csAddPoints.Leave();
 
-    Ec ec;  // EC context for bloom checking
+#ifdef COLLIDER_PRO
+    // EC context reused across this batch's opportunistic bloom probes.
+    // Pro-only: with COLLIDER_PRO undefined there is no bloom hook call so
+    // the context (and the probe) compile out entirely.
+    Ec ec;
+#endif
 
     for (int i = 0; i < cnt; i++) {
         DBRec nrec;
@@ -618,10 +338,21 @@ static void CheckNewPoints() {
         memcpy(nrec.d, p + 32, 22);
         nrec.type = s_GenMode ? TAME : p[56];
 
-        // Check bloom filter for this DP (opportunistic address scan)
-        if (s_bloom_filter.loaded && !s_GenMode) {
-            check_dp_bloom(nrec, ec);
+#ifdef COLLIDER_PRO
+        // Opportunistic address scan: probe this DP's candidate address
+        // against the loaded bloom filter (Pro only). All bloom logic lives
+        // in rckangaroo_bloom.cu; here we only extract the distance and hand
+        // it plus the run's half-range / target point to the hook.
+        if (collider::gpu::bloom::is_loaded() && !s_GenMode) {
+            EcInt dist;
+            memset(dist.data, 0, sizeof(dist.data));
+            memcpy(dist.data, nrec.d, sizeof(nrec.d));
+            if (nrec.d[21] == 0xFF) memset(((u8*)dist.data) + 22, 0xFF, 18);
+            collider::gpu::bloom::probe_dp(dist, nrec.type == TAME,
+                                           s_Int_HalfRange, s_PntToSolve, ec,
+                                           s_PntTotalOps);
         }
+#endif
 
         DBRec* pref = (DBRec*)s_db.FindOrAddDataBlock((u8*)&nrec);
 
@@ -1156,18 +887,17 @@ RCKangarooResult RCKangarooManager::solve() {
     s_PntIndex = 0;
     s_TotalErrors = 0;
 
-    // Reset bloom filter stats
-    s_bloom_checks = 0;
-    {
-        std::lock_guard<std::mutex> lock(s_bloom_hits_mutex);
-        s_bloom_hits.clear();
-    }
-    s_bloom_hit_callback = bloom_hit_callback;
-    s_dp_callback = dp_callback;
+#ifdef COLLIDER_PRO
+    // Reset opportunistic-bloom stats and arm the hit callback for this run.
+    collider::gpu::bloom::reset_stats();
+    collider::gpu::bloom::set_hit_callback(bloom_hit_callback);
 
-    if (bloom_enabled && s_bloom_filter.loaded) {
+    if (bloom_enabled && collider::gpu::bloom::is_loaded()) {
         std::cout << "[Bloom] Opportunistic address checking enabled" << std::endl;
     }
+#endif
+    s_dp_callback = dp_callback;
+
     s_Solved = false;
 
     // Prepare jump tables
@@ -1375,17 +1105,16 @@ RCKangarooResult RCKangarooManager::solve() {
     result.error_count = s_TotalErrors;
     result.k_value = (double)s_PntTotalOps / pow(2.0, Range / 2.0);
 
-    // Copy bloom filter results
-    result.bloom_checks = s_bloom_checks.load();
-    {
-        std::lock_guard<std::mutex> lock(s_bloom_hits_mutex);
-        result.bloom_hits = s_bloom_hits;
-    }
+#ifdef COLLIDER_PRO
+    // Copy opportunistic-bloom results out of the Pro-only bloom TU.
+    result.bloom_checks = collider::gpu::bloom::checks();
+    result.bloom_hits = collider::gpu::bloom::hits();
 
     if (bloom_enabled && result.bloom_checks > 0) {
         std::cout << "[Bloom] Total checks: " << result.bloom_checks
                   << ", Hits: " << result.bloom_hits.size() << std::endl;
     }
+#endif
 
     if (s_Solved) {
         // Apply start offset
@@ -1454,19 +1183,21 @@ int RCKangarooManager::get_speed() const {
     return impl_->current_speed;
 }
 
+#ifdef COLLIDER_PRO
 bool RCKangarooManager::load_bloom_filter(const std::string& filename) {
-    if (s_bloom_filter.load(filename)) {
+    if (collider::gpu::bloom::load(filename)) {
         bloom_enabled = true;
         bloom_file = filename;
-        s_bloom_hit_callback = bloom_hit_callback;
+        collider::gpu::bloom::set_hit_callback(bloom_hit_callback);
         return true;
     }
     return false;
 }
 
 uint64_t RCKangarooManager::get_bloom_checks() const {
-    return s_bloom_checks.load();
+    return collider::gpu::bloom::checks();
 }
+#endif
 
 // ============================================================================
 // herd save / load

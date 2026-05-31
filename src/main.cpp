@@ -540,7 +540,7 @@ static int main_impl(int argc, char* argv[]) {
         }
 #endif
         if (!dispatched && args.pool_mode) {
-            rc = collider::runtime::run_pool_mode(args, gpu_info);
+            rc = collider::runtime::run_pool_mode(args, gpu_info, argc, argv);
             dispatched = true;
         }
 #ifdef COLLIDER_PRO

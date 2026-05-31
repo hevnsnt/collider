@@ -4,8 +4,12 @@
  * Integrates RetiredCoder's RCKangaroo (GPLv3) as the Kangaroo solver backend.
  * RCKangaroo achieves ~8 GKeys/s on RTX 4090, ~4 GKeys/s on RTX 3090.
  *
- * Optional bloom filter integration: checks each DP against a bloom filter
- * of funded Bitcoin addresses (opportunistic collision detection).
+ * Optional bloom filter integration (Pro only): checks each DP against a
+ * bloom filter of funded Bitcoin addresses (opportunistic collision
+ * detection). The feature lives entirely in the Pro-only
+ * rckangaroo_bloom.{hpp,cu}; this wrapper reaches it through the
+ * collider::gpu::bloom hook under #ifdef COLLIDER_PRO so Free builds carry
+ * zero bloom symbols.
  *
  * Original software: (c) 2024, RetiredCoder (RC)
  * https://github.com/RetiredC/RCKangaroo
@@ -20,18 +24,16 @@
 #include <functional>
 #include <atomic>
 
+#ifdef COLLIDER_PRO
+// BloomHit + the opportunistic-bloom hook API live in this Pro-only header.
+// Including it here (under COLLIDER_PRO only) lets the gated result/config
+// members below name collider::gpu::bloom::BloomHit. Free builds never see
+// the type, the members, or the bloom source.
+#include "rckangaroo_bloom.hpp"
+#endif
+
 namespace collider {
 namespace gpu {
-
-/**
- * Bloom filter hit - a potential match against the address database
- */
-struct BloomHit {
-    std::array<uint64_t, 4> private_key;  // 256-bit private key
-    std::array<uint8_t, 20> hash160;      // RIPEMD160(SHA256(pubkey))
-    std::string address;                   // Bitcoin address (if computed)
-    uint64_t ops_at_hit;                   // Operations count when found
-};
 
 /**
  * Result from RCKangaroo solve
@@ -45,9 +47,12 @@ struct RCKangarooResult {
     double k_value;  // K coefficient (target is 1.15)
     uint32_t error_count;
 
-    // Bloom filter results
-    uint64_t bloom_checks;                // Total bloom filter checks performed
-    std::vector<BloomHit> bloom_hits;     // Potential matches (verify externally)
+#ifdef COLLIDER_PRO
+    // Opportunistic bloom results (Pro only). BloomHit is defined in
+    // rckangaroo_bloom.hpp; the field is absent from Free builds.
+    uint64_t bloom_checks = 0;                  // Total bloom probes performed
+    std::vector<bloom::BloomHit> bloom_hits;    // Potential matches (verify externally)
+#endif
 };
 
 /**
@@ -84,15 +89,21 @@ public:
     // solve() before Prepare(); takes effect for the next solve() call only.
     int mode = 0;               // 0 = KANG_MODE_BOTH (defs.h)
 
-    // Bloom filter configuration
+#ifdef COLLIDER_PRO
+    // Bloom filter configuration (Pro only). The whole opportunistic-bloom
+    // feature compiles out of Free builds; these fields, the hit callback,
+    // and load_bloom_filter / get_bloom_checks below are absent there.
     bool bloom_enabled = false;         // Enable bloom filter checking
     std::string bloom_file;             // Path to .blf bloom filter file
+#endif
 
     // Progress callback: (ops, dp_count, speed_mkeys) -> continue?
     std::function<bool(uint64_t, uint64_t, int)> progress_callback;
 
-    // Bloom hit callback: (hit) -> called when bloom filter match found
-    std::function<void(const BloomHit&)> bloom_hit_callback;
+#ifdef COLLIDER_PRO
+    // Bloom hit callback: (hit) -> called when bloom filter match found.
+    std::function<void(const bloom::BloomHit&)> bloom_hit_callback;
+#endif
 
     // DP callback for pool mode: (x[32], d[32], type) -> called for each new DP
     // Used to submit DPs to pool server
@@ -163,18 +174,21 @@ public:
      */
     int get_speed() const;
 
+#ifdef COLLIDER_PRO
     /**
      * Load bloom filter from .blf file for opportunistic address checking
+     * (Pro only). Absent from Free builds.
      * @param filename Path to .blf bloom filter file
      * @return true if loaded successfully
      */
     bool load_bloom_filter(const std::string& filename);
 
     /**
-     * Get bloom filter statistics
+     * Get bloom filter statistics (Pro only).
      * @return Number of bloom filter checks performed so far
      */
     uint64_t get_bloom_checks() const;
+#endif
 
     /**
      * kangaroo herd save / load.

@@ -234,7 +234,7 @@ int run_sha256_only_benchmark(const Arguments& args,
 
     std::cout << "\nFor sustained-rate Kangaroo throughput on this hardware,\n";
     std::cout << "connect to the live pool:\n";
-    std::cout << "  ./collider --pool jlps://collisionprotocol.com:17403 --worker bc1q...\n";
+    std::cout << "  ./collider --pool jlps://pool.collisionprotocol.com:17403 --worker bc1q...\n";
     std::cout << "\nFor the full brain-wallet pipeline benchmark, theCollider Pro\n";
     std::cout << "exercises SHA256 -> EC -> hash160 -> bloom across all GPUs.\n";
     std::cout << "https://collisionprotocol.com/pro\n";

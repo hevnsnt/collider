@@ -1,10 +1,10 @@
 /**
  * test_jlp_pool_handshake -- live integration test against the
- * Collision Protocol JLP pool server (collisionprotocol.com:17403).
+ * Collision Protocol JLP pool server (pool.collisionprotocol.com:17403).
  *
  * What this test verifies (positive signals):
  *   1. The pool's TLS certificate validates against the system trust store
- *      AND its CN/SAN matches "collisionprotocol.com" (RFC 6125 hostname
+ *      AND its CN/SAN matches "pool.collisionprotocol.com" (RFC 6125 hostname
  *      check). If either fails, this test FAILS - that is a real outage of
  *      the pool's TLS posture, not a flaky test.
  *   2. After TLS, the client sends a single AUTH message with the exact
@@ -25,7 +25,7 @@
  *
  * Skip semantics (return 77):
  *   - Environment variable COLLIDER_SKIP_NETWORK_TESTS is set (any value).
- *   - TCP connect to collisionprotocol.com:17403 fails or DNS resolution
+ *   - TCP connect to pool.collisionprotocol.com:17403 fails or DNS resolution
  *     fails inside the 5-second connect deadline. Network tests must not
  *     break offline / firewalled CI machines.
  *
@@ -95,7 +95,7 @@
 
 namespace {
 
-constexpr const char*    POOL_HOST       = "collisionprotocol.com";
+constexpr const char*    POOL_HOST       = "pool.collisionprotocol.com";
 constexpr const char*    POOL_PORT_STR   = "17403";
 constexpr int            CONNECT_TIMEOUT_SEC = 5;
 constexpr int            IO_TIMEOUT_SEC      = 10;

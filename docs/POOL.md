@@ -37,7 +37,7 @@ The Collision Protocol pool is the shared DP store plus the orchestration around
 ## Joining the public pool in 30 seconds
 
 ```bash
-./collider --pool jlps://collisionprotocol.com:17403 \
+./collider --pool jlps://pool.collisionprotocol.com:17403 \
            --worker 1YourBitcoinAddressForRewards
 ```
 
@@ -173,7 +173,7 @@ theCollider prints rolling telemetry to the terminal: GPU step rate, DPs submitt
 For headless operation:
 
 ```bash
-./collider --pool jlps://collisionprotocol.com:17403 \
+./collider --pool jlps://pool.collisionprotocol.com:17403 \
            --worker bc1qYourBtcAddress \
            --verbose 2>&1 | tee -a collider.log
 ```
@@ -281,7 +281,7 @@ Second-most-common: malformed worker name. Verify it is a real Bitcoin address b
 Diagnose:
 
 ```bash
-./collider --pool jlps://collisionprotocol.com:17403 \
+./collider --pool jlps://pool.collisionprotocol.com:17403 \
            --worker bc1qYourBtcAddress \
            --verbose --debug
 ```

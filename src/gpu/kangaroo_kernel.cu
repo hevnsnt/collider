@@ -2844,8 +2844,30 @@ GPUKangarooResult GPUKangarooManager::solve() {
                         }
 
                         if (collision_valid) {
-                            result.found = true;
-                            break;
+                            // Mandatory correctness gate (audit C1): verify the
+                            // recovered scalar actually solves the puzzle
+                            // (k*G == Q) before declaring a solve. The collision
+                            // distance algebra above (offset undo, mod_half
+                            // parity, tame/wild branches) is error-prone; without
+                            // this gate a wrong recovery is written to disk as a
+                            // confirmed private key. Cost: one host scalar-mul.
+                            cpu::ECPoint cand;
+                            cpu::ec_mul(cand, result.private_key);
+                            cpu::uint256_t cx, cy;
+                            cpu::ec_to_affine(cx, cy, cand);
+                            bool key_ok = !cand.is_infinity();
+                            for (int i = 0; i < 4 && key_ok; i++)
+                                if (cx.d[i] != impl_->target_pubkey_x[i] ||
+                                    cy.d[i] != impl_->target_pubkey_y[i])
+                                    key_ok = false;
+                            if (key_ok) {
+                                result.found = true;
+                                break;
+                            }
+                            std::cerr << "[!] Recovered key failed k*G==Q "
+                                         "verification; discarding (cycled or "
+                                         "offset-undo error) and continuing.\n";
+                            collision_valid = false;
                         }
                     } else {
                         // Same-type collision means a kangaroo's trajectory
@@ -3789,9 +3811,27 @@ GPUKangarooResult MultiGPUKangarooManager::solve() {
                                 }
 
                                 if (collision_valid) {
-                                    impl_->result.found = true;
-                                    impl_->found = true;
-                                    return;
+                                    // Mandatory correctness gate (audit C1):
+                                    // verify k*G == Q before declaring a solve.
+                                    // The collision distance algebra is error-
+                                    // prone; without this a wrong recovery is
+                                    // written to disk as a confirmed key. Cost:
+                                    // one host scalar-mul.
+                                    cpu::ECPoint cand;
+                                    cpu::ec_mul(cand, impl_->result.private_key);
+                                    cpu::uint256_t cx, cy;
+                                    cpu::ec_to_affine(cx, cy, cand);
+                                    if (!cand.is_infinity()
+                                        && cx == impl_->target_pubkey_x
+                                        && cy == impl_->target_pubkey_y) {
+                                        impl_->result.found = true;
+                                        impl_->found = true;
+                                        return;
+                                    }
+                                    std::cerr << "[!] Recovered key failed "
+                                                 "k*G==Q verification; discarding "
+                                                 "and continuing search.\n";
+                                    collision_valid = false;
                                 }
                             } else {
                                 // Same-type collision = cycled kangaroo.
