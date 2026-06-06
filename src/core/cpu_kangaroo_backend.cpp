@@ -72,7 +72,10 @@ void CpuKangarooBackend::solve(BackendCallbacks cb) {
         uint8_t x_be[32], d_be[32];
         ::collider::limbs_le_to_be32(x.d,    x_be);
         ::collider::limbs_le_to_be32(dist.d, d_be);
-        cb.on_dp(x_be, d_be, is_tame ? 0u : 1u, dp_bits_u32);
+        // v1.5.5 (task #9): the CPU backend never captures a checkpoint chain,
+        // so the trailing committable-chain pointers are always nullptr and the
+        // pool client emits DP_BATCH_V2 for CPU-produced DPs.
+        cb.on_dp(x_be, d_be, is_tame ? 0u : 1u, dp_bits_u32, nullptr, nullptr);
     });
 
     // KangarooSolver invokes the progress callback as

@@ -28,6 +28,7 @@
  */
 #include "runtime/pool_solver.hpp"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -39,8 +40,15 @@
 #include <string>
 #include <system_error>
 #include <thread>
+#include <vector>
 
 #include "core/kangaroo_backend.hpp"
+#ifdef COLLIDER_USE_RCKANGAROO
+// v1.5.5 (task #9): RCKangarooManager::checkpoint_capture_built() static query.
+// Only the CUDA RCKangaroo build compiles this TU; guarded so non-CUDA pool
+// runs link cleanly.
+#include "gpu/rckangaroo_wrapper.hpp"
+#endif
 #include "core/paths.hpp"
 #include "core/session_log.hpp"  // milestone() for state_saved (kangaroo herd)
 #include "core/version.hpp"
@@ -294,6 +302,21 @@ int run_pool_mode(const Arguments& args, const GPUDetectionResult& gpu_info,
     auto& pool_manager = get_pool_manager();
     pool_manager.set_config(pool_config);
 
+    // v1.5.5 checkpoint-replay (task #9): tell the pool manager whether this
+    // build compiled the per-kangaroo checkpoint capture. The manager ANDs it
+    // with "v4 identity loaded" inside apply_worker_identity (run by connect()
+    // and every reconnect) to enable the client's DP_BATCH_V3 emit; the client
+    // additionally gates per-DP on an actually-captured committable chain, so a
+    // CPU/Metal-backed run (which never captures) stays on V2 even when this
+    // flag is true. Must be set BEFORE connect() so the first AUTH's
+    // apply_worker_identity sees it. Only the CUDA RCKangaroo build defines
+    // RCKangarooManager::checkpoint_capture_built(); guard the call so non-CUDA
+    // builds compile + link without the GPU TU.
+#ifdef COLLIDER_USE_RCKANGAROO
+    pool_manager.set_checkpoint_capture_built(
+        ::collider::gpu::RCKangarooManager::checkpoint_capture_built());
+#endif
+
     if (!pool_manager.connect()) {
         if (pool_tui) {
             pool_tui->set_current_phase_name("Connection failed");
@@ -337,8 +360,16 @@ int run_pool_mode(const Arguments& args, const GPUDetectionResult& gpu_info,
                 pool_tui->set_current_phase_name("Updating client");
             }
             updated_or_attempted = true;
+            // perform_self_update is the authoritative gate: it verifies the
+            // Ed25519 manifest signature against the compiled-in release
+            // pubkey and enforces the anti-rollback floor BEFORE fetching
+            // anything. The `newer`/url/sha checks above are only a fast path
+            // to avoid logging an update attempt when there is plainly
+            // nothing to do.
             const bool ok = ::collider::update::perform_self_update(
-                advert.download_url, advert.sha256, argc, argv);
+                advert.latest_version, advert.min_version,
+                advert.download_url, advert.sha256, advert.manifest_sig,
+                argc, argv);
             // perform_self_update relaunches + ExitProcess on success, so
             // reaching here means it failed. Continue on the current version.
             if (!ok) {
@@ -499,9 +530,17 @@ int run_pool_mode(const Arguments& args, const GPUDetectionResult& gpu_info,
     };
 
     ::collider::kangaroo::BackendCallbacks cb;
-    cb.on_dp = [&pool_manager](const uint8_t* x_be, const uint8_t* d_be,
-                                uint8_t type, uint32_t dp_bits) {
-        pool_manager.submit_dp(x_be, d_be, type, dp_bits);
+    cb.on_dp = [&pool_manager](
+            const uint8_t* x_be, const uint8_t* d_be,
+            uint8_t type, uint32_t dp_bits,
+            const std::vector<std::array<uint8_t, 32>>* ckpt_distances,
+            const std::vector<uint8_t>* ckpt_l1s2) {
+        // v1.5.5 (task #9): forward the committable checkpoint chain (or
+        // nullptr) into the manager so the JLP client can decide V3-vs-V2 per
+        // DP. The manager copies the chain onto the queued DistinguishedPoint;
+        // it does not retain the pointers past the call.
+        pool_manager.submit_dp(x_be, d_be, type, dp_bits,
+                               ckpt_distances, ckpt_l1s2);
     };
     cb.on_progress = [&progress, &pool_manager, &poll_work_id_change,
                       &restart_pending, pool_tui,

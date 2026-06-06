@@ -109,13 +109,23 @@ inline std::vector<ProofStep> build_proof(const std::vector<Distance>& distances
 // client-side self-check before sending a CHALLENGE_RSP.
 inline bool verify_proof(const Hash& root, const Distance& dist_be,
                          size_t index, const std::vector<ProofStep>& path) {
+    // The leaf `index` fixes the direction of every step: at each level the
+    // low bit of the running index says whether the current node is the LEFT
+    // child (bit 0, sibling sits to the right) or the RIGHT child (bit 1,
+    // sibling sits to the left). Recompute that expected direction from
+    // `index` and reject if it disagrees with the proof's sibling_is_right
+    // flag, so correctness cannot rest on attacker-supplied flags alone.
+    // Byte-identical to the Python verify_proof in
+    // collision-protocol/src/checkpoint_commit.py.
     Hash node = leaf_hash(dist_be);
+    size_t idx = index;
     for (const auto& step : path) {
+        const bool expected_sibling_is_right = (idx % 2 == 0);
+        if (step.sibling_is_right != expected_sibling_is_right) return false;
         node = step.sibling_is_right ? node_hash(node, step.sibling)
                                      : node_hash(step.sibling, node);
+        idx /= 2;
     }
-    (void)index;  // index is implicit in the sibling-side flags, kept for
-                  // signature parity with the Python verifier.
     return node == root;
 }
 

@@ -262,6 +262,13 @@ struct Arguments {
     bool pool_mode = false;               // Connect to pool for distributed solving
     std::string pool_url;                 // Pool URL (jlp://host:port or http://host:port)
     std::string pool_worker;              // Worker name (Bitcoin address for rewards)
+    // Test escape hatch: skip the strict --worker name/format validator. Only
+    // honored when supplied as a genuine top-level --worker-unsafe-allow-any
+    // flag (registered in the FlagSpec table and consumed in argument order),
+    // never via a global argv scan, so it cannot be smuggled in as another
+    // flag's value. The worker-name check is deferred to a post-parse step so
+    // this flag's effect is position-independent relative to --worker.
+    bool worker_unsafe_allow_any = false;
     // Pool password (optional). Reading the secret from argv leaks it via
     // ps / Task Manager; --pool-password-file is the supported replacement.
     // Held in a SecurePassword wrapper (around SecureString) so the bytes

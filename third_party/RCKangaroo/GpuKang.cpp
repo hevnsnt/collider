@@ -33,7 +33,12 @@
 cudaError_t cuSetGpuParams(TKparams Kparams, u64* _jmp2_table);
 void CallGpuKernelGen(TKparams Kparams);
 void CallGpuKernelABC(TKparams Kparams);
-void AddPointsToList(u32* data, int cnt, u64 ops_cnt);
+// theCollider: AddPointsToList now takes an opaque context pointer as its
+// first argument so the DP sink receives its accumulator explicitly instead
+// of reaching into file-scope globals (improves testability / reentrancy).
+// The context is RCGpuKang::PointSinkCtx, set by the caller before Execute().
+// The upstream standalone definition ignores it and uses its own globals.
+void AddPointsToList(void* ctx, u32* data, int cnt, u64 ops_cnt);
 extern bool gGenMode; //tames generation mode
 
 int RCGpuKang::CalcKangCnt()
@@ -565,7 +570,7 @@ void RCGpuKang::Execute()
 				gTotalErrors++;
 				break;
 			}
-			AddPointsToList(DPs_out, cnt, (u64)KangCnt * STEP_CNT);
+			AddPointsToList(PointSinkCtx, DPs_out, cnt, (u64)KangCnt * STEP_CNT);
 		}
 
 		//dbg

@@ -27,6 +27,7 @@
 
 #include "../pool/jlp_pool_client.hpp"  // collider::pool::WorkAssignment
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -44,10 +45,23 @@ namespace kangaroo {
 struct BackendCallbacks {
     // Distinguished point surfaced. Bytes are in BE wire format ready
     // for direct submission to PoolManager::submit_dp().
+    //
+    // v1.5.5 checkpoint-replay (task #9): the trailing two pointers carry the
+    // COMMITTABLE checkpoint chain (ordered 32-byte big-endian distances mod n
+    // + per-checkpoint L1S2 bits) read back from the GPU for the kangaroo that
+    // produced this DP, when this build captured one and the walk is
+    // server-replayable. Both are nullptr (the default for backends that never
+    // capture: Metal, CPU, and the non-capture CUDA build) which the pool path
+    // treats as "no commitment -> emit DP_BATCH_V2". A non-null pair is only
+    // ever produced by a loop-escape-free, birth-L1S2==0 walk
+    // (read_checkpoint_chain enforces this), so the client never commits a
+    // fabricated chain.
     std::function<void(const uint8_t* x_be,
                        const uint8_t* d_be,
                        uint8_t type,
-                       uint32_t dp_bits)> on_dp;
+                       uint32_t dp_bits,
+                       const std::vector<std::array<uint8_t, 32>>* ckpt_distances,
+                       const std::vector<uint8_t>* ckpt_l1s2)> on_dp;
 
     // Periodic progress tick. Backend chooses tick frequency (~1-10 Hz
     // typical). Return false to request the solve loop exits cleanly.

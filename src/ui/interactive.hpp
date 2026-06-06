@@ -67,6 +67,7 @@ enum class MainMenuChoice {
     BIP_SCAN_MODE = 3,         // v1.5.x: BIP-39/32 mnemonic scanner
     BENCHMARK_MODE = 4,
     SHOW_HELP = 5,
+    WORDLIST_GENERATOR = 6,    // v1.5.5: build candidate wordlists (Pro)
     EXIT = 0
 };
 

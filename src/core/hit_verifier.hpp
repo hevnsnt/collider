@@ -16,6 +16,8 @@
 #include "types.hpp"
 #include "byte_codec.hpp"
 #include "bech32.hpp"     // BIP-173 checksum-verifying decoder
+#include "crypto_cpu.hpp" // C4: re-derive hash160 from the private key to
+                          // cryptographically confirm a hit before emit
 #include "../tools/utxo_bloom_builder.hpp"
 #include <cstring>   // std::memcpy used below; MSVC pulls it transitively
                      // via <string>, strict GCC/Clang do not.
@@ -220,6 +222,48 @@ public:
         }
 
         return results;
+    }
+
+    /**
+     * C4 (adversarial review v1.5.5, Security D): cryptographic key
+     * confirmation. The UVRF lookup above only proves the matched h160 is a
+     * funded address; it does NOT prove the private key we are about to emit
+     * actually controls it. A bloom collision, a kernel bug, or a corrupted
+     * private-key readback could surface a record whose private key does not
+     * derive to the matched h160 -- emitting it would mislead the operator
+     * into believing they found a spendable key when they did not.
+     *
+     * This re-derives hash160(pubkey(private_key)) on the CPU for the SAME
+     * address kind the GPU matched, and compares it to the claimed h160 in
+     * constant time. Returns true only on an exact match.
+     *
+     * addr_type mirrors the C2 convention used by the brain-wallet runner:
+     *   0 = uncompressed P2PKH   -> hash160(0x04 || X || Y)
+     *   2 = P2SH-P2WPKH (BIP-49) -> hash160(0x0014 || hash160_compressed)
+     *   1 / default = compressed P2PKH (and BIP-84 P2WPKH, same h160)
+     */
+    static bool confirm_key(const uint8_t* private_key /* 32 bytes */,
+                            uint8_t addr_type,
+                            const utxo::H160& claimed_h160) {
+        std::array<uint8_t, 20> derived;
+        switch (addr_type) {
+            case 0:
+                derived = cpu::compute_hash160_uncompressed(private_key);
+                break;
+            case 2:
+                derived = cpu::compute_hash160_p2sh_p2wpkh(private_key);
+                break;
+            default:
+                derived = cpu::compute_hash160(private_key);
+                break;
+        }
+        // Constant-time compare; an h160 mismatch is not secret-dependent but
+        // the cost of a fixed-time compare here is negligible.
+        unsigned diff = 0;
+        for (size_t i = 0; i < 20; ++i) {
+            diff |= static_cast<unsigned>(derived[i] ^ claimed_h160.data[i]);
+        }
+        return diff == 0;
     }
 
     /**

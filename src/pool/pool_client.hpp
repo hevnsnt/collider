@@ -9,6 +9,7 @@
 #include <memory>
 #include <functional>
 #include <atomic>
+#include <array>
 
 namespace collider {
 namespace pool {
@@ -19,6 +20,27 @@ struct DistinguishedPoint {
     uint8_t d[32];           // Distance traveled (private key offset)
     uint8_t type;            // 0 = tame, 1 = wild
     uint64_t dp_bits;        // Number of DP bits used
+
+    // v1.5.5 checkpoint-replay anti-cheat (task #9). A COMMITTABLE walk's
+    // ordered checkpoint distances (32-byte big-endian scalars mod n, ready
+    // for checkpoint_commit::build_root) and the matching per-checkpoint
+    // loop-state (L1S2) bits, read back from the GPU at DP-harvest time for
+    // the producing kangaroo. Empty (size < 2) means "this DP has no
+    // committable chain" -- the sender then emits DP_BATCH_V2 exactly as
+    // before. These are TRANSIENT per-connection anti-cheat state, NOT part
+    // of the DP's persisted identity: serialize()/deserialize() (the V1
+    // disk-backlog path) deliberately ignore them, so a DP replayed from disk
+    // after a restart correctly falls back to V2 (its retained walk is gone).
+    // Carrying them on the in-memory queue element (rather than the wire
+    // struct) keeps the V2/V3 wire layouts untouched.
+    std::vector<std::array<uint8_t, 32>> ckpt_distances;
+    std::vector<uint8_t> ckpt_l1s2;
+
+    // A walk is committable iff it carries >= 2 checkpoints (birth + at least
+    // one full segment). read_checkpoint_chain already enforces the stricter
+    // server-replayable conditions (loop-escape-free, birth L1S2 == 0) before
+    // populating these, so a non-empty chain here is always safe to commit.
+    bool has_checkpoint_chain() const { return ckpt_distances.size() >= 2; }
 
     // Serialize for network transmission
     std::vector<uint8_t> serialize() const;

@@ -12,12 +12,14 @@
 // to TAME_ONLY or WILD_ONLY; BOTH is rejected as a server bug.
 #include "../../third_party/RCKangaroo/defs.h"
 
+#include <array>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <iostream>
 #include <ostream>
 #include <sstream>
+#include <vector>
 
 namespace collider {
 namespace kangaroo {
@@ -157,11 +159,20 @@ void CudaRCKangarooBackend::solve(BackendCallbacks cb) {
 
     const uint32_t dp_bits_u32 = rc_.dp_bits;  // already uint32_t in v1.4.0+
 
-    // RCKangaroo's dp_callback signature is (x[32], d[32], type).
-    rc_.dp_callback = [cb, dp_bits_u32](const uint8_t* x_be,
-                                         const uint8_t* d_be,
-                                         uint8_t type) {
-        cb.on_dp(x_be, d_be, type, dp_bits_u32);
+    // RCKangaroo's dp_callback signature is (x[32], d[32], type,
+    // ckpt_distances*, ckpt_l1s2*). v1.5.5 (task #9): the trailing two pointers
+    // carry the COMMITTABLE checkpoint chain for the kangaroo that produced
+    // this DP (or nullptr if none / non-replayable / non-capture build). Pass
+    // them straight through to BackendCallbacks::on_dp so the pool client can
+    // decide V3-vs-V2 per DP. The wrapper read them back at harvest; this
+    // adapter does not interpret them.
+    rc_.dp_callback = [cb, dp_bits_u32](
+            const uint8_t* x_be,
+            const uint8_t* d_be,
+            uint8_t type,
+            const std::vector<std::array<uint8_t, 32>>* ckpt_distances,
+            const std::vector<uint8_t>* ckpt_l1s2) {
+        cb.on_dp(x_be, d_be, type, dp_bits_u32, ckpt_distances, ckpt_l1s2);
     };
 
     // RCKangaroo reports speed in MKeys/s (int); convert to ops/s.

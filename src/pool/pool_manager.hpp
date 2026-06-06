@@ -78,6 +78,16 @@ public:
 
     // DP submission (called from Kangaroo solver)
     void submit_dp(const uint8_t* x, const uint8_t* d, uint8_t type, uint32_t dp_bits);
+    // v1.5.5 (task #9): chain-carrying overload. ckpt_distances / ckpt_l1s2 are
+    // the COMMITTABLE checkpoint chain for the kangaroo that produced this DP
+    // (ordered 32-byte big-endian distances mod n + per-checkpoint L1S2 bits),
+    // read back at GPU harvest. Both nullptr (or a chain shorter than 2
+    // checkpoints) means "no commitment" -> the DP ships as DP_BATCH_V2. The
+    // pointers are copied (not retained) onto the queued DistinguishedPoint.
+    void submit_dp(const uint8_t* x, const uint8_t* d, uint8_t type,
+                   uint32_t dp_bits,
+                   const std::vector<std::array<uint8_t, 32>>* ckpt_distances,
+                   const std::vector<uint8_t>* ckpt_l1s2);
     void submit_dp(const DistinguishedPoint& dp);
 
     // Statistics
@@ -133,6 +143,22 @@ public:
     uint32_t reconnect_successes() const { return reconnect_successes_.load(); }
     bool reconnect_supervisor_gave_up() const { return supervisor_gave_up_.load(); }
 
+    // Reconnect-window DP buffer diagnostics. buffered = DPs held while
+    // disconnected; replayed = buffered DPs resubmitted into the new client
+    // post-reconnect (work_id still matched the active assignment); purged =
+    // buffered DPs DROPPED at drain time because their work_id no longer
+    // matched (resubmitting would earn server-side stale-work_id strikes).
+    // All three are cumulative across the process lifetime.
+    uint64_t reconnect_buffered_total() const {
+        return reconnect_buffered_total_.load(std::memory_order_relaxed);
+    }
+    uint64_t reconnect_replayed_total() const {
+        return reconnect_replayed_total_.load(std::memory_order_relaxed);
+    }
+    uint64_t reconnect_purged_total() const {
+        return reconnect_purged_total_.load(std::memory_order_relaxed);
+    }
+
     // v1.5.4 maintenance status (surfaced to the host so the TUI / logs
     // can tell the operator the pool asked everyone to back off). The
     // flag is set when a MAINTENANCE(active=1) frame arrives and cleared
@@ -143,6 +169,19 @@ public:
     std::string maintenance_message() const {
         std::lock_guard<std::mutex> lock(maintenance_mutex_);
         return maintenance_message_;
+    }
+
+    // v1.5.5 checkpoint-replay (task #9). The runtime driver (pool_solver)
+    // reports whether the active GPU backend compiled the per-kangaroo
+    // checkpoint capture (RCKangarooManager::checkpoint_capture_built()).
+    // PoolManager stores it and applies it to every client it creates (initial
+    // connect + every supervisor reconnect) inside apply_worker_identity, ANDed
+    // with whether a worker identity is loaded (= negotiated protocol v4), so a
+    // reconnect-created client re-enables V3 emit consistently. Set BEFORE
+    // connect(); a later change only affects subsequently-created clients.
+    // Default false keeps the client on DP_BATCH_V2 (no commitment).
+    void set_checkpoint_capture_built(bool built) {
+        checkpoint_capture_built_ = built;
     }
 
     // v1.5.4: surface the update advert parsed from the current client's
@@ -170,9 +209,29 @@ private:
     // semantics so the producer side never blocks on the drain side.
     static constexpr size_t kReconnectBufferCap = 10000;
     std::mutex reconnect_buf_mutex_;
-    std::deque<DistinguishedPoint> reconnect_buffer_;
+    // Each buffered DP is tagged with the work_id it was computed under.
+    // On reconnect we replay only DPs whose work_id still matches the
+    // active assignment and DROP the rest: a DP for a chunk we no longer
+    // own can never be accepted, and resubmitting it only earns the
+    // server's stale-work_id strikes (which escalate to a force-close +
+    // reconnect loop -- the v1.5.4 post-restart stranding bug). The bare
+    // DistinguishedPoint carries no work_id, so the tag lives alongside it
+    // here rather than on the wire struct.
+    struct BufferedDP {
+        DistinguishedPoint dp;
+        uint64_t work_id;
+    };
+    std::deque<BufferedDP> reconnect_buffer_;
     std::atomic<uint64_t> reconnect_buffered_total_{0};
     std::atomic<uint64_t> reconnect_replayed_total_{0};
+    // Count of buffered DPs purged at drain time because their work_id no
+    // longer matched the active assignment (operator-visible diagnostics).
+    std::atomic<uint64_t> reconnect_purged_total_{0};
+    // Lock-free snapshot of the currently-assigned work_id, updated every
+    // time current_work_ changes (work_callback + reconnect WORK_ASN).
+    // submit_dp() reads this on the producer hot path to tag buffered DPs
+    // without contending for work_mutex_. 0 = no assignment yet.
+    std::atomic<uint64_t> current_work_id_{0};
     std::chrono::steady_clock::time_point start_time_;
     SolutionFoundCallback solution_callback_;
 
@@ -201,6 +260,11 @@ private:
     // configured (legacy v3 wire path).
     std::shared_ptr<collider::identity::WorkerIdentity> worker_identity_;
     void apply_worker_identity(JLPPoolClient* jlp);  // load + attach
+
+    // v1.5.5 (task #9): set by the runtime driver from the active backend's
+    // RCKangarooManager::checkpoint_capture_built(). apply_worker_identity ANDs
+    // it with "v4 identity loaded" to enable the client's DP_BATCH_V3 emit.
+    bool checkpoint_capture_built_ = false;
 
     // WORK_ASN dedup state lives at the manager level
     // because it survives client recreation across reconnects. The

@@ -9,6 +9,11 @@
 
 #include "rckangaroo_wrapper.hpp"
 #include "../core/byte_codec.hpp"
+#ifdef COLLIDER_CHECKPOINT_CAPTURE
+// Mod-n reduction + big-endian Distance encoding for the captured per-kangaroo
+// checkpoint chain. Header-only (crypto_cpu.hpp is all inline).
+#include "../core/checkpoint_commit.hpp"
+#endif
 // Q-T1.1 inversion (2026-05-17): formerly #include
 // "../runtime/runtime_control.hpp" purely for the kMaxGpus constant used
 // in the static_assert below. The constant is now owned by the gpu layer
@@ -29,6 +34,8 @@
 #include <iomanip>
 #include <filesystem>   // T0.2: atomic tmp+rename for save_herd_state
 #include <system_error> // std::error_code on the rename path
+#include <array>        // checkpoint chain Distance (std::array<uint8_t,32>)
+#include <vector>       // checkpoint chain readback buffers
 
 #ifdef _WIN32
     // _commit() is the Windows equivalent of POSIX fsync(): flushes the
@@ -163,58 +170,81 @@ static void cpu_sha256(const uint8_t* data, size_t len, uint8_t* hash) {
 // statics that backed it (s_bloom_filter, s_bloom_checks, s_bloom_hits,
 // s_bloom_hits_mutex, s_bloom_hit_callback) moved there; this file only
 // reaches the feature through the collider::gpu::bloom hook under
-// #ifdef COLLIDER_PRO. The DP-export callback below is NOT a bloom symbol
-// and stays here (pool mode uses it to submit DPs to the server).
-static std::function<void(const uint8_t*, const uint8_t*, uint8_t)> s_dp_callback;
+// #ifdef COLLIDER_PRO. The DP-export callback (pool mode) now lives inside
+// RckSingletonState::dp_callback (declared below) rather than as a loose
+// file-scope std::function, so all per-run state has a single owner.
 
 // ============================================================================
-// Process-singleton state.
-// RCKangaroo's third_party/RCKangaroo/GpuKang.cpp declares
-// `void AddPointsToList(u32*, int, u64)` as an extern free function at
-// line 16 and calls it from the kernel-completion path at line 472 with
-// no `void* user_data` to thread instance state through. Our wrapper
-// implementation of AddPointsToList therefore has to reach process-
-// scope state to do anything useful. Encapsulating this into a per-
-// instance Impl member would require either:
-//   (a) forking RCKangaroo to add a context pointer to its API, or
-//   (b) routing through a static "active instance" pointer that is
-//       just a global by another name.
-// We instead enforce the implicit singleton contract via
-// g_active_instance_ + an atomic check in RCKangarooManager's
-// constructor: a second instance fails loudly rather than silently
-// stomping the first. The g_X globals below are renamed s_X to make
-// their internal-linkage scope clearer to readers; they remain file-
-// scope because that is the only way to satisfy GpuKang.cpp's link
-// surface.
-// audit finding: process-globals are a known hazard pattern;
-// the singleton guard converts that hazard into a deterministic crash
-// on misuse rather than data corruption. Full encapsulation requires
-// patching third_party/RCKangaroo to thread a context pointer through
-// AddPointsToList -- a separate effort once the upstream patches are
-// vendored.
+// RckSingletonState - encapsulated RCKangaroo run state.
+//
+// Why this is still a single process-wide owner (and not a per-instance
+// Impl member):
+//   RCKangaroo's device side is irreducibly process-global. RCGpuCore.cu
+//   declares __constant__ jump-table symbols (jmp2_table) that are bound
+//   per process via cudaMemcpyToSymbol inside cuSetGpuParams, and the EC
+//   library's precomputed tables are owned by the global InitEc()/DeInitEc()
+//   pair. A second concurrent RCKangaroo search would stomp that shared
+//   device constant memory regardless of how the host-side accumulator is
+//   scoped. Threading a context pointer therefore CANNOT remove the
+//   singleton; the singleton is a property of the upstream device code, not
+//   of this wrapper. The g_active_rckangaroo guard below converts that real
+//   constraint into a deterministic abort on misuse rather than silent
+//   state corruption, and the review explicitly requires it to remain.
+//
+// What the refactor DOES fix (the testability / reentrancy axis the review
+// flagged): the ~15 loose s_* file-scope variables are collapsed into this
+// one struct with a single named owner (g_rck_state), and AddPointsToList no
+// longer reaches blindly into file scope -- it now receives its accumulator
+// explicitly through the context pointer threaded from
+// RCGpuKang::PointSinkCtx (see third_party/RCKangaroo/GpuKang.cpp). The
+// function body is a pure function of (ctx, data, cnt, ops): given a state
+// pointer it is independently exercisable, and a future multi-context build
+// (should upstream ever make InitEc/jmp2_table per-instance) only has to
+// hand a different pointer in. The members keep their former names so the
+// diff against the rest of the file stays mechanical (s_X -> g_rck_state.X).
 // ============================================================================
+struct RckSingletonState {
+    EcJMP EcJumps1[JMP_CNT];
+    EcJMP EcJumps2[JMP_CNT];
+    EcJMP EcJumps3[JMP_CNT];
+    RCGpuKang* GpuKangs[MAX_GPU_CNT] = {};
+    int GpuCnt = 0;
+    volatile bool Solved = false;
+    volatile long ThrCnt = 0;
 
-static EcJMP s_EcJumps1[JMP_CNT];
-static EcJMP s_EcJumps2[JMP_CNT];
-static EcJMP s_EcJumps3[JMP_CNT];
-static RCGpuKang* s_GpuKangs[MAX_GPU_CNT];
-static int s_GpuCnt = 0;
-static volatile bool s_Solved = false;
-static volatile long s_ThrCnt = 0;
+    EcInt Int_HalfRange;
+    EcPoint Pnt_HalfRange;
+    EcInt PrivKey;
+    EcPoint PntToSolve;
 
-static EcInt s_Int_HalfRange;
-static EcPoint s_Pnt_HalfRange;
-static EcInt s_PrivKey;
-static EcPoint s_PntToSolve;
+    CriticalSection csAddPoints;
+    u8* pPntList = nullptr;
+    u8* pPntList2 = nullptr;
+    volatile int PntIndex = 0;
+    TFastBase db;
+    u64 PntTotalOps = 0;
+    u32 TotalErrors = 0;
+    bool GenMode = false;
 
-static CriticalSection s_csAddPoints;
-static u8* s_pPntList = nullptr;
-static u8* s_pPntList2 = nullptr;
-static volatile int s_PntIndex = 0;
-static TFastBase s_db;
-static u64 s_PntTotalOps = 0;
-static u32 s_TotalErrors = 0;
-static bool s_GenMode = false;
+    // DP-export callback (pool mode). Not a bloom symbol; lives here so all
+    // run state has one owner. Cleared between runs by solve().
+    //
+    // v1.5.5 (task #9): the trailing two pointers carry the COMMITTABLE
+    // checkpoint chain for the kangaroo that produced this DP (ordered 32-byte
+    // big-endian distances mod n + per-checkpoint L1S2 bits), read back at
+    // harvest in CheckNewPoints when this build captured one. nullptr on the
+    // non-capture build, and nullptr for any DP whose walk is not
+    // server-replayable, so the pool client falls back to DP_BATCH_V2.
+    std::function<void(const uint8_t*, const uint8_t*, uint8_t,
+                       const std::vector<std::array<uint8_t, 32>>*,
+                       const std::vector<uint8_t>*)> dp_callback;
+};
+
+// The single permitted instance. Justified above: RCKangaroo's __constant__
+// device memory and global EC tables make a second concurrent search
+// impossible regardless of host-side scoping. The g_active_rckangaroo guard
+// enforces that at the C++ level.
+static RckSingletonState g_rck_state;
 
 // Active-instance tracker. NULL when no RCKangarooManager exists; non-
 // null only between construct/destroy of the single permitted instance.
@@ -224,21 +254,51 @@ static bool s_GenMode = false;
 // dereferences.
 static std::atomic<void*> g_active_rckangaroo{nullptr};
 
+#ifdef COLLIDER_CHECKPOINT_CAPTURE
+// v1.5.5 checkpoint-replay (task #9). When solve() arms the device capture it
+// publishes the active manager (so CheckNewPoints can call read_checkpoint_chain
+// on it) and the armed window size (so CheckNewPoints can bound the DP byte-60
+// kangaroo index to the captured slots). Both are written on the solve() thread
+// BEFORE the worker threads launch and the main loop calls CheckNewPoints, and
+// cleared after the worker threads join, so the single-reader CheckNewPoints
+// (run from the same solve() thread) never races them. They are plain pointers
+// because the capture readback is single-threaded within solve(); the
+// g_active_rckangaroo singleton guard already forbids a second concurrent
+// manager. nullptr / 0 means "capture not armed" -> CheckNewPoints emits no
+// chain and the client falls back to V2. The RCKangarooManager type is fully
+// defined by the included rckangaroo_wrapper.hpp above.
+static const ::collider::gpu::RCKangarooManager* g_active_capture_mgr = nullptr;
+static uint32_t g_capture_window_size = 0;
+#endif
+
 // ============================================================================
-// AddPointsToList - Called by RCGpuKang::Execute() after kernel completes
-// This is required by GpuKang.cpp (extern declaration at line 16)
+// AddPointsToList - Called by RCGpuKang::Execute() after the kernel completes.
+// Required by GpuKang.cpp (extern declaration there). The first argument is
+// the opaque context pointer threaded from RCGpuKang::PointSinkCtx; the
+// wrapper sets it to &g_rck_state before launching workers, so this function
+// operates purely on its arguments rather than reaching into file scope.
 // ============================================================================
-void AddPointsToList(u32* data, int pnt_cnt, u64 ops_cnt) {
-    s_csAddPoints.Enter();
-    if (s_PntIndex + pnt_cnt >= MAX_CNT_LIST) {
-        s_csAddPoints.Leave();
+void AddPointsToList(void* ctx, u32* data, int pnt_cnt, u64 ops_cnt) {
+    // ctx is always &g_rck_state in this build (set in solve()/generate_tames
+    // before any worker thread can call back). Guard against a null context
+    // defensively so a future caller that forgets to wire it fails loudly at
+    // its own call site rather than corrupting unrelated memory.
+    if (!ctx) {
+        std::cerr << "AddPointsToList called with null context; DP dropped."
+                  << std::endl;
+        return;
+    }
+    RckSingletonState& st = *static_cast<RckSingletonState*>(ctx);
+    st.csAddPoints.Enter();
+    if (st.PntIndex + pnt_cnt >= MAX_CNT_LIST) {
+        st.csAddPoints.Leave();
         std::cerr << "DPs buffer overflow, increase DP value!" << std::endl;
         return;
     }
-    memcpy(s_pPntList + GPU_DP_SIZE * s_PntIndex, data, pnt_cnt * GPU_DP_SIZE);
-    s_PntIndex = s_PntIndex + pnt_cnt;  // Avoid deprecated volatile compound assignment
-    s_PntTotalOps += ops_cnt;
-    s_csAddPoints.Leave();
+    memcpy(st.pPntList + GPU_DP_SIZE * st.PntIndex, data, pnt_cnt * GPU_DP_SIZE);
+    st.PntIndex = st.PntIndex + pnt_cnt;  // Avoid deprecated volatile compound assignment
+    st.PntTotalOps += ops_cnt;
+    st.csAddPoints.Leave();
 }
 
 // ============================================================================
@@ -253,14 +313,14 @@ namespace gpu {
 static u32 __stdcall kang_thr_proc(void* data) {
     RCGpuKang* Kang = (RCGpuKang*)data;
     Kang->Execute();
-    InterlockedDecrement(&s_ThrCnt);
+    InterlockedDecrement(&g_rck_state.ThrCnt);
     return 0;
 }
 #else
 static void* kang_thr_proc(void* data) {
     RCGpuKang* Kang = (RCGpuKang*)data;
     Kang->Execute();
-    __sync_fetch_and_sub(&s_ThrCnt, 1);
+    __sync_fetch_and_sub(&g_rck_state.ThrCnt, 1);
     return nullptr;
 }
 #endif
@@ -271,33 +331,33 @@ static bool Collision_SOTA(EcPoint& pnt, EcInt t, int TameType, EcInt w, int Wil
     if (IsNeg)
         t.Neg();
     if (TameType == TAME) {
-        s_PrivKey = t;
-        s_PrivKey.Sub(w);
-        EcInt sv = s_PrivKey;
-        s_PrivKey.Add(s_Int_HalfRange);
-        EcPoint P = ec.MultiplyG(s_PrivKey);
+        g_rck_state.PrivKey = t;
+        g_rck_state.PrivKey.Sub(w);
+        EcInt sv = g_rck_state.PrivKey;
+        g_rck_state.PrivKey.Add(g_rck_state.Int_HalfRange);
+        EcPoint P = ec.MultiplyG(g_rck_state.PrivKey);
         if (P.IsEqual(pnt))
             return true;
-        s_PrivKey = sv;
-        s_PrivKey.Neg();
-        s_PrivKey.Add(s_Int_HalfRange);
-        P = ec.MultiplyG(s_PrivKey);
+        g_rck_state.PrivKey = sv;
+        g_rck_state.PrivKey.Neg();
+        g_rck_state.PrivKey.Add(g_rck_state.Int_HalfRange);
+        P = ec.MultiplyG(g_rck_state.PrivKey);
         return P.IsEqual(pnt);
     } else {
-        s_PrivKey = t;
-        s_PrivKey.Sub(w);
-        if (s_PrivKey.data[4] >> 63)
-            s_PrivKey.Neg();
-        s_PrivKey.ShiftRight(1);
-        EcInt sv = s_PrivKey;
-        s_PrivKey.Add(s_Int_HalfRange);
-        EcPoint P = ec.MultiplyG(s_PrivKey);
+        g_rck_state.PrivKey = t;
+        g_rck_state.PrivKey.Sub(w);
+        if (g_rck_state.PrivKey.data[4] >> 63)
+            g_rck_state.PrivKey.Neg();
+        g_rck_state.PrivKey.ShiftRight(1);
+        EcInt sv = g_rck_state.PrivKey;
+        g_rck_state.PrivKey.Add(g_rck_state.Int_HalfRange);
+        EcPoint P = ec.MultiplyG(g_rck_state.PrivKey);
         if (P.IsEqual(pnt))
             return true;
-        s_PrivKey = sv;
-        s_PrivKey.Neg();
-        s_PrivKey.Add(s_Int_HalfRange);
-        P = ec.MultiplyG(s_PrivKey);
+        g_rck_state.PrivKey = sv;
+        g_rck_state.PrivKey.Neg();
+        g_rck_state.PrivKey.Add(g_rck_state.Int_HalfRange);
+        P = ec.MultiplyG(g_rck_state.PrivKey);
         return P.IsEqual(pnt);
     }
 }
@@ -312,16 +372,16 @@ struct DBRec {
 
 // Check new distinguished points for collisions
 static void CheckNewPoints() {
-    s_csAddPoints.Enter();
-    if (!s_PntIndex) {
-        s_csAddPoints.Leave();
+    g_rck_state.csAddPoints.Enter();
+    if (!g_rck_state.PntIndex) {
+        g_rck_state.csAddPoints.Leave();
         return;
     }
 
-    int cnt = s_PntIndex;
-    memcpy(s_pPntList2, s_pPntList, GPU_DP_SIZE * cnt);
-    s_PntIndex = 0;
-    s_csAddPoints.Leave();
+    int cnt = g_rck_state.PntIndex;
+    memcpy(g_rck_state.pPntList2, g_rck_state.pPntList, GPU_DP_SIZE * cnt);
+    g_rck_state.PntIndex = 0;
+    g_rck_state.csAddPoints.Leave();
 
 #ifdef COLLIDER_PRO
     // EC context reused across this batch's opportunistic bloom probes.
@@ -332,32 +392,32 @@ static void CheckNewPoints() {
 
     for (int i = 0; i < cnt; i++) {
         DBRec nrec;
-        u8* p = s_pPntList2 + i * GPU_DP_SIZE;
+        u8* p = g_rck_state.pPntList2 + i * GPU_DP_SIZE;
         // GPU_DP_SIZE=64 layout: 0-15 x LS 128b, 16-31 x MS 128b, 32-53 d, 56 type
         memcpy(nrec.x, p, 12);
         memcpy(nrec.d, p + 32, 22);
-        nrec.type = s_GenMode ? TAME : p[56];
+        nrec.type = g_rck_state.GenMode ? TAME : p[56];
 
 #ifdef COLLIDER_PRO
         // Opportunistic address scan: probe this DP's candidate address
         // against the loaded bloom filter (Pro only). All bloom logic lives
         // in rckangaroo_bloom.cu; here we only extract the distance and hand
         // it plus the run's half-range / target point to the hook.
-        if (collider::gpu::bloom::is_loaded() && !s_GenMode) {
+        if (collider::gpu::bloom::is_loaded() && !g_rck_state.GenMode) {
             EcInt dist;
             memset(dist.data, 0, sizeof(dist.data));
             memcpy(dist.data, nrec.d, sizeof(nrec.d));
             if (nrec.d[21] == 0xFF) memset(((u8*)dist.data) + 22, 0xFF, 18);
             collider::gpu::bloom::probe_dp(dist, nrec.type == TAME,
-                                           s_Int_HalfRange, s_PntToSolve, ec,
-                                           s_PntTotalOps);
+                                           g_rck_state.Int_HalfRange, g_rck_state.PntToSolve, ec,
+                                           g_rck_state.PntTotalOps);
         }
 #endif
 
-        DBRec* pref = (DBRec*)s_db.FindOrAddDataBlock((u8*)&nrec);
+        DBRec* pref = (DBRec*)g_rck_state.db.FindOrAddDataBlock((u8*)&nrec);
 
         // Export DP to pool via callback (if in pool mode)
-        if (s_dp_callback && !s_GenMode) {
+        if (g_rck_state.dp_callback && !g_rck_state.GenMode) {
             // x: GPU stores 4 u64s in little-endian; reverse to big-endian so
             // the server sees leading zeros at byte 0 (secp256k1 x is < 2^256).
             uint8_t x_be[32];
@@ -378,16 +438,50 @@ static void CheckNewPoints() {
             // Since WILD2 walks from -PntA, its DP satisfies (-PntA+d*G).x==X
             // which equals (PntA-d*G).x==X, matching branch-2. Map to 1.
             const uint8_t pool_type = (nrec.type == 2) ? 1 : nrec.type;
-            s_dp_callback(x_be, d_be, pool_type);
+
+            // v1.5.5 checkpoint-replay (task #9): if this build captured a
+            // per-kangaroo checkpoint chain AND the producing kangaroo's chain
+            // is server-replayable, read it back here (host side, where the
+            // kangaroo's global index is known) and hand it to the callback so
+            // the pool client can emit a real DP_BATCH_V3 commitment. Anything
+            // not committable (out-of-window index, loop-escape, < 2
+            // checkpoints) yields nullptr -> the client stays on V2. This reads
+            // ONLY the capture buffers; it never touches x_be / d_be / type, so
+            // the walk math and the V2 DP contract are byte-for-byte unchanged.
+            const std::vector<std::array<uint8_t, 32>>* ckpt_dists_ptr = nullptr;
+            const std::vector<uint8_t>* ckpt_l1s2_ptr = nullptr;
+#ifdef COLLIDER_CHECKPOINT_CAPTURE
+            std::vector<std::array<uint8_t, 32>> ckpt_dists;
+            std::vector<uint8_t> ckpt_l1s2;
+            // DP bytes 60..63 are the producing kangaroo's global index (a u32
+            // written by RCGpuCore.cu BuildDP at DPs[15]). Read the full 4 bytes,
+            // not just p[60]: a single-byte read is only correct while the capture
+            // window is base-0 with CHK_MAX_KANG<=256, and silently aliases the
+            // low byte if either ever changes.
+            uint32_t kang_index;
+            memcpy(&kang_index, p + 60, sizeof(uint32_t));
+            if (g_active_capture_mgr &&
+                kang_index < g_capture_window_size &&
+                g_active_capture_mgr->read_checkpoint_chain(
+                    kang_index, ckpt_dists, ckpt_l1s2)) {
+                ckpt_dists_ptr = &ckpt_dists;
+                ckpt_l1s2_ptr = &ckpt_l1s2;
+            }
+            g_rck_state.dp_callback(x_be, d_be, pool_type,
+                                    ckpt_dists_ptr, ckpt_l1s2_ptr);
+#else
+            g_rck_state.dp_callback(x_be, d_be, pool_type,
+                                    ckpt_dists_ptr, ckpt_l1s2_ptr);
+#endif
             // Pool mode: the server owns collision detection.
-            // Skip the local FindOrAddDataBlock / s_Solved path so the
+            // Skip the local FindOrAddDataBlock / g_rck_state.Solved path so the
             // solve loop runs indefinitely rather than exiting on the
             // first internal collision (which happens within milliseconds
             // for small puzzles like 41-bit with 2M kangaroos).
             continue;
         }
 
-        if (s_GenMode)
+        if (g_rck_state.GenMode)
             continue;
         if (pref) {
             // Restore first 3 bytes
@@ -421,17 +515,17 @@ static void CheckNewPoints() {
                 WildType = nrec.type;
             }
 
-            bool res = Collision_SOTA(s_PntToSolve, t, TameType, w, WildType, false) ||
-                       Collision_SOTA(s_PntToSolve, t, TameType, w, WildType, true);
+            bool res = Collision_SOTA(g_rck_state.PntToSolve, t, TameType, w, WildType, false) ||
+                       Collision_SOTA(g_rck_state.PntToSolve, t, TameType, w, WildType, true);
             if (!res) {
                 bool w12 = ((pref->type == WILD1) && (nrec.type == WILD2)) ||
                            ((pref->type == WILD2) && (nrec.type == WILD1));
                 if (!w12) {
-                    s_TotalErrors++;
+                    g_rck_state.TotalErrors++;
                 }
                 continue;
             }
-            s_Solved = true;
+            g_rck_state.Solved = true;
             break;
         }
     }
@@ -449,9 +543,9 @@ struct RCKangarooManager::Impl {
 
     // herd save/load buffers. save_bufs holds one
     // host-side cudaMemcpy destination per GPU, sized KangCnt * 96. They
-    // get armed onto s_GpuKangs[i]->SaveKangsHost before solve() runs.
+    // get armed onto g_rck_state.GpuKangs[i]->SaveKangsHost before solve() runs.
     // load_bufs holds parsed file contents and gets armed onto
-    // s_GpuKangs[i]->InitKangsHost. Both are cleared after solve()
+    // g_rck_state.GpuKangs[i]->InitKangsHost. Both are cleared after solve()
     // returns OR after save_herd_state writes the file. Sized for at
     // most MAX_GPU_CNT entries; only the first num_active_gpus are used.
     std::vector<std::vector<uint8_t>> save_bufs;
@@ -472,22 +566,22 @@ struct RCKangarooManager::Impl {
     }
 
     void cleanup() {
-        if (s_pPntList) {
-            free(s_pPntList);
-            s_pPntList = nullptr;
+        if (g_rck_state.pPntList) {
+            free(g_rck_state.pPntList);
+            g_rck_state.pPntList = nullptr;
         }
-        if (s_pPntList2) {
-            free(s_pPntList2);
-            s_pPntList2 = nullptr;
+        if (g_rck_state.pPntList2) {
+            free(g_rck_state.pPntList2);
+            g_rck_state.pPntList2 = nullptr;
         }
-        for (int i = 0; i < s_GpuCnt; i++) {
-            if (s_GpuKangs[i]) {
-                delete s_GpuKangs[i];
-                s_GpuKangs[i] = nullptr;
+        for (int i = 0; i < g_rck_state.GpuCnt; i++) {
+            if (g_rck_state.GpuKangs[i]) {
+                delete g_rck_state.GpuKangs[i];
+                g_rck_state.GpuKangs[i] = nullptr;
             }
         }
-        s_GpuCnt = 0;
-        s_db.Clear();
+        g_rck_state.GpuCnt = 0;
+        g_rck_state.db.Clear();
         if (initialized) {
             DeInitEc();
             initialized = false;
@@ -496,13 +590,15 @@ struct RCKangarooManager::Impl {
 };
 
 RCKangarooManager::RCKangarooManager() : impl_(new Impl()) {
-    // Enforce the implicit singleton constraint described at the top of
-    // this file. RCKangaroo's GpuKang.cpp calls AddPointsToList as a
-    // free function with no context pointer, so all RCKangaroo state
-    // lives in the s_X file-scope variables above. A second
-    // RCKangarooManager instance would silently corrupt the first one's
-    // search; we'd rather crash deterministically than keep solving
-    // with poisoned state.
+    // Enforce the singleton constraint described at the RckSingletonState
+    // definition above. The host-side run state is now encapsulated in the
+    // single g_rck_state object and reached by AddPointsToList through an
+    // explicit context pointer, but the constraint itself is irreducible:
+    // RCKangaroo's __constant__ device jump tables and the global
+    // InitEc()/DeInitEc() EC tables are process-wide, so a second concurrent
+    // RCKangarooManager would corrupt the first one's device-side search no
+    // matter how the host accumulator is scoped. We crash deterministically
+    // here rather than keep solving with poisoned state.
     void* expected = nullptr;
     if (!g_active_rckangaroo.compare_exchange_strong(
             expected, static_cast<void*>(this), std::memory_order_acq_rel)) {
@@ -545,7 +641,7 @@ int RCKangarooManager::init(const std::vector<int>& gpu_ids) {
     std::cout << "CUDA driver/runtime: " << drv/1000 << "." << (drv%100)/10
               << "/" << rt/1000 << "." << (rt%100)/10 << std::endl;
 
-    s_GpuCnt = 0;
+    g_rck_state.GpuCnt = 0;
 
     for (int i = 0; i < gcnt; i++) {
         // Check if this GPU should be used
@@ -615,26 +711,32 @@ int RCKangarooManager::init(const std::vector<int>& gpu_ids) {
         }
 
 
-        s_GpuKangs[s_GpuCnt] = new RCGpuKang();
-        s_GpuKangs[s_GpuCnt]->CudaIndex = i;
-        s_GpuKangs[s_GpuCnt]->persistingL2CacheMaxSize = prop.persistingL2CacheMaxSize;
-        s_GpuKangs[s_GpuCnt]->mpCnt = prop.multiProcessorCount;
-        s_GpuKangs[s_GpuCnt]->IsOldGpu = prop.l2CacheSize < 16 * 1024 * 1024;
-        s_GpuCnt++;
+        g_rck_state.GpuKangs[g_rck_state.GpuCnt] = new RCGpuKang();
+        g_rck_state.GpuKangs[g_rck_state.GpuCnt]->CudaIndex = i;
+        g_rck_state.GpuKangs[g_rck_state.GpuCnt]->persistingL2CacheMaxSize = prop.persistingL2CacheMaxSize;
+        g_rck_state.GpuKangs[g_rck_state.GpuCnt]->mpCnt = prop.multiProcessorCount;
+        g_rck_state.GpuKangs[g_rck_state.GpuCnt]->IsOldGpu = prop.l2CacheSize < 16 * 1024 * 1024;
+        // Thread the DP-sink context into this worker. Execute() forwards it
+        // verbatim to AddPointsToList so the sink receives &g_rck_state
+        // explicitly instead of reaching into file scope. Set at construction
+        // so it is in place before any solve()/generate_tames() launches the
+        // worker thread that calls Execute().
+        g_rck_state.GpuKangs[g_rck_state.GpuCnt]->PointSinkCtx = &g_rck_state;
+        g_rck_state.GpuCnt++;
     }
 
-    std::cout << "Total GPUs initialized: " << s_GpuCnt << std::endl;
+    std::cout << "Total GPUs initialized: " << g_rck_state.GpuCnt << std::endl;
 
     // Allocate DP buffers
-    s_pPntList = (u8*)malloc(MAX_CNT_LIST * GPU_DP_SIZE);
-    s_pPntList2 = (u8*)malloc(MAX_CNT_LIST * GPU_DP_SIZE);
+    g_rck_state.pPntList = (u8*)malloc(MAX_CNT_LIST * GPU_DP_SIZE);
+    g_rck_state.pPntList2 = (u8*)malloc(MAX_CNT_LIST * GPU_DP_SIZE);
 
     impl_->gpu_ids = gpu_ids;
-    return s_GpuCnt;
+    return g_rck_state.GpuCnt;
 }
 
 int RCKangarooManager::num_gpus() const {
-    return s_GpuCnt;
+    return g_rck_state.GpuCnt;
 }
 
 bool RCKangarooManager::set_target_pubkey(const std::string& compressed_hex) {
@@ -661,21 +763,21 @@ void RCKangarooManager::set_start_offset(const std::string& start_hex) {
 
 bool RCKangarooManager::load_tames(const std::string& filename) {
     impl_->tames_file = filename;
-    return s_db.LoadFromFile(const_cast<char*>(filename.c_str()));
+    return g_rck_state.db.LoadFromFile(const_cast<char*>(filename.c_str()));
 }
 
 bool RCKangarooManager::generate_tames(const std::string& filename, double max_ops) {
     impl_->tames_file = filename;
     Ec ec;
 
-    if (s_GpuCnt == 0) {
+    if (g_rck_state.GpuCnt == 0) {
         std::cerr << "No GPUs initialized for tames generation" << std::endl;
         return false;
     }
 
     int Range = range_bits;
     int DP = dp_bits;
-    s_GenMode = true;  // Enable tames generation mode
+    g_rck_state.GenMode = true;  // Enable tames generation mode
 
     std::cout << "\n=== TAMES GENERATION MODE ===" << std::endl;
     std::cout << "Range: " << Range << " bits, DP: " << DP << std::endl;
@@ -690,10 +792,10 @@ bool RCKangarooManager::generate_tames(const std::string& filename, double max_o
     std::cout << "Max ops for tames: 2^" << log2(max_total_ops) << std::endl;
 
     // Initialize state
-    s_PntTotalOps = 0;
-    s_PntIndex = 0;
-    s_TotalErrors = 0;
-    s_Solved = false;
+    g_rck_state.PntTotalOps = 0;
+    g_rck_state.PntIndex = 0;
+    g_rck_state.TotalErrors = 0;
+    g_rck_state.Solved = false;
 
     // Use a fixed seed for reproducible tames generation
     // This allows tames files to be compatible across runs
@@ -704,31 +806,31 @@ bool RCKangarooManager::generate_tames(const std::string& filename, double max_o
     minjump.Set(1);
     minjump.ShiftLeft(Range / 2 + 3);
     for (int i = 0; i < JMP_CNT; i++) {
-        s_EcJumps1[i].dist = minjump;
+        g_rck_state.EcJumps1[i].dist = minjump;
         t.RndMax(minjump);
-        s_EcJumps1[i].dist.Add(t);
-        s_EcJumps1[i].dist.data[0] &= 0xFFFFFFFFFFFFFFFE;  // Must be even
-        s_EcJumps1[i].p = ec.MultiplyG(s_EcJumps1[i].dist);
+        g_rck_state.EcJumps1[i].dist.Add(t);
+        g_rck_state.EcJumps1[i].dist.data[0] &= 0xFFFFFFFFFFFFFFFE;  // Must be even
+        g_rck_state.EcJumps1[i].p = ec.MultiplyG(g_rck_state.EcJumps1[i].dist);
     }
 
     minjump.Set(1);
     minjump.ShiftLeft(Range - 10);
     for (int i = 0; i < JMP_CNT; i++) {
-        s_EcJumps2[i].dist = minjump;
+        g_rck_state.EcJumps2[i].dist = minjump;
         t.RndMax(minjump);
-        s_EcJumps2[i].dist.Add(t);
-        s_EcJumps2[i].dist.data[0] &= 0xFFFFFFFFFFFFFFFE;
-        s_EcJumps2[i].p = ec.MultiplyG(s_EcJumps2[i].dist);
+        g_rck_state.EcJumps2[i].dist.Add(t);
+        g_rck_state.EcJumps2[i].dist.data[0] &= 0xFFFFFFFFFFFFFFFE;
+        g_rck_state.EcJumps2[i].p = ec.MultiplyG(g_rck_state.EcJumps2[i].dist);
     }
 
     minjump.Set(1);
     minjump.ShiftLeft(Range - 10 - 2);
     for (int i = 0; i < JMP_CNT; i++) {
-        s_EcJumps3[i].dist = minjump;
+        g_rck_state.EcJumps3[i].dist = minjump;
         t.RndMax(minjump);
-        s_EcJumps3[i].dist.Add(t);
-        s_EcJumps3[i].dist.data[0] &= 0xFFFFFFFFFFFFFFFE;
-        s_EcJumps3[i].p = ec.MultiplyG(s_EcJumps3[i].dist);
+        g_rck_state.EcJumps3[i].dist.Add(t);
+        g_rck_state.EcJumps3[i].dist.data[0] &= 0xFFFFFFFFFFFFFFFE;
+        g_rck_state.EcJumps3[i].p = ec.MultiplyG(g_rck_state.EcJumps3[i].dist);
     }
 
     // Restore random seed for randomized starting points
@@ -739,9 +841,9 @@ bool RCKangarooManager::generate_tames(const std::string& filename, double max_o
 #endif
 
     // Set half range
-    s_Int_HalfRange.Set(1);
-    s_Int_HalfRange.ShiftLeft(Range - 1);
-    s_Pnt_HalfRange = ec.MultiplyG(s_Int_HalfRange);
+    g_rck_state.Int_HalfRange.Set(1);
+    g_rck_state.Int_HalfRange.ShiftLeft(Range - 1);
+    g_rck_state.Pnt_HalfRange = ec.MultiplyG(g_rck_state.Int_HalfRange);
 
     // For tames generation, we use the generator point G as the "target"
     // This creates tames that can be used for any public key in this range
@@ -749,33 +851,33 @@ bool RCKangarooManager::generate_tames(const std::string& filename, double max_o
     PntForTames.x.SetZero();
     PntForTames.y.SetZero();
     // Use a dummy point - tames are generated relative to halfrange
-    s_PntToSolve = s_Pnt_HalfRange;  // Use half range point as reference
+    g_rck_state.PntToSolve = g_rck_state.Pnt_HalfRange;  // Use half range point as reference
 
     // Prepare GPUs for tames generation
-    for (int i = 0; i < s_GpuCnt; i++) {
-        if (!s_GpuKangs[i]->Prepare(s_Pnt_HalfRange, Range, DP, s_EcJumps1, s_EcJumps2, s_EcJumps3)) {
-            s_GpuKangs[i]->Failed = true;
-            std::cerr << "GPU " << s_GpuKangs[i]->CudaIndex << " Prepare failed for tames generation" << std::endl;
+    for (int i = 0; i < g_rck_state.GpuCnt; i++) {
+        if (!g_rck_state.GpuKangs[i]->Prepare(g_rck_state.Pnt_HalfRange, Range, DP, g_rck_state.EcJumps1, g_rck_state.EcJumps2, g_rck_state.EcJumps3)) {
+            g_rck_state.GpuKangs[i]->Failed = true;
+            std::cerr << "GPU " << g_rck_state.GpuKangs[i]->CudaIndex << " Prepare failed for tames generation" << std::endl;
         }
     }
 
     auto start_time = std::chrono::steady_clock::now();
-    std::cout << "Starting tames generation on " << s_GpuCnt << " GPUs..." << std::endl;
+    std::cout << "Starting tames generation on " << g_rck_state.GpuCnt << " GPUs..." << std::endl;
 
     // Launch worker threads
 #ifdef _WIN32
     HANDLE thr_handles[MAX_GPU_CNT];
     u32 ThreadID;
-    s_ThrCnt = s_GpuCnt;
-    for (int i = 0; i < s_GpuCnt; i++) {
+    g_rck_state.ThrCnt = g_rck_state.GpuCnt;
+    for (int i = 0; i < g_rck_state.GpuCnt; i++) {
         thr_handles[i] = (HANDLE)_beginthreadex(NULL, 0, kang_thr_proc,
-                                                 (void*)s_GpuKangs[i], 0, &ThreadID);
+                                                 (void*)g_rck_state.GpuKangs[i], 0, &ThreadID);
     }
 #else
     pthread_t thr_handles[MAX_GPU_CNT];
-    s_ThrCnt = s_GpuCnt;
-    for (int i = 0; i < s_GpuCnt; i++) {
-        pthread_create(&thr_handles[i], NULL, kang_thr_proc, (void*)s_GpuKangs[i]);
+    g_rck_state.ThrCnt = g_rck_state.GpuCnt;
+    for (int i = 0; i < g_rck_state.GpuCnt; i++) {
+        pthread_create(&thr_handles[i], NULL, kang_thr_proc, (void*)g_rck_state.GpuKangs[i]);
     }
 #endif
 
@@ -787,7 +889,7 @@ bool RCKangarooManager::generate_tames(const std::string& filename, double max_o
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
         // Check if we've reached the operations limit
-        if (s_PntTotalOps >= static_cast<u64>(max_total_ops)) {
+        if (g_rck_state.PntTotalOps >= static_cast<u64>(max_total_ops)) {
             std::cout << "\nOperations limit reached, stopping..." << std::endl;
             break;
         }
@@ -795,32 +897,32 @@ bool RCKangarooManager::generate_tames(const std::string& filename, double max_o
         auto now = std::chrono::steady_clock::now();
         if (std::chrono::duration_cast<std::chrono::seconds>(now - last_stats).count() >= 10) {
             int speed = 0;
-            for (int i = 0; i < s_GpuCnt; i++) {
-                if (!s_GpuKangs[i]->Failed) {
-                    speed += s_GpuKangs[i]->GetStatsSpeed();
+            for (int i = 0; i < g_rck_state.GpuCnt; i++) {
+                if (!g_rck_state.GpuKangs[i]->Failed) {
+                    speed += g_rck_state.GpuKangs[i]->GetStatsSpeed();
                 }
             }
 
-            double progress = (static_cast<double>(s_PntTotalOps) / max_total_ops) * 100.0;
-            std::cout << "GEN: Speed: " << speed << " MKeys/s, DPs: " << s_db.GetBlockCnt()
-                      << ", Ops: 2^" << std::fixed << std::setprecision(2) << log2(static_cast<double>(s_PntTotalOps))
+            double progress = (static_cast<double>(g_rck_state.PntTotalOps) / max_total_ops) * 100.0;
+            std::cout << "GEN: Speed: " << speed << " MKeys/s, DPs: " << g_rck_state.db.GetBlockCnt()
+                      << ", Ops: 2^" << std::fixed << std::setprecision(2) << log2(static_cast<double>(g_rck_state.PntTotalOps))
                       << ", Progress: " << std::setprecision(1) << progress << "%" << std::endl;
             last_stats = now;
         }
     }
 
     // Stop workers
-    for (int i = 0; i < s_GpuCnt; i++)
-        s_GpuKangs[i]->Stop();
-    while (s_ThrCnt)
+    for (int i = 0; i < g_rck_state.GpuCnt; i++)
+        g_rck_state.GpuKangs[i]->Stop();
+    while (g_rck_state.ThrCnt)
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
     // Close thread handles
 #ifdef _WIN32
-    for (int i = 0; i < s_GpuCnt; i++)
+    for (int i = 0; i < g_rck_state.GpuCnt; i++)
         CloseHandle(thr_handles[i]);
 #else
-    for (int i = 0; i < s_GpuCnt; i++)
+    for (int i = 0; i < g_rck_state.GpuCnt; i++)
         pthread_join(thr_handles[i], NULL);
 #endif
 
@@ -829,24 +931,24 @@ bool RCKangarooManager::generate_tames(const std::string& filename, double max_o
 
     // Save tames to file
     std::cout << "\nSaving tames to " << filename << "..." << std::endl;
-    s_db.Header[0] = static_cast<u8>(Range);  // Store range in header for compatibility check
+    g_rck_state.db.Header[0] = static_cast<u8>(Range);  // Store range in header for compatibility check
 
     // Need to cast away const for the C-style API
     char* fn_cstr = const_cast<char*>(filename.c_str());
-    bool saved = s_db.SaveToFile(fn_cstr);
+    bool saved = g_rck_state.db.SaveToFile(fn_cstr);
 
     if (saved) {
         std::cout << "=== TAMES GENERATION COMPLETE ===" << std::endl;
-        std::cout << "Tames saved: " << s_db.GetBlockCnt() << std::endl;
-        std::cout << "Total ops: 2^" << log2(static_cast<double>(s_PntTotalOps)) << std::endl;
+        std::cout << "Tames saved: " << g_rck_state.db.GetBlockCnt() << std::endl;
+        std::cout << "Total ops: 2^" << log2(static_cast<double>(g_rck_state.PntTotalOps)) << std::endl;
         std::cout << "Time: " << std::setprecision(1) << elapsed << " seconds" << std::endl;
         std::cout << "File: " << filename << std::endl;
     } else {
         std::cerr << "ERROR: Failed to save tames to " << filename << std::endl;
     }
 
-    s_db.Clear();
-    s_GenMode = false;  // Reset generation mode
+    g_rck_state.db.Clear();
+    g_rck_state.GenMode = false;  // Reset generation mode
     return saved;
 }
 
@@ -859,14 +961,14 @@ RCKangarooResult RCKangarooManager::solve() {
         return result;
     }
 
-    if (s_GpuCnt == 0) {
+    if (g_rck_state.GpuCnt == 0) {
         std::cerr << "No GPUs initialized" << std::endl;
         return result;
     }
 
     int Range = range_bits;
     int DP = dp_bits;
-    s_GenMode = false;
+    g_rck_state.GenMode = false;
 
     std::cout << "\nSolving: Range " << Range << " bits, DP " << DP << std::endl;
     double ops = 1.15 * pow(2.0, Range / 2.0);
@@ -880,12 +982,12 @@ RCKangarooResult RCKangarooManager::solve() {
         PntOfs.y.NegModP();
         PntToSolve = ec.AddPoints(PntToSolve, PntOfs);
     }
-    s_PntToSolve = PntToSolve;
+    g_rck_state.PntToSolve = PntToSolve;
 
     // Initialize state
-    s_PntTotalOps = 0;
-    s_PntIndex = 0;
-    s_TotalErrors = 0;
+    g_rck_state.PntTotalOps = 0;
+    g_rck_state.PntIndex = 0;
+    g_rck_state.TotalErrors = 0;
 
 #ifdef COLLIDER_PRO
     // Reset opportunistic-bloom stats and arm the hit callback for this run.
@@ -896,9 +998,9 @@ RCKangarooResult RCKangarooManager::solve() {
         std::cout << "[Bloom] Opportunistic address checking enabled" << std::endl;
     }
 #endif
-    s_dp_callback = dp_callback;
+    g_rck_state.dp_callback = dp_callback;
 
-    s_Solved = false;
+    g_rck_state.Solved = false;
 
     // Prepare jump tables
     SetRndSeed(0);
@@ -906,31 +1008,31 @@ RCKangarooResult RCKangarooManager::solve() {
     minjump.Set(1);
     minjump.ShiftLeft(Range / 2 + 3);
     for (int i = 0; i < JMP_CNT; i++) {
-        s_EcJumps1[i].dist = minjump;
+        g_rck_state.EcJumps1[i].dist = minjump;
         t.RndMax(minjump);
-        s_EcJumps1[i].dist.Add(t);
-        s_EcJumps1[i].dist.data[0] &= 0xFFFFFFFFFFFFFFFE;
-        s_EcJumps1[i].p = ec.MultiplyG(s_EcJumps1[i].dist);
+        g_rck_state.EcJumps1[i].dist.Add(t);
+        g_rck_state.EcJumps1[i].dist.data[0] &= 0xFFFFFFFFFFFFFFFE;
+        g_rck_state.EcJumps1[i].p = ec.MultiplyG(g_rck_state.EcJumps1[i].dist);
     }
 
     minjump.Set(1);
     minjump.ShiftLeft(Range - 10);
     for (int i = 0; i < JMP_CNT; i++) {
-        s_EcJumps2[i].dist = minjump;
+        g_rck_state.EcJumps2[i].dist = minjump;
         t.RndMax(minjump);
-        s_EcJumps2[i].dist.Add(t);
-        s_EcJumps2[i].dist.data[0] &= 0xFFFFFFFFFFFFFFFE;
-        s_EcJumps2[i].p = ec.MultiplyG(s_EcJumps2[i].dist);
+        g_rck_state.EcJumps2[i].dist.Add(t);
+        g_rck_state.EcJumps2[i].dist.data[0] &= 0xFFFFFFFFFFFFFFFE;
+        g_rck_state.EcJumps2[i].p = ec.MultiplyG(g_rck_state.EcJumps2[i].dist);
     }
 
     minjump.Set(1);
     minjump.ShiftLeft(Range - 10 - 2);
     for (int i = 0; i < JMP_CNT; i++) {
-        s_EcJumps3[i].dist = minjump;
+        g_rck_state.EcJumps3[i].dist = minjump;
         t.RndMax(minjump);
-        s_EcJumps3[i].dist.Add(t);
-        s_EcJumps3[i].dist.data[0] &= 0xFFFFFFFFFFFFFFFE;
-        s_EcJumps3[i].p = ec.MultiplyG(s_EcJumps3[i].dist);
+        g_rck_state.EcJumps3[i].dist.Add(t);
+        g_rck_state.EcJumps3[i].dist.data[0] &= 0xFFFFFFFFFFFFFFFE;
+        g_rck_state.EcJumps3[i].p = ec.MultiplyG(g_rck_state.EcJumps3[i].dist);
     }
 
 #ifdef _WIN32
@@ -940,22 +1042,22 @@ RCKangarooResult RCKangarooManager::solve() {
 #endif
 
     // Set half range
-    s_Int_HalfRange.Set(1);
-    s_Int_HalfRange.ShiftLeft(Range - 1);
-    s_Pnt_HalfRange = ec.MultiplyG(s_Int_HalfRange);
+    g_rck_state.Int_HalfRange.Set(1);
+    g_rck_state.Int_HalfRange.ShiftLeft(Range - 1);
+    g_rck_state.Pnt_HalfRange = ec.MultiplyG(g_rck_state.Int_HalfRange);
 
     // Prepare GPUs
-    for (int i = 0; i < s_GpuCnt; i++) {
+    for (int i = 0; i < g_rck_state.GpuCnt; i++) {
         // v1.5: propagate the asymmetric kangaroo mode chosen by the
         // caller (pool runtime) to each per-GPU RCGpuKang BEFORE its
         // Prepare() runs. Prepare() snapshots Mode into Kparams.Mode
         // and configures TAME_ONLY / WILD_ONLY starting points + kernel
         // dispatch. Default (mode == KANG_MODE_BOTH == 0) preserves
         // upstream behavior for the standalone solver.
-        s_GpuKangs[i]->Mode = mode;
-        if (!s_GpuKangs[i]->Prepare(PntToSolve, Range, DP, s_EcJumps1, s_EcJumps2, s_EcJumps3)) {
-            s_GpuKangs[i]->Failed = true;
-            std::cerr << "GPU " << s_GpuKangs[i]->CudaIndex << " Prepare failed" << std::endl;
+        g_rck_state.GpuKangs[i]->Mode = mode;
+        if (!g_rck_state.GpuKangs[i]->Prepare(PntToSolve, Range, DP, g_rck_state.EcJumps1, g_rck_state.EcJumps2, g_rck_state.EcJumps3)) {
+            g_rck_state.GpuKangs[i]->Failed = true;
+            std::cerr << "GPU " << g_rck_state.GpuKangs[i]->CudaIndex << " Prepare failed" << std::endl;
         }
     }
 
@@ -966,17 +1068,17 @@ RCKangarooResult RCKangarooManager::solve() {
     // file-pointer hooks; the actual file I/O happens outside solve()
     // in request_save_on_stop / save_herd_state / load_herd_state.
     if (impl_->load_armed) {
-        for (int i = 0; i < s_GpuCnt; i++) {
-            const int kc = s_GpuKangs[i]->KangCnt;
+        for (int i = 0; i < g_rck_state.GpuCnt; i++) {
+            const int kc = g_rck_state.GpuKangs[i]->KangCnt;
             if (i >= static_cast<int>(impl_->load_bufs.size())) break;
             if (impl_->load_bufs[i].size() == static_cast<size_t>(kc) * 96) {
-                s_GpuKangs[i]->InitKangsHost = impl_->load_bufs[i].data();
+                g_rck_state.GpuKangs[i]->InitKangsHost = impl_->load_bufs[i].data();
             } else {
                 std::cerr << "[!] RCKangaroo: load buffer size mismatch on GPU "
                           << i << " (expected " << (kc * 96)
                           << ", got " << impl_->load_bufs[i].size() << "). "
                              "Falling back to random init for this GPU.\n";
-                s_GpuKangs[i]->InitKangsHost = nullptr;
+                g_rck_state.GpuKangs[i]->InitKangsHost = nullptr;
             }
         }
     }
@@ -985,11 +1087,11 @@ RCKangarooResult RCKangarooManager::solve() {
         // KangCnt depends on its mpCnt and IsOldGpu, so they may differ
         // across heterogeneous configurations; size each buffer
         // independently rather than assuming uniformity.
-        impl_->save_bufs.resize(s_GpuCnt);
-        for (int i = 0; i < s_GpuCnt; i++) {
-            const int kc = s_GpuKangs[i]->KangCnt;
+        impl_->save_bufs.resize(g_rck_state.GpuCnt);
+        for (int i = 0; i < g_rck_state.GpuCnt; i++) {
+            const int kc = g_rck_state.GpuKangs[i]->KangCnt;
             impl_->save_bufs[i].assign(static_cast<size_t>(kc) * 96, 0);
-            s_GpuKangs[i]->SaveKangsHost = impl_->save_bufs[i].data();
+            g_rck_state.GpuKangs[i]->SaveKangsHost = impl_->save_bufs[i].data();
         }
     }
     // Capture the config parameters that go into the on-disk fingerprint.
@@ -1006,20 +1108,33 @@ RCKangarooResult RCKangarooManager::solve() {
     auto start_time = std::chrono::steady_clock::now();
     std::cout << "GPUs started..." << std::endl;
 
+#ifdef COLLIDER_CHECKPOINT_CAPTURE
+    // v1.5.5 checkpoint-replay (task #9): arm the device capture window at base
+    // 0 (first checkpoint_window_size() global kangaroo indices) and publish
+    // this manager + the window size so CheckNewPoints can read back each
+    // captured kangaroo's chain at DP harvest. Armed AFTER Prepare (KangCnt
+    // final) and BEFORE the worker threads launch, exactly like the herd-save
+    // hooks above. The capture is a validated read-only side channel (RTX 3060,
+    // 2026-06-04); it does not alter the walk. Disarmed after the workers join.
+    enable_checkpoint_capture(0);
+    g_active_capture_mgr = this;
+    g_capture_window_size = checkpoint_window_size();
+#endif
+
     // Launch worker threads
 #ifdef _WIN32
     HANDLE thr_handles[MAX_GPU_CNT];
     u32 ThreadID;
-    s_ThrCnt = s_GpuCnt;
-    for (int i = 0; i < s_GpuCnt; i++) {
+    g_rck_state.ThrCnt = g_rck_state.GpuCnt;
+    for (int i = 0; i < g_rck_state.GpuCnt; i++) {
         thr_handles[i] = (HANDLE)_beginthreadex(NULL, 0, kang_thr_proc,
-                                                 (void*)s_GpuKangs[i], 0, &ThreadID);
+                                                 (void*)g_rck_state.GpuKangs[i], 0, &ThreadID);
     }
 #else
     pthread_t thr_handles[MAX_GPU_CNT];
-    s_ThrCnt = s_GpuCnt;
-    for (int i = 0; i < s_GpuCnt; i++) {
-        pthread_create(&thr_handles[i], NULL, kang_thr_proc, (void*)s_GpuKangs[i]);
+    g_rck_state.ThrCnt = g_rck_state.GpuCnt;
+    for (int i = 0; i < g_rck_state.GpuCnt; i++) {
+        pthread_create(&thr_handles[i], NULL, kang_thr_proc, (void*)g_rck_state.GpuKangs[i]);
     }
 #endif
 
@@ -1035,7 +1150,7 @@ RCKangarooResult RCKangarooManager::solve() {
     //     its 10 s cadence so unattended CLI runs don't spam.
     auto last_progress = std::chrono::steady_clock::now();
     auto last_stdout   = last_progress;
-    while (!s_Solved && !stop_flag.load()) {
+    while (!g_rck_state.Solved && !stop_flag.load()) {
         CheckNewPoints();
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
@@ -1049,16 +1164,16 @@ RCKangarooResult RCKangarooManager::solve() {
 
         if (progress_due || stdout_due) {
             int speed = 0;
-            for (int i = 0; i < s_GpuCnt; i++) {
+            for (int i = 0; i < g_rck_state.GpuCnt; i++) {
                 // Only query speed from GPUs that haven't failed
-                if (!s_GpuKangs[i]->Failed) {
-                    speed += s_GpuKangs[i]->GetStatsSpeed();
+                if (!g_rck_state.GpuKangs[i]->Failed) {
+                    speed += g_rck_state.GpuKangs[i]->GetStatsSpeed();
                 }
             }
             impl_->current_speed = speed;
 
             if (progress_due && progress_callback) {
-                if (!progress_callback(s_PntTotalOps, s_db.GetBlockCnt(), speed)) {
+                if (!progress_callback(g_rck_state.PntTotalOps, g_rck_state.db.GetBlockCnt(), speed)) {
                     stop_flag.store(true);
                 }
                 last_progress = now;
@@ -1075,8 +1190,8 @@ RCKangarooResult RCKangarooManager::solve() {
                 } else {
                     speed_str = std::to_string(speed) + " MKeys/s";
                 }
-                std::cout << "Speed: " << speed_str << ", Err: " << s_TotalErrors
-                          << ", DPs: " << s_db.GetBlockCnt() << "/" << est_dps_cnt
+                std::cout << "Speed: " << speed_str << ", Err: " << g_rck_state.TotalErrors
+                          << ", DPs: " << g_rck_state.db.GetBlockCnt() << "/" << est_dps_cnt
                           << std::endl;
             }
             if (stdout_due) last_stdout = now;
@@ -1084,26 +1199,36 @@ RCKangarooResult RCKangarooManager::solve() {
     }
 
     // Stop workers
-    for (int i = 0; i < s_GpuCnt; i++)
-        s_GpuKangs[i]->Stop();
-    while (s_ThrCnt)
+    for (int i = 0; i < g_rck_state.GpuCnt; i++)
+        g_rck_state.GpuKangs[i]->Stop();
+    while (g_rck_state.ThrCnt)
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
     // Close thread handles
 #ifdef _WIN32
-    for (int i = 0; i < s_GpuCnt; i++)
+    for (int i = 0; i < g_rck_state.GpuCnt; i++)
         CloseHandle(thr_handles[i]);
 #else
-    for (int i = 0; i < s_GpuCnt; i++)
+    for (int i = 0; i < g_rck_state.GpuCnt; i++)
         pthread_join(thr_handles[i], NULL);
+#endif
+
+#ifdef COLLIDER_CHECKPOINT_CAPTURE
+    // v1.5.5: workers have joined and the main loop's final CheckNewPoints has
+    // already run, so no reader of the capture statics remains. Clear them and
+    // disarm the device window before returning. (solve() path only; the
+    // GenMode tame-generation loop never exports DPs to the pool.)
+    g_active_capture_mgr = nullptr;
+    g_capture_window_size = 0;
+    disable_checkpoint_capture();
 #endif
 
     auto end_time = std::chrono::steady_clock::now();
     result.elapsed_seconds = std::chrono::duration<double>(end_time - start_time).count();
-    result.total_ops = s_PntTotalOps;
-    result.dp_count = s_db.GetBlockCnt();
-    result.error_count = s_TotalErrors;
-    result.k_value = (double)s_PntTotalOps / pow(2.0, Range / 2.0);
+    result.total_ops = g_rck_state.PntTotalOps;
+    result.dp_count = g_rck_state.db.GetBlockCnt();
+    result.error_count = g_rck_state.TotalErrors;
+    result.k_value = (double)g_rck_state.PntTotalOps / pow(2.0, Range / 2.0);
 
 #ifdef COLLIDER_PRO
     // Copy opportunistic-bloom results out of the Pro-only bloom TU.
@@ -1116,20 +1241,20 @@ RCKangarooResult RCKangarooManager::solve() {
     }
 #endif
 
-    if (s_Solved) {
+    if (g_rck_state.Solved) {
         // Apply start offset
         if (impl_->start_set) {
-            s_PrivKey.Add(impl_->start_offset);
+            g_rck_state.PrivKey.Add(impl_->start_offset);
         }
 
         // Verify solution
-        EcPoint verify = ec.MultiplyG(s_PrivKey);
+        EcPoint verify = ec.MultiplyG(g_rck_state.PrivKey);
         if (verify.IsEqual(impl_->target_pubkey)) {
             result.found = true;
-            memcpy(result.private_key.data(), s_PrivKey.data, 32);
+            memcpy(result.private_key.data(), g_rck_state.PrivKey.data, 32);
 
             char hex[100];
-            s_PrivKey.GetHexStr(hex);
+            g_rck_state.PrivKey.GetHexStr(hex);
             std::cout << "\n+============================================================+\n"
                       << "|                      PUZZLE SOLVED!                        |\n"
                       << "+============================================================+\n"
@@ -1140,7 +1265,7 @@ RCKangarooResult RCKangarooManager::solve() {
         }
     }
 
-    s_db.Clear();
+    g_rck_state.db.Clear();
     return result;
 }
 
@@ -1245,7 +1370,7 @@ void compute_config_hash(const std::string& pubkey_hex,
 }  // namespace
 
 bool RCKangarooManager::request_save_on_stop() {
-    if (s_GpuCnt == 0) {
+    if (g_rck_state.GpuCnt == 0) {
         std::cerr << "[!] RCKangaroo: request_save_on_stop called before "
                      "init(); ignored.\n";
         return false;
@@ -1255,13 +1380,13 @@ bool RCKangarooManager::request_save_on_stop() {
 }
 
 bool RCKangarooManager::save_herd_state(const std::string& path) {
-    if (s_GpuCnt == 0) return false;
+    if (g_rck_state.GpuCnt == 0) return false;
     if (!impl_->save_armed) {
         std::cerr << "[!] RCKangaroo: save_herd_state called without prior "
                      "request_save_on_stop(); nothing to write.\n";
         return false;
     }
-    if (impl_->save_bufs.size() != static_cast<size_t>(s_GpuCnt)) {
+    if (impl_->save_bufs.size() != static_cast<size_t>(g_rck_state.GpuCnt)) {
         // solve() never ran to completion; save buffers are not populated.
         return false;
     }
@@ -1269,8 +1394,8 @@ bool RCKangarooManager::save_herd_state(const std::string& path) {
     // Validate every per-GPU buffer is properly sized. A zero-size buffer
     // indicates the GPU was marked Failed during Prepare and the patch's
     // save hook never fired.
-    for (int i = 0; i < s_GpuCnt; i++) {
-        const int kc = s_GpuKangs[i]->KangCnt;
+    for (int i = 0; i < g_rck_state.GpuCnt; i++) {
+        const int kc = g_rck_state.GpuKangs[i]->KangCnt;
         if (impl_->save_bufs[i].size() != static_cast<size_t>(kc) * kRckBytesPerKangaroo) {
             std::cerr << "[!] RCKangaroo: save buffer for GPU " << i
                       << " has unexpected size; aborting save.\n";
@@ -1330,8 +1455,8 @@ bool RCKangarooManager::save_herd_state(const std::string& path) {
     }
     uint8_t hdr_nums[20];
     write_u32_le(hdr_nums + 0,  kRckHerdVersion);
-    write_u32_le(hdr_nums + 4,  static_cast<uint32_t>(s_GpuCnt));
-    write_u32_le(hdr_nums + 8,  static_cast<uint32_t>(s_GpuKangs[0]->KangCnt));
+    write_u32_le(hdr_nums + 4,  static_cast<uint32_t>(g_rck_state.GpuCnt));
+    write_u32_le(hdr_nums + 8,  static_cast<uint32_t>(g_rck_state.GpuKangs[0]->KangCnt));
     write_u32_le(hdr_nums + 12, static_cast<uint32_t>(impl_->saved_range_bits));
     write_u32_le(hdr_nums + 16, static_cast<uint32_t>(impl_->saved_dp_bits));
     if (std::fwrite(hdr_nums, 1, sizeof(hdr_nums), fp) != sizeof(hdr_nums)) {
@@ -1345,9 +1470,9 @@ bool RCKangarooManager::save_herd_state(const std::string& path) {
     }
 
     // Per-GPU body.
-    for (int i = 0; i < s_GpuCnt; i++) {
+    for (int i = 0; i < g_rck_state.GpuCnt; i++) {
         uint8_t gpu_hdr[8];
-        write_u32_le(gpu_hdr + 0, static_cast<uint32_t>(s_GpuKangs[i]->CudaIndex));
+        write_u32_le(gpu_hdr + 0, static_cast<uint32_t>(g_rck_state.GpuKangs[i]->CudaIndex));
         write_u32_le(gpu_hdr + 4, 0);  // reserved
         if (std::fwrite(gpu_hdr, 1, sizeof(gpu_hdr), fp) != sizeof(gpu_hdr)) {
             return unwind("gpu header write");
@@ -1418,15 +1543,15 @@ bool RCKangarooManager::save_herd_state(const std::string& path) {
     // Clear the SaveKangsHost pointers so a subsequent solve() without
     // a fresh request_save_on_stop() does not silently overwrite the
     // buffers (they are still owned by impl_ but the hooks are off).
-    for (int i = 0; i < s_GpuCnt; i++) {
-        s_GpuKangs[i]->SaveKangsHost = nullptr;
+    for (int i = 0; i < g_rck_state.GpuCnt; i++) {
+        g_rck_state.GpuKangs[i]->SaveKangsHost = nullptr;
     }
     impl_->save_armed = false;
     return true;
 }
 
 bool RCKangarooManager::load_herd_state(const std::string& path) {
-    if (s_GpuCnt == 0) {
+    if (g_rck_state.GpuCnt == 0) {
         std::cerr << "[!] RCKangaroo: load_herd_state called before init(); "
                      "ignoring.\n";
         return false;
@@ -1460,15 +1585,15 @@ bool RCKangarooManager::load_herd_state(const std::string& path) {
                   << " unsupported (expected " << kRckHerdVersion << ").\n";
         std::fclose(fp); return false;
     }
-    if (file_gpus != static_cast<uint32_t>(s_GpuCnt)) {
+    if (file_gpus != static_cast<uint32_t>(g_rck_state.GpuCnt)) {
         std::cerr << "[!] RCKangaroo: checkpoint has " << file_gpus
-                  << " GPUs but current run has " << s_GpuCnt
+                  << " GPUs but current run has " << g_rck_state.GpuCnt
                   << "; refusing to load.\n";
         std::fclose(fp); return false;
     }
-    if (file_kang_cnt != static_cast<uint32_t>(s_GpuKangs[0]->KangCnt)) {
+    if (file_kang_cnt != static_cast<uint32_t>(g_rck_state.GpuKangs[0]->KangCnt)) {
         std::cerr << "[!] RCKangaroo: checkpoint KangCnt " << file_kang_cnt
-                  << " does not match current " << s_GpuKangs[0]->KangCnt
+                  << " does not match current " << g_rck_state.GpuKangs[0]->KangCnt
                   << " (GPU model change?); refusing to load.\n";
         std::fclose(fp); return false;
     }
@@ -1502,15 +1627,15 @@ bool RCKangarooManager::load_herd_state(const std::string& path) {
     }
 
     // Per-GPU body.
-    impl_->load_bufs.assign(s_GpuCnt, std::vector<uint8_t>{});
-    for (int i = 0; i < s_GpuCnt; i++) {
+    impl_->load_bufs.assign(g_rck_state.GpuCnt, std::vector<uint8_t>{});
+    for (int i = 0; i < g_rck_state.GpuCnt; i++) {
         uint8_t gpu_hdr[8];
         if (std::fread(gpu_hdr, 1, sizeof(gpu_hdr), fp) != sizeof(gpu_hdr)) {
             std::fclose(fp); return false;
         }
         // cuda_index in gpu_hdr is informational; GPU renumbering between
         // runs is tolerated (the order in the file is the order they
-        // appear in s_GpuKangs).
+        // appear in g_rck_state.GpuKangs).
 
         const size_t body_size = static_cast<size_t>(file_kang_cnt)
                                  * kRckBytesPerKangaroo;
@@ -1546,6 +1671,128 @@ bool hex_to_private_key(const std::string& hex, std::array<uint64_t, 4>& key) {
     }
     return true;
 }
+
+// ============================================================================
+// v1.5.5 checkpoint-replay capture (task #9). HARDWARE-VALIDATED.
+//
+// The device-side per-kangaroo checkpoint capture is implemented in
+// third_party/RCKangaroo/RCGpuCore.cu under COLLIDER_CHECKPOINT_CAPTURE:
+// KernelB records each kangaroo's walk DISTANCE (signed 192-bit) + the L1S2
+// loop-state bit every CHECKPOINT_INTERVAL (65536) jumps into a per-kangaroo
+// device ring, for a fixed window [base, base+CHK_MAX_KANG) of global kangaroo
+// indices. BuildDP tags each DP with its producing kangaroo's global index
+// (byte offset 60 of the 64-byte GPU DP record). The host arms the capture
+// window, and on a DP from a captured kangaroo reads back that kangaroo's
+// ordered checkpoint chain.
+//
+// VALIDATED on an RTX 3060 (2026-06-04) by tests/test_checkpoint_capture.cu:
+// for loop-free kangaroos the captured chain (distance + L1S2 bit) reproduces
+// the canonical CPU walk (src/core/checkpoint_walk.hpp ==
+// collision-protocol/src/checkpoint_replay.py) byte-for-byte over a full
+// 65536-jump segment. Measured jmp3 loop-escape (KernelC) incidence
+// ~0.17%/segment; such segments are NOT modeled by the server's pure
+// jmp1/jmp2 replay, so the capture exposes a per-kangaroo loop-escape count
+// and the caller MUST exclude loop-escape walks from the committed/
+// challengeable set (the server runs challenge_mode="shadow", logging not
+// banning, until that exclusion is soaked).
+
+#ifdef COLLIDER_CHECKPOINT_CAPTURE
+// Device-side capture helpers (RCGpuCore.cu, COLLIDER_CHECKPOINT_CAPTURE).
+extern "C" void ckpt_enable_capture(unsigned int base);
+extern "C" void ckpt_disable_capture();
+extern "C" unsigned int ckpt_interval();
+extern "C" unsigned int ckpt_max_kang();
+extern "C" unsigned int ckpt_max_cp();
+extern "C" unsigned int ckpt_readback_slot(unsigned int slot,
+                                           unsigned long long* dist_out,
+                                           unsigned char* l1s2_out,
+                                           unsigned int* loopesc_out);
+
+namespace {
+
+// Reduce a GPU signed 192-bit distance (3 little-endian u64) mod n into a
+// 32-byte big-endian Distance (the Merkle leaf / on-wire form), exactly as the
+// validated test does and as the server's reconstruct_checkpoint_point expects
+// (distance mod n). A "negative" birth-relative distance (top bit of the
+// 192-bit word set) maps to (value - 2^192) mod n.
+::collider::checkpoint_commit::Distance gpu_dist_to_be_mod_n(
+        const unsigned long long d3[3]) {
+    using ::collider::cpu::uint256_t;
+    const uint256_t& n = ::collider::cpu::SECP256K1_N;
+    const bool negative = (d3[2] >> 63) != 0;
+    uint256_t v; v.d[0] = d3[0]; v.d[1] = d3[1]; v.d[2] = d3[2]; v.d[3] = 0;
+    uint256_t res;
+    if (!negative) {
+        res = v;
+        while (res >= n) { uint256_t r; ::collider::cpu::sub256(r, res, n); res = r; }
+    } else {
+        uint256_t two192; two192.d[0] = 0; two192.d[1] = 0; two192.d[2] = 0; two192.d[3] = 1;
+        while (two192 >= n) { uint256_t r; ::collider::cpu::sub256(r, two192, n); two192 = r; }
+        uint256_t vmod = v;
+        while (vmod >= n) { uint256_t r; ::collider::cpu::sub256(r, vmod, n); vmod = r; }
+        uint64_t borrow = ::collider::cpu::sub256(res, vmod, two192);
+        if (borrow) { uint256_t r; ::collider::cpu::add256(r, res, n); res = r; }
+    }
+    ::collider::checkpoint_commit::Distance out{};
+    for (int limb = 0; limb < 4; ++limb) {
+        const uint64_t lv = res.d[limb];
+        uint8_t* p = out.data() + (3 - limb) * 8;
+        for (int b = 0; b < 8; ++b)
+            p[b] = static_cast<uint8_t>((lv >> (8 * (7 - b))) & 0xFF);
+    }
+    return out;
+}
+
+}  // namespace
+
+// Arm/disarm the device capture window. Default base 0 captures the first
+// CHK_MAX_KANG global kangaroo indices; the DP tag (byte 60) tells the host
+// which captured slot a DP came from.
+void RCKangarooManager::enable_checkpoint_capture(uint32_t base) {
+    ckpt_enable_capture(base);
+}
+void RCKangarooManager::disable_checkpoint_capture() {
+    ckpt_disable_capture();
+}
+
+// Read back the ordered checkpoint chain for a captured kangaroo `slot`
+// (0-based within the armed window). Returns true and fills `out` iff the
+// kangaroo has >= 2 checkpoints (>= one full segment), the birth L1S2 bit is 0,
+// and it hit ZERO loop-escapes (so every committed segment replays cleanly
+// under the server's pure jmp1/jmp2 walk). A loop-escape walk returns false:
+// the caller must NOT commit it. The distances are reduced mod n and encoded
+// big-endian, ready for checkpoint_commit::build_root.
+bool RCKangarooManager::read_checkpoint_chain(
+        uint32_t slot,
+        std::vector<::collider::checkpoint_commit::Distance>& out,
+        std::vector<uint8_t>& l1s2_out) const {
+    out.clear();
+    l1s2_out.clear();
+    const unsigned max_cp = ckpt_max_cp();
+    std::vector<unsigned long long> dist(static_cast<size_t>(max_cp) * 3);
+    std::vector<unsigned char> l1s2(max_cp);
+    unsigned loopesc = 0;
+    unsigned cnt = ckpt_readback_slot(slot, dist.data(), l1s2.data(), &loopesc);
+    if (cnt < 2) return false;       // need birth + >= 1 full segment
+    if (loopesc != 0) return false;  // loop-escape: not server-replayable
+    if (l1s2[0] != 0) return false;  // birth must enter at l1s2 == 0
+    out.reserve(cnt);
+    l1s2_out.reserve(cnt);
+    for (unsigned cp = 0; cp < cnt; ++cp) {
+        out.push_back(gpu_dist_to_be_mod_n(&dist[static_cast<size_t>(cp) * 3]));
+        l1s2_out.push_back(l1s2[cp]);
+    }
+    return true;
+}
+
+uint32_t RCKangarooManager::checkpoint_window_size() { return ckpt_max_kang(); }
+uint32_t RCKangarooManager::checkpoint_interval()    { return ckpt_interval(); }
+bool RCKangarooManager::checkpoint_capture_built()   { return true; }
+#else
+uint32_t RCKangarooManager::checkpoint_window_size() { return 0; }
+uint32_t RCKangarooManager::checkpoint_interval()    { return 0; }
+bool RCKangarooManager::checkpoint_capture_built()   { return false; }
+#endif  // COLLIDER_CHECKPOINT_CAPTURE
 
 }  // namespace gpu
 }  // namespace collider

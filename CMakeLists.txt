@@ -101,6 +101,30 @@ option(COLLIDER_BUILD_TESTS      "Build tests"      ${_collider_default_tests})
 option(COLLIDER_BUILD_BENCHMARKS "Build benchmarks" ${_collider_default_bench})
 option(COLLIDER_BUILD_TOOLS      "Build CLI tools"  ${_collider_default_tools})
 
+# Task #7 walk-step validation: when ON, KernelA captures a single kangaroo's
+# ground-truth walk so scripts/validate_walkstep_trace.py can cross-check the
+# server's checkpoint_replay.walk_step against real silicon. OFF for releases
+# (the shipped kernel carries no debug capture). Enable with
+# -DCOLLIDER_WALKSTEP_TRACE=ON, rebuild test_kangaroo_mode_asymmetric, run it.
+option(COLLIDER_WALKSTEP_TRACE "Build the KernelA walk-step debug trace capture" OFF)
+if(COLLIDER_WALKSTEP_TRACE)
+  add_compile_definitions(COLLIDER_WALKSTEP_TRACE)
+endif()
+
+# Task #9 per-kangaroo checkpoint capture: when ON, KernelB records each
+# kangaroo's walk distance every CHECKPOINT_INTERVAL jumps (+ the L1S2 bit)
+# into a per-kangaroo device ring the host reads back, so the client can emit
+# real DP_BATCH_V3 checkpoint commitments and answer challenges. The device
+# branch is fully gated behind a runtime enable (g_ckpt_on) so when the
+# capture is not armed the hot KernelB loop pays only a single predicated
+# load. Default ON for Pro (this is the anti-cheat capture path, not a debug
+# aid); the validation test test_checkpoint_capture asserts the captured chain
+# reproduces the canonical CPU walk byte-for-byte on real hardware.
+option(COLLIDER_CHECKPOINT_CAPTURE "Build the per-kangaroo checkpoint capture (anti-cheat V3 emit)" ${COLLIDER_PRO})
+if(COLLIDER_CHECKPOINT_CAPTURE)
+  add_compile_definitions(COLLIDER_CHECKPOINT_CAPTURE)
+endif()
+
 # Friendly alias support: accept the more-natural BUILD_TESTS / BUILD_BENCHMARKS
 # / BUILD_TOOLS spellings and forward them to the COLLIDER_-prefixed canonical
 # options. Without this, `cmake -DBUILD_TESTS=OFF ..` silently no-ops with a
@@ -747,6 +771,7 @@ if(COLLIDER_PRO)
     # address against the loaded bloom filter. Pro-only; selected via
     # --bip-scan on the CLI.
     list(APPEND CORE_SOURCES src/runtime/bip_scanner_runner.cpp)
+    list(APPEND CORE_SOURCES src/runtime/bip_addr_kind.cpp)
     # GPU dispatcher for BIP scan: routes derived priv keys through
     # the existing MultiAddressSession kernel (secp256k1 + hash160 +
     # bloom probe) so the per-pubkey work runs on GPU instead of CPU.
@@ -839,6 +864,8 @@ if(COLLIDER_PRO)
         src/ui/tui/menu/main_menu.cpp
         # TR-1-full: TUI mode-config modals (BIP confirm + puzzle picker).
         src/ui/tui/menu/mode_config.cpp
+        # v1.5.5: wordlist generator screen + pure generation engine.
+        src/ui/tui/menu/wordlist_generator.cpp
         # Phase 1..3 widgets (builder-panels)
         src/ui/tui/widgets/sparkline.cpp
         src/ui/tui/widgets/progress_bar.cpp
@@ -917,6 +944,24 @@ if(CORE_SOURCES)
     # the same headers transitively without listing collider_tui again.
     if(COLLIDER_PRO AND TARGET collider_tui)
         target_link_libraries(collider_core collider_tui)
+    endif()
+    if(NOT COLLIDER_PRO)
+        # Free build: the formerly-free solver TUs (pool_solver.cpp,
+        # puzzle_solver*.cpp) include ui/tui/* headers unguarded. The real
+        # headers pull FTXUI (only linked into collider_core under Pro) and
+        # reference tui .cpp symbols (only compiled under Pro), so a plain
+        # in-tree COLLIDER_PRO=OFF build cannot compile or link them. Resolve
+        # those includes to the ftxui-free no-op stubs in
+        # scripts/templates/free_stubs/ instead -- the SAME stubs
+        # sync-to-free.sh installs at the real paths in the public repo.
+        # Prepending the stub root makes the in-tree free build (build_free.bat
+        # and the CI FREE job) compile + link identically to the public free
+        # build. PUBLIC so the collider executable target inherits the search
+        # path for its own TUs. In the public tree this stub root is stripped,
+        # but the real header paths already hold the stubs there, so the now
+        # absent include dir is simply ignored.
+        target_include_directories(collider_core BEFORE PUBLIC
+            ${CMAKE_SOURCE_DIR}/scripts/templates/free_stubs/src)
     endif()
     # session_log.cpp's Windows crash filter uses StackWalk64 + SymFromAddr
     # from dbghelp.dll. The library is part of the Windows SDK so no
@@ -1153,6 +1198,26 @@ if(COLLIDER_BACKEND STREQUAL "CUDA")
     # Add RCKangaroo wrapper if enabled
     if(COLLIDER_USE_RCKANGAROO AND TARGET rckangaroo)
         list(APPEND GPU_SOURCES src/gpu/rckangaroo_wrapper.cu)
+        # Pro-only opportunistic bloom address checking for the kangaroo
+        # walk. Holds ALL bloom source (BloomFilter, CPU hash160, the bloom
+        # statics, check/probe logic, BloomHit) so the shared wrapper above
+        # ships zero bloom symbols to Free. Depends on RCKangaroo's EC
+        # primitives (Ec.h), so it is gated on RCKangaroo being present in
+        # addition to COLLIDER_PRO; the wrapper calls into it only under
+        # #ifdef COLLIDER_PRO. Excluded from the Free repo via PRO_PATHS in
+        # scripts/sync-to-free.sh.
+        # Gate on file presence ONLY (mirrors the v2/bip Pro-only sources
+        # above), NOT on the COLLIDER_PRO cmake var. The file is present in
+        # the Pro tree and sync-stripped from the Free repo (PRO_PATHS), so
+        # presence == Pro. Relying on COLLIDER_PRO here regressed: the Pro CI
+        # build passes -DCOLLIDER_PRO=ON yet this clause evaluated false,
+        # dropping the TU and leaving rckangaroo_wrapper's #ifdef COLLIDER_PRO
+        # bloom hooks unresolved at link. rckangaroo_bloom.cu is only ever
+        # compiled in a Pro tree (where COLLIDER_PRO=1 is defined), so the
+        # wrapper's references always resolve.
+        if(EXISTS "${CMAKE_SOURCE_DIR}/src/gpu/rckangaroo_bloom.cu")
+            list(APPEND GPU_SOURCES src/gpu/rckangaroo_bloom.cu)
+        endif()
         # CUDA IKangarooBackend adapter; only compiled with RCKangaroo
         # active. Lives in collider_gpu (rather than collider_core)
         # because it #include's rckangaroo_wrapper.hpp; that keeps the
@@ -1244,6 +1309,16 @@ if(COLLIDER_BUILD_TOOLS)
                 Threads::Threads
             )
         endif()
+    endif()
+
+    # Candidate-generation tool: materialize a PassphraseSource strategy (corpus
+    # n-grams, PRINCE, OMEN, brainwallet transforms, keyboard walks) to a wordlist
+    # the scanner consumes via --wordlist. Bridges the programmatic generators
+    # into the file-based brain-wallet scan path.
+    if(EXISTS "${CMAKE_SOURCE_DIR}/src/tools/gen_candidates.cpp" AND TARGET collider_core)
+        add_executable(gen_candidates src/tools/gen_candidates.cpp)
+        target_link_libraries(gen_candidates collider_core Threads::Threads)
+        target_include_directories(gen_candidates PRIVATE ${CMAKE_SOURCE_DIR})
     endif()
 
     # B1 wire-v4: keygen tool. Generates a fresh secp256k1 worker
@@ -1426,6 +1501,27 @@ if(COLLIDER_BUILD_TESTS)
         add_executable(test_challenge_response tests/test_challenge_response.cpp)
         target_link_libraries(test_challenge_response collider_core)
         add_test(NAME ChallengeResponse COMMAND test_challenge_response)
+    endif()
+
+    # v1.5.4 CPU-reference checkpoint walk: cross-checks the client's canonical
+    # walk-step + jump-table generator (src/core/checkpoint_walk.hpp) against
+    # the frozen Python reference (jump_table.py + checkpoint_replay.py) and
+    # confirms the generated checkpoints commit + challenge-prove cleanly. This
+    # is the hardware-independent oracle the GPU capture must reproduce.
+    if(COLLIDER_PRO AND EXISTS "${CMAKE_SOURCE_DIR}/tests/test_checkpoint_walk.cpp" AND TARGET collider_core)
+        add_executable(test_checkpoint_walk tests/test_checkpoint_walk.cpp)
+        target_link_libraries(test_checkpoint_walk collider_core)
+        add_test(NAME CheckpointWalk COMMAND test_checkpoint_walk)
+    endif()
+
+    # v1.5.4 client checkpoint session: cross-checks the live client's
+    # CHALLENGE decode + CHALLENGE_RSP answer + DP_BATCH_V3 encoder against the
+    # frozen Python server wire bytes (jlp_protocol.py). Header-only path;
+    # links collider_core for the SHA256 used by the Merkle commit.
+    if(COLLIDER_PRO AND EXISTS "${CMAKE_SOURCE_DIR}/tests/test_checkpoint_session.cpp" AND TARGET collider_core)
+        add_executable(test_checkpoint_session tests/test_checkpoint_session.cpp)
+        target_link_libraries(test_checkpoint_session collider_core)
+        add_test(NAME CheckpointSession COMMAND test_checkpoint_session)
     endif()
 
     # v1.4.2: per-GPU work balancer used by the brain wallet runtime to
@@ -1655,6 +1751,75 @@ if(COLLIDER_BUILD_TESTS)
         add_test(NAME GeneratorModes COMMAND test_generator_modes)
     endif()
 
+    # GEN-1: host-only boundary + coverage tests for passphrase_generator.hpp
+    # (FrequencyWordlistSource stoull guard, normalize() high-byte UB guard,
+    # CombinatorSource::estimated_size overflow saturation, plus WordlistSource
+    # enumeration and a threaded PassphraseGenerator smoke). Header-only sources
+    # backed by collider_core; the generator runs a worker thread (Threads).
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_passphrase_generator.cpp" AND TARGET collider_core)
+        add_executable(test_passphrase_generator tests/test_passphrase_generator.cpp)
+        target_link_libraries(test_passphrase_generator collider_core Threads::Threads)
+        target_include_directories(test_passphrase_generator PRIVATE ${CMAKE_SOURCE_DIR})
+        add_test(NAME PassphraseGenerator COMMAND test_passphrase_generator)
+    endif()
+
+    # New brain-wallet candidate-generation strategies (corpus n-grams, PRINCE,
+    # OMEN, brainwallet transforms, keyboard walks). Header-only PassphraseSource
+    # subclasses backed by collider_core; Threads for the generator worker.
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_corpus_ngram_source.cpp" AND TARGET collider_core)
+        add_executable(test_corpus_ngram_source tests/test_corpus_ngram_source.cpp)
+        target_link_libraries(test_corpus_ngram_source collider_core Threads::Threads)
+        target_include_directories(test_corpus_ngram_source PRIVATE ${CMAKE_SOURCE_DIR})
+        add_test(NAME CorpusNgramSource COMMAND test_corpus_ngram_source)
+    endif()
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_prince_source.cpp" AND TARGET collider_core)
+        add_executable(test_prince_source tests/test_prince_source.cpp)
+        target_link_libraries(test_prince_source collider_core Threads::Threads)
+        target_include_directories(test_prince_source PRIVATE ${CMAKE_SOURCE_DIR})
+        add_test(NAME PrinceSource COMMAND test_prince_source)
+    endif()
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_omen_source.cpp" AND TARGET collider_core)
+        add_executable(test_omen_source tests/test_omen_source.cpp)
+        target_link_libraries(test_omen_source collider_core Threads::Threads)
+        target_include_directories(test_omen_source PRIVATE ${CMAKE_SOURCE_DIR})
+        add_test(NAME OmenSource COMMAND test_omen_source)
+    endif()
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_brainwallet_transforms.cpp" AND TARGET collider_core)
+        add_executable(test_brainwallet_transforms tests/test_brainwallet_transforms.cpp)
+        target_link_libraries(test_brainwallet_transforms collider_core Threads::Threads)
+        target_include_directories(test_brainwallet_transforms PRIVATE ${CMAKE_SOURCE_DIR})
+        add_test(NAME BrainwalletTransforms COMMAND test_brainwallet_transforms)
+    endif()
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_keyboard_walk_source.cpp" AND TARGET collider_core)
+        add_executable(test_keyboard_walk_source tests/test_keyboard_walk_source.cpp)
+        target_link_libraries(test_keyboard_walk_source collider_core Threads::Threads)
+        target_include_directories(test_keyboard_walk_source PRIVATE ${CMAKE_SOURCE_DIR})
+        add_test(NAME KeyboardWalk COMMAND test_keyboard_walk_source)
+    endif()
+    # v1.5.5: Wordlist Generator engine (TUI-backing run_wordlist_generation).
+    # Pro-only: the source lives under src/ui/tui/ and pulls in src/generators/.
+    if(COLLIDER_PRO AND EXISTS "${CMAKE_SOURCE_DIR}/tests/test_wordlist_generator.cpp"
+       AND TARGET collider_core)
+        add_executable(test_wordlist_generator tests/test_wordlist_generator.cpp)
+        target_link_libraries(test_wordlist_generator collider_core Threads::Threads)
+        target_include_directories(test_wordlist_generator PRIVATE
+            ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src)
+        add_test(NAME WordlistGenerator COMMAND test_wordlist_generator)
+    endif()
+
+    # v1.5.x PCFG improvements (log-space probabilities, Weir pivot
+    # probability-order generator, multithreaded training, year/keyboard/
+    # multiword detectors) plus the offline exact wordlist deduplicator.
+    # Header-only targets (pcfg.hpp, wordlist_dedup.hpp); xxHash include dir
+    # is needed by wordlist_dedup.hpp.
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_pcfg_probability_order.cpp" AND COLLIDER_PRO)
+        add_executable(test_pcfg_probability_order tests/test_pcfg_probability_order.cpp)
+        target_link_libraries(test_pcfg_probability_order collider_core Threads::Threads)
+        target_include_directories(test_pcfg_probability_order PRIVATE
+            ${CMAKE_SOURCE_DIR} ${XXHASH_INCLUDE_DIR})
+        add_test(NAME PcfgProbabilityOrder COMMAND test_pcfg_probability_order)
+    endif()
+
     # Repair R1: regression cover for restore_state() into a non-PHASE_CYCLING
     # iteration mode. Pre-R1 the mode-owned generator state (markov_matrix_,
     # pcfg_grammar_, stacked_rules_, hybrid_mask_plans_, keyboard_walk_seeds_)
@@ -1864,6 +2029,41 @@ if(COLLIDER_BUILD_TESTS)
         add_test(NAME KangarooModeAsymmetric
             COMMAND test_kangaroo_mode_asymmetric)
         set_tests_properties(KangarooModeAsymmetric PROPERTIES
+            SKIP_RETURN_CODE 77
+            RESOURCE_LOCK gpu
+            TIMEOUT 120)
+    endif()
+
+    # v1.5.5 task #9: on-GPU checkpoint-capture validation. Runs the REAL
+    # RCKangaroo kernel with COLLIDER_CHECKPOINT_CAPTURE armed and proves the
+    # per-kangaroo checkpoint chain reproduces the canonical CPU walk
+    # (src/core/checkpoint_walk.hpp) byte-for-byte. Only meaningful when the
+    # capture is compiled in; same link discipline as the asymmetric test
+    # (rckangaroo + CUDA::cudart, separable, WHOLEARCHIVE for the
+    # __constant__ jmp2_table static init). The CPU oracle headers are
+    # header-only (crypto_cpu.hpp is all inline) so no collider_core link is
+    # needed -- which also avoids the AddPointsToList singleton clash.
+    if(COLLIDER_CHECKPOINT_CAPTURE AND
+       COLLIDER_USE_CUDA AND COLLIDER_USE_RCKANGAROO AND TARGET rckangaroo AND
+       EXISTS "${CMAKE_SOURCE_DIR}/tests/test_checkpoint_capture.cu")
+        add_executable(test_checkpoint_capture
+            tests/test_checkpoint_capture.cu)
+        set_target_properties(test_checkpoint_capture PROPERTIES
+            CUDA_SEPARABLE_COMPILATION ON
+            CUDA_RUNTIME_LIBRARY Shared)
+        target_link_libraries(test_checkpoint_capture
+            rckangaroo CUDA::cudart)
+        if(MSVC)
+            target_link_options(test_checkpoint_capture PRIVATE
+                "LINKER:/WHOLEARCHIVE:rckangaroo")
+        else()
+            target_link_options(test_checkpoint_capture PRIVATE
+                "LINKER:--whole-archive"
+                "LINKER:-lrckangaroo"
+                "LINKER:--no-whole-archive")
+        endif()
+        add_test(NAME CheckpointCapture COMMAND test_checkpoint_capture)
+        set_tests_properties(CheckpointCapture PROPERTIES
             SKIP_RETURN_CODE 77
             RESOURCE_LOCK gpu
             TIMEOUT 120)
@@ -2093,6 +2293,23 @@ if(COLLIDER_BUILD_TESTS)
         set_tests_properties(LicenseCache PROPERTIES SKIP_RETURN_CODE 77)
     endif()
 
+    # C4 (adversarial review v1.5.5): Ed25519 signed-assertion verification
+    # + HitVerifier key confirmation. Uses a fresh TEST keypair generated at
+    # runtime via OpenSSL EVP (never the production key) so the forged-cache
+    # rejection is demonstrable. Header-only crypto_cpu / hit_verifier are
+    # pulled in by relative include; collider_license carries OpenSSL.
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_license_assertion.cpp"
+       AND TARGET collider_license)
+        add_executable(test_license_assertion tests/test_license_assertion.cpp)
+        target_include_directories(test_license_assertion PRIVATE
+            ${CMAKE_SOURCE_DIR}/src)
+        target_link_libraries(test_license_assertion
+            collider_license
+            OpenSSL::Crypto)
+        add_test(NAME LicenseAssertion COMMAND test_license_assertion)
+        set_tests_properties(LicenseAssertion PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+
     # JLP pool TLS handshake live integration test. Connects to
     # collisionprotocol.com:17403, runs a verified TLS handshake, sends an
     # AUTH frame, reads the response. Returns 77 (skip) if
@@ -2185,6 +2402,110 @@ if(COLLIDER_BUILD_TESTS)
         set_tests_properties(JLPPoolReconnect PROPERTIES
             TIMEOUT 60
             RESOURCE_LOCK pool_port)
+    endif()
+
+    # Adversarial-review v1.5.5 repair tests (waves 1).
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_markov_model.cpp" AND COLLIDER_PRO)
+        add_executable(test_markov_model tests/test_markov_model.cpp)
+        target_link_libraries(test_markov_model collider_core)
+        target_include_directories(test_markov_model PRIVATE ${CMAKE_SOURCE_DIR})
+        add_test(NAME MarkovModel COMMAND test_markov_model)
+    endif()
+
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_pcfg_load_hardening.cpp" AND COLLIDER_PRO)
+        add_executable(test_pcfg_load_hardening tests/test_pcfg_load_hardening.cpp)
+        target_link_libraries(test_pcfg_load_hardening collider_core Threads::Threads)
+        target_include_directories(test_pcfg_load_hardening PRIVATE
+            ${CMAKE_SOURCE_DIR} ${XXHASH_INCLUDE_DIR})
+        add_test(NAME PcfgLoadHardening COMMAND test_pcfg_load_hardening)
+    endif()
+
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_bip84_p2wpkh_label.cpp"
+       AND TARGET collider_core AND COLLIDER_PRO)
+        add_executable(test_bip84_p2wpkh_label tests/test_bip84_p2wpkh_label.cpp)
+        target_link_libraries(test_bip84_p2wpkh_label collider_core collider_gpu)
+        add_test(NAME Bip84P2wpkhLabel COMMAND test_bip84_p2wpkh_label)
+        set_tests_properties(Bip84P2wpkhLabel PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+    endif()
+
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_jlp_pool_manager_reconnect.cpp" AND TARGET collider_pool)
+        add_executable(test_jlp_pool_manager_reconnect tests/test_jlp_pool_manager_reconnect.cpp)
+        target_link_libraries(test_jlp_pool_manager_reconnect
+            collider_pool collider_core Threads::Threads)
+        if(WIN32)
+            target_link_libraries(test_jlp_pool_manager_reconnect ws2_32)
+        endif()
+        add_test(NAME JLPPoolManagerReconnect COMMAND test_jlp_pool_manager_reconnect)
+        set_tests_properties(JLPPoolManagerReconnect PROPERTIES
+            TIMEOUT 120
+            RESOURCE_LOCK pool_port)
+    endif()
+
+    # v1.5.5 checkpoint-replay (task #9): live DP-sender V3 emit + CHALLENGE
+    # answer against a frame-aware mock pool server. Requires a v4 worker
+    # identity (OpenSSL) so the client's v3_commit_emit_active() gate holds.
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_jlp_pool_v3_emit.cpp"
+       AND TARGET collider_pool AND OPENSSL_FOUND)
+        add_executable(test_jlp_pool_v3_emit tests/test_jlp_pool_v3_emit.cpp)
+        target_link_libraries(test_jlp_pool_v3_emit
+            collider_pool collider_core OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
+        if(WIN32)
+            target_link_libraries(test_jlp_pool_v3_emit ws2_32)
+        endif()
+        add_test(NAME JLPPoolV3Emit COMMAND test_jlp_pool_v3_emit)
+        set_tests_properties(JLPPoolV3Emit PROPERTIES
+            TIMEOUT 120
+            RESOURCE_LOCK pool_port)
+    endif()
+
+    if(COLLIDER_PRO AND COLLIDER_USE_CUDA
+       AND EXISTS "${CMAKE_SOURCE_DIR}/tests/test_brainwallet_multiaddr_report_kat.cu"
+       AND TARGET collider_gpu)
+        add_executable(test_brainwallet_multiaddr_report_kat tests/test_brainwallet_multiaddr_report_kat.cu)
+        set_target_properties(test_brainwallet_multiaddr_report_kat PROPERTIES
+            CUDA_SEPARABLE_COMPILATION ON
+            CUDA_RUNTIME_LIBRARY Shared)
+        target_link_libraries(test_brainwallet_multiaddr_report_kat collider_gpu collider_core CUDA::cudart)
+        add_test(NAME BrainwalletMultiAddrReportKat COMMAND test_brainwallet_multiaddr_report_kat)
+        set_tests_properties(BrainwalletMultiAddrReportKat PROPERTIES
+            SKIP_RETURN_CODE 77
+            RESOURCE_LOCK gpu)
+    endif()
+
+    # Pass-2 repair tests.
+    if(COLLIDER_PRO AND COLLIDER_USE_CUDA
+       AND EXISTS "${CMAKE_SOURCE_DIR}/tests/test_brainwallet_wordlist_multiaddr_kat.cu"
+       AND TARGET collider_gpu)
+        add_executable(test_brainwallet_wordlist_multiaddr_kat tests/test_brainwallet_wordlist_multiaddr_kat.cu)
+        set_target_properties(test_brainwallet_wordlist_multiaddr_kat PROPERTIES
+            CUDA_SEPARABLE_COMPILATION ON
+            CUDA_RUNTIME_LIBRARY Shared)
+        target_link_libraries(test_brainwallet_wordlist_multiaddr_kat collider_gpu collider_core CUDA::cudart)
+        add_test(NAME BrainwalletWordlistMultiAddrKat COMMAND test_brainwallet_wordlist_multiaddr_kat)
+        set_tests_properties(BrainwalletWordlistMultiAddrKat PROPERTIES
+            SKIP_RETURN_CODE 77
+            RESOURCE_LOCK gpu)
+    endif()
+
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_license_json_field.cpp" AND TARGET collider_license)
+        add_executable(test_license_json_field tests/test_license_json_field.cpp)
+        target_link_libraries(test_license_json_field collider_license)
+        add_test(NAME LicenseJsonField COMMAND test_license_json_field)
+        set_tests_properties(LicenseJsonField PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+
+    set(_SIGNING_KAT_FIXTURE
+        "${CMAKE_SOURCE_DIR}/../collision-protocol/tests/fixtures/signing_kat.json")
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_cross_lang_signing_kat.cpp"
+       AND EXISTS "${_SIGNING_KAT_FIXTURE}"
+       AND TARGET collider_core AND TARGET collider_license AND OPENSSL_FOUND)
+        add_executable(test_cross_lang_signing_kat tests/test_cross_lang_signing_kat.cpp)
+        target_link_libraries(test_cross_lang_signing_kat
+            collider_core collider_license OpenSSL::Crypto)
+        target_compile_definitions(test_cross_lang_signing_kat PRIVATE
+            SIGNING_KAT_FIXTURE="${_SIGNING_KAT_FIXTURE}")
+        add_test(NAME CrossLangSigningKAT COMMAND test_cross_lang_signing_kat)
+        set_tests_properties(CrossLangSigningKAT PROPERTIES SKIP_RETURN_CODE 77)
     endif()
 
     # S1 regression: WORK_ASN dp_bits validation. Drives a mock server that
@@ -2702,6 +3023,21 @@ if(COLLIDER_BUILD_TESTS)
             add_test(NAME SelfUpdate COMMAND test_self_update)
         endif()
 
+        # v1.5.5 C3 self-update signature gate: canonical manifest format +
+        # Ed25519 verify (zeroed/forged/tampered/wrong-key all rejected; a
+        # round-trip with a TEST key is accepted). Uses OpenSSL EVP directly
+        # to mint a TEST keypair, which collider_core exposes transitively
+        # (OpenSSL::Crypto + COLLIDER_HAS_OPENSSL are PUBLIC on collider_core).
+        # The test is only meaningful with OpenSSL; gate on the define.
+        if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_self_update_signing.cpp"
+           AND TARGET collider_core AND OPENSSL_FOUND)
+            add_executable(test_self_update_signing
+                tests/test_self_update_signing.cpp)
+            target_link_libraries(test_self_update_signing
+                collider_core OpenSSL::Crypto)
+            add_test(NAME SelfUpdateSigning COMMAND test_self_update_signing)
+        endif()
+
         # Bloom false-positive-rate KAT (Tier 4 T7). Pins the empirical FP
         # rate of UTXOBloomBuilder at 1e-5 (loose GPU bloom) and 1e-7
         # (tight CPU bloom) within a 2x band. Header-only against
@@ -2714,6 +3050,22 @@ if(COLLIDER_BUILD_TESTS)
             # 10M MurmurHash3-128 probes per trial; ~3-5s on desktop CPU,
             # generous timeout for slower CI runners.
             set_tests_properties(BloomFpRate PROPERTIES TIMEOUT 120)
+        endif()
+
+        # GEN-2: DedupBloomFilter over-capacity guard. Pins the inserted-element
+        # counter, the count()/design_capacity()/over_capacity() contract, the
+        # one-time over-capacity warning path, clear() reset/re-arm, and
+        # BatchDedupHelper.flush() unique accounting. Header-only against
+        # src/core/dedup_bloom.hpp; links collider_core for the xxHash PUBLIC
+        # include dir and Threads for the atomics. Edition-agnostic (the dedup
+        # bloom lives in src/core/ and ships in both Free and Pro).
+        if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_dedup_bloom_capacity.cpp" AND TARGET collider_core)
+            add_executable(test_dedup_bloom_capacity tests/test_dedup_bloom_capacity.cpp)
+            target_link_libraries(test_dedup_bloom_capacity collider_core Threads::Threads)
+            target_include_directories(test_dedup_bloom_capacity PRIVATE
+                ${CMAKE_SOURCE_DIR} ${XXHASH_INCLUDE_DIR})
+            add_test(NAME DedupBloomCapacity COMMAND test_dedup_bloom_capacity)
+            set_tests_properties(DedupBloomCapacity PROPERTIES TIMEOUT 60)
         endif()
     endif()
 endif()

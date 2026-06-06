@@ -3,6 +3,8 @@
 #include "self_update.hpp"
 
 #include "../core/session_log.hpp"  // milestone()
+#include "../core/version.hpp"      // kVersion (anti-rollback floor)
+#include "signing_keys.hpp"         // kReleaseSigningPubKey
 
 #include <cctype>
 #include <cstdio>
@@ -18,8 +20,9 @@
 #include <curl/curl.h>
 #endif
 
-// OpenSSL EVP for streaming SHA-256. collider_core links OpenSSL::Crypto and
-// defines COLLIDER_HAS_OPENSSL when it is available.
+// OpenSSL EVP for streaming SHA-256 and Ed25519 signature verification.
+// collider_core links OpenSSL::Crypto and defines COLLIDER_HAS_OPENSSL when
+// it is available.
 #ifdef COLLIDER_HAS_OPENSSL
 #include <openssl/evp.h>
 #endif
@@ -174,6 +177,34 @@ bool sha256_is_all_zero(const std::array<uint8_t, 32>& h) {
     return true;
 }
 
+// True when the 64-byte signature is all zero (the server's "unsigned"
+// sentinel). A zero signature must be rejected, never verified.
+bool sig_is_all_zero(const std::array<uint8_t, 64>& s) {
+    for (uint8_t b : s) {
+        if (b != 0) return false;
+    }
+    return true;
+}
+
+// Domain separator for the canonical update manifest. MUST match the server
+// (collision-protocol/src/jlp_protocol.py::UPDATE_MANIFEST_DOMAIN) and the
+// layout in protocol/jlp.yaml::AuthOkPayload. 19 ASCII bytes including the
+// trailing newline.
+constexpr char kManifestDomain[] = "COLLIDER-UPDATE-v1\n";
+// sizeof includes the implicit NUL terminator, which is NOT part of the
+// domain bytes; subtract it.
+constexpr size_t kManifestDomainLen = sizeof(kManifestDomain) - 1;
+
+// Append a little-endian uint16 length prefix followed by `s` to `out`. The
+// canonical manifest length-prefixes every variable field so no two distinct
+// (version, url, hash) tuples can collide on the same signed bytes.
+void append_lp_field(std::vector<uint8_t>& out, const std::string& s) {
+    const uint16_t n = static_cast<uint16_t>(s.size());
+    out.push_back(static_cast<uint8_t>(n & 0xFF));
+    out.push_back(static_cast<uint8_t>((n >> 8) & 0xFF));
+    out.insert(out.end(), s.begin(), s.end());
+}
+
 }  // namespace
 
 bool semver_less(const std::string& a, const std::string& b) {
@@ -221,6 +252,92 @@ bool semver_less(const std::string& a, const std::string& b) {
     return false;  // equal
 }
 
+std::vector<uint8_t> build_update_manifest(
+    const std::string& latest_version,
+    const std::string& min_version,
+    const std::string& download_url,
+    const std::array<uint8_t, 32>& sha256) {
+    std::vector<uint8_t> m;
+    m.reserve(kManifestDomainLen + 6 + latest_version.size() +
+              min_version.size() + download_url.size() + 32);
+    m.insert(m.end(), kManifestDomain, kManifestDomain + kManifestDomainLen);
+    // The server signer (jlp_protocol.build_update_manifest) caps these fields
+    // before signing: version strings to 16 bytes, the URL to 256. The client
+    // MUST apply the identical caps before verifying or an over-length field
+    // would produce different canonical bytes here than the server signed,
+    // breaking verification of an otherwise-valid manifest.
+    append_lp_field(m, latest_version.substr(0, 16));
+    append_lp_field(m, min_version.substr(0, 16));
+    append_lp_field(m, download_url.substr(0, 256));
+    m.insert(m.end(), sha256.begin(), sha256.end());
+    return m;
+}
+
+bool verify_update_manifest_with_key(
+    const std::array<uint8_t, 32>& pubkey,
+    const std::string& latest_version,
+    const std::string& min_version,
+    const std::string& download_url,
+    const std::array<uint8_t, 32>& sha256,
+    const std::array<uint8_t, 64>& signature) {
+    // A zero ("unsigned") signature never verifies. Reject before touching
+    // OpenSSL so the all-zero advert is an unambiguous "no signature".
+    if (sig_is_all_zero(signature)) {
+        return false;
+    }
+#ifdef COLLIDER_HAS_OPENSSL
+    const std::vector<uint8_t> manifest = build_update_manifest(
+        latest_version, min_version, download_url, sha256);
+
+    // Wrap the raw 32-byte Ed25519 public key.
+    EVP_PKEY* pkey = EVP_PKEY_new_raw_public_key(
+        EVP_PKEY_ED25519, nullptr, pubkey.data(), pubkey.size());
+    if (!pkey) {
+        return false;
+    }
+
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    if (!ctx) {
+        EVP_PKEY_free(pkey);
+        return false;
+    }
+
+    bool ok = false;
+    // Ed25519 is a single-shot (PureEdDSA) verify: DigestVerifyInit with a
+    // null md, then one DigestVerify over the whole message.
+    if (EVP_DigestVerifyInit(ctx, nullptr, nullptr, nullptr, pkey) == 1) {
+        const int rc = EVP_DigestVerify(
+            ctx, signature.data(), signature.size(),
+            manifest.data(), manifest.size());
+        ok = (rc == 1);
+    }
+
+    EVP_MD_CTX_free(ctx);
+    EVP_PKEY_free(pkey);
+    return ok;
+#else
+    // Without OpenSSL we cannot verify a signature; refuse to update rather
+    // than trusting an unverified manifest.
+    (void)pubkey;
+    (void)latest_version;
+    (void)min_version;
+    (void)download_url;
+    (void)sha256;
+    return false;
+#endif  // COLLIDER_HAS_OPENSSL
+}
+
+bool verify_update_manifest(
+    const std::string& latest_version,
+    const std::string& min_version,
+    const std::string& download_url,
+    const std::array<uint8_t, 32>& sha256,
+    const std::array<uint8_t, 64>& signature) {
+    return verify_update_manifest_with_key(
+        ::collider::keys::kReleaseSigningPubKey,
+        latest_version, min_version, download_url, sha256, signature);
+}
+
 void cleanup_stale_update_artifacts() {
     std::error_code ec;
     fs::path exe = running_executable_path(nullptr);
@@ -243,22 +360,49 @@ void cleanup_stale_update_artifacts() {
     }
 }
 
-bool perform_self_update(const std::string& download_url,
+bool perform_self_update(const std::string& latest_version,
+                         const std::string& min_version,
+                         const std::string& download_url,
                          const std::array<uint8_t, 32>& expected_sha256,
+                         const std::array<uint8_t, 64>& manifest_sig,
                          int /*argc*/, char** argv) {
-#ifndef COLLIDER_HAVE_CURL
-    (void)download_url;
-    (void)expected_sha256;
-    (void)argv;
-    ::collider::log::milestone("self_update_skipped", "no_curl");
-    return false;
-#else
+    // ---- Security gates (run on EVERY build, before any fetch) ------------
+    // These checks do not depend on libcurl: even a no-curl build must reject
+    // a forged/stale manifest rather than fall through to a "skipped" log that
+    // could be mistaken for "the advert was fine".
     if (download_url.empty() || sha256_is_all_zero(expected_sha256)) {
         ::collider::log::milestone("self_update_skipped",
                                    "no_url_or_hash");
         return false;
     }
 
+    // Gate 1: signature MUST verify against the compiled-in release pubkey
+    // over the exact canonical manifest. A missing (all-zero) or forged
+    // signature is rejected here, BEFORE any network fetch (review C3).
+    if (!verify_update_manifest(latest_version, min_version, download_url,
+                                expected_sha256, manifest_sig)) {
+        ::collider::log::milestone(
+            "self_update_rejected",
+            "manifest signature invalid or missing; refusing to fetch");
+        return false;
+    }
+
+    // Gate 2: anti-rollback. Even a validly signed manifest may not downgrade
+    // (or reinstall) the running version. Require latest_version strictly
+    // newer than kVersion.
+    if (!semver_less(std::string(::collider::kVersion), latest_version)) {
+        ::collider::log::milestone(
+            "self_update_rejected",
+            std::string("anti-rollback: advertised ") + latest_version +
+                " is not newer than running " + ::collider::kVersion);
+        return false;
+    }
+
+#ifndef COLLIDER_HAVE_CURL
+    (void)argv;
+    ::collider::log::milestone("self_update_skipped", "no_curl");
+    return false;
+#else
     fs::path exe = running_executable_path(argv);
     if (exe.empty()) {
         ::collider::log::milestone("self_update_failed",

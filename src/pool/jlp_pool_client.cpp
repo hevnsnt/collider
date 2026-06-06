@@ -147,10 +147,12 @@ std::atomic<uint32_t> g_last_dp_seq{0};
 // methods invoked from sender_loop see them without re-declaration.
 constexpr auto kSenderKeepaliveSeconds  = std::chrono::seconds(20);
 constexpr auto kSenderStatsIntervalSeconds = std::chrono::seconds(10);
-// Maximum DPs per batched send. The server caps batch count at 10000,
-// but 100 DPs gives us ~6.6 KB of payload per send, fitting within
-// typical MTU after framing and bounding the time we hold dp_mutex_
-// during the drain copy.
+// Maximum DPs per batched send. The server caps batch count at 256
+// (collision-protocol/src/jlp_protocol.py decode_dp_batch / decode_dp_batch_v2
+// MAX_BATCH_SIZE; lowered from 10000 for DDoS surface), and 100 DPs gives us
+// ~7.8 KB of payload per send (78-byte v2 entries + framing), comfortably
+// under that cap while bounding the time we hold dp_mutex_ during the drain
+// copy.
 constexpr size_t kSenderMaxBatchDps = 100;
 
 // Build a SessionState seed populated only with the pool-mode fields;
@@ -1802,6 +1804,38 @@ void JLPPoolClient::sender_loop() {
             }
         }
 
+        // v1.5.5 (task #9): the V2 drain above stops at the first committable
+        // DP (when V3 emit is active), leaving it at the front. The preceding
+        // V2 batch is now on the wire, so emit committable DPs as their own
+        // DP_BATCH_V3 frames here, preserving wire order. Each emit builds the
+        // Merkle commitment and retains the walk so a later CHALLENGE can be
+        // answered. We re-sample the current sequence under work_mutex_ because
+        // the V2 send advanced it. A run of consecutive committable DPs is
+        // drained in this pass; non-committable DPs behind them are picked up
+        // on the next loop iteration (wait_for_send_signal returns immediately
+        // while the queue is non-empty). The whole pass is a no-op unless
+        // v3_commit_emit_active() (capture available AND negotiated v4).
+        if (v3_commit_emit_active()) {
+            uint32_t v3_seq = 0;
+            uint64_t v3_work_id = 0;
+            uint8_t v3_expected_type = kAnyDpType;
+            {
+                std::lock_guard<std::mutex> wlock(work_mutex_);
+                v3_work_id = current_work_.work_id;
+                v3_seq = dp_sequence_next_;
+                v3_expected_type =
+                    kang_type_to_dp_type(current_work_.kangaroo_type);
+            }
+            // Only attempt against the same chunk the V2 batch targeted; if a
+            // WORK_ASN raced in, defer to the next iteration which re-samples.
+            if (v3_work_id == current_work_id) {
+                while (emit_front_committable_dp_v3(v3_work_id, v3_expected_type,
+                                                    v3_seq, payload, last_send)) {
+                    // seq advanced inside; loop drains a committable run.
+                }
+            }
+        }
+
         if (drain_requested_.load(std::memory_order_acquire)) {
             perform_final_drain_pass(batch, payload, last_send);
         }
@@ -1834,9 +1868,23 @@ size_t JLPPoolClient::drain_dp_queue_into_batch(
     // avoids the missing-htole64 portability headache (Windows lacks it).
     const size_t before = batch.size();
     uint64_t dropped_this_call = 0;
+    // v1.5.5 (task #9): when the V3 commitment path is active, a committable DP
+    // (one carrying a real checkpoint chain) must be emitted as its own
+    // DP_BATCH_V3 frame, not folded into this V2 batch. To preserve strict
+    // wire order, stop draining the moment we reach a committable DP and leave
+    // it at the FRONT of the queue: the sender flushes this V2 batch first,
+    // then emits the committable DP via the V3 path. When V3 emit is inactive
+    // (no capture / not v4) committable chains are simply ignored here and the
+    // DP ships as V2 exactly as before.
+    const bool v3_emit_active = v3_commit_emit_active();
     std::lock_guard<std::mutex> lock(dp_mutex_);
     while (!dp_queue_.empty() && batch.size() < kSenderMaxBatchDps) {
         const auto& dp = dp_queue_.front();
+
+        if (v3_emit_active && dp.has_checkpoint_chain()) {
+            // Leave the committable DP queued; the sender's V3 step takes it.
+            break;
+        }
 
         // v1.5 client-side type-mismatch safety net. The currently-assigned
         // kangaroo_type permits exactly one DP wire type (0=tame, 1=wild).
@@ -1920,9 +1968,11 @@ bool JLPPoolClient::send_dp_batch(
         std::chrono::steady_clock::time_point& last_send) {
     // Wire format expected by the pool: [count:u32 LE][dp1:78][dp2:78]...
     // (DP_BATCH_V2 uses 78-byte v2 entries; the leading u32 count is
-    // capped at 10000 server-side, so without it the first 4 bytes of
-    // the first DP get interpreted as the count and the server tears
-    // down the connection with "Batch count N exceeds max 10000".)
+    // capped at 256 server-side (jlp_protocol.py decode_dp_batch_v2
+    // MAX_BATCH_SIZE), so without it the first 4 bytes of the first DP get
+    // interpreted as the count and the server tears down the connection with
+    // "Batch count N exceeds max 256". The client batches at most
+    // kSenderMaxBatchDps=100, well under the cap.)
     payload.clear();
     uint32_t count = static_cast<uint32_t>(batch.size());
     payload.push_back(static_cast<uint8_t>( count        & 0xFFu));
@@ -2008,6 +2058,156 @@ bool JLPPoolClient::send_dp_batch(
     return true;
 }
 
+bool JLPPoolClient::send_dp_batch_v3(
+        uint64_t current_work_id,
+        uint32_t seq_start,
+        const std::vector<JLPDistinguishedPointV3>& batch,
+        const pool::CommittedWalk& committed_walk,
+        std::vector<uint8_t>& payload,
+        std::chrono::steady_clock::time_point& last_send) {
+    // DP_BATCH_V3 wire format: [count:u32 LE][dp1:114][dp2:114]... Each DP
+    // carries the walk's Merkle commitment (ckpt_root + n_segments). Encoded
+    // by checkpoint_session.hpp so the byte layout is pinned to the Python
+    // server codec and cross-checked by test_checkpoint_session.
+    pool::encode_dp_batch_v3(batch, payload);
+    const bool ok = send_message(JLPMessageType::DP_BATCH_V3,
+                                 payload.data(), payload.size());
+    if (!ok) {
+        return false;
+    }
+    last_send = std::chrono::steady_clock::now();
+
+    // Retain the committed walk so an incoming CHALLENGE for this work_id can
+    // be answered from the revealed checkpoint distances. The server holds at
+    // most one outstanding challenge per worker, so the latest commitment is
+    // what it will probe.
+    checkpoint_session_.retain(committed_walk);
+
+    // Mirror the advanced sequence counter back to PoolManager (identical to
+    // the V2 path) so a supervisor-driven reconnect seeds the new instance
+    // with the post-batch value.
+    DpSeqProgressCallback cb;
+    {
+        std::lock_guard<std::mutex> lock(callbacks_mutex_);
+        cb = dp_seq_progress_callback_;
+    }
+    if (cb) {
+        cb(current_work_id,
+           seq_start + static_cast<uint32_t>(batch.size()));
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(stats_mutex_);
+        stats_.your_dps += batch.size();
+    }
+
+    const uint64_t batch_n = batch.size();
+    g_dp_total_submitted.fetch_add(batch_n, std::memory_order_acq_rel);
+    g_dp_submitted_this_work.fetch_add(batch_n, std::memory_order_acq_rel);
+    g_last_dp_seq.store(seq_start + static_cast<uint32_t>(batch.size()),
+                        std::memory_order_release);
+    return true;
+}
+
+bool JLPPoolClient::emit_front_committable_dp_v3(
+        uint64_t current_work_id,
+        uint8_t expected_type,
+        uint32_t& seq_inout,
+        std::vector<uint8_t>& payload,
+        std::chrono::steady_clock::time_point& last_send) {
+    // Pop the single committable DP now at the FRONT of dp_queue_ (the V2 drain
+    // stopped there) and build its DP_BATCH_V3 frame. Caller guarantees
+    // v3_commit_emit_active() and that the preceding V2 batch has already been
+    // flushed, so wire order is preserved.
+    DistinguishedPoint dp;
+    {
+        std::lock_guard<std::mutex> lock(dp_mutex_);
+        // Same client-side asymmetric type safety net as the V2 drain: a
+        // committable DP whose type does not match the assigned kangaroo_type
+        // is a stale-herd leak or backend bug. Drop such DPs (they never reach
+        // the server) rather than commit a chain the server would reject; do
+        // NOT consume a sequence number. Loop so a run of mismatched committable
+        // DPs at the front is fully skipped before we either find a sendable
+        // committable DP or hit a non-committable front (-> V2 path takes over).
+        for (;;) {
+            if (dp_queue_.empty()) return false;
+            if (!dp_queue_.front().has_checkpoint_chain()) return false;
+            if (expected_type != kAnyDpType &&
+                dp_queue_.front().type != expected_type) {
+                dropped_type_mismatch_.fetch_add(1, std::memory_order_relaxed);
+                dp_queue_.pop_front();
+                continue;
+            }
+            break;
+        }
+        dp = dp_queue_.front();
+        dp_queue_.pop_front();
+    }
+
+    // Only send when the connection is AUTH_OK. If not, re-queue the DP at the
+    // FRONT (preserving order + its chain) so it is retried after AUTH_OK, and
+    // report "no V3 sent" so the sender does not advance the sequence counter.
+    if (!(connected_.load() && auth_state_.load() == AuthState::AUTH_OK)) {
+        std::lock_guard<std::mutex> lock(dp_mutex_);
+        dp_queue_.push_front(dp);
+        return false;
+    }
+
+    // Build the Merkle commitment over the walk's checkpoint distances. The
+    // root MUST match what answer_challenge will later prove against, so we
+    // commit the exact same distance vector we retain.
+    pool::CommittedWalk walk;
+    walk.work_id = current_work_id;
+    walk.distances = dp.ckpt_distances;
+    walk.root = checkpoint_commit::build_root(walk.distances);
+
+    // Assemble the single 114-byte V3 record. work_id + sequence are stamped
+    // here (LE) exactly as the V2 drain does; x/d/type/dp_bits mirror the V2
+    // fields; ckpt_root + n_segments carry the commitment.
+    JLPDistinguishedPointV3 v3{};
+    {
+        uint8_t* p = reinterpret_cast<uint8_t*>(&v3.work_id);
+        for (int i = 0; i < 8; ++i)
+            p[i] = static_cast<uint8_t>((current_work_id >> (8 * i)) & 0xFFu);
+    }
+    {
+        uint8_t* p = reinterpret_cast<uint8_t*>(&v3.sequence);
+        for (int i = 0; i < 4; ++i)
+            p[i] = static_cast<uint8_t>((seq_inout >> (8 * i)) & 0xFFu);
+    }
+    memcpy(v3.x, dp.x, 32);
+    memcpy(v3.d, dp.d, 32);
+    v3.type = dp.type;
+    v3.dp_bits = static_cast<uint8_t>(dp.dp_bits & 0xFF);
+    memcpy(v3.ckpt_root, walk.root.data(), 32);
+    v3.n_segments = walk.n_segments();
+
+    std::vector<JLPDistinguishedPointV3> v3_batch{v3};
+
+    // Optimistically advance the sequence counter to cover this one DP, exactly
+    // like the V2 path (advance_dp_sequence_if_unchanged guards against a
+    // racing WORK_ASN). send_dp_batch_v3 retains the walk on success.
+    const uint32_t new_next = seq_inout + 1;
+    advance_dp_sequence_if_unchanged(current_work_id, new_next);
+
+    if (!send_dp_batch_v3(current_work_id, seq_inout, v3_batch, walk, payload,
+                          last_send)) {
+        // Send failed: roll the sequence advance back (only if the chunk is
+        // unchanged) and re-queue the DP so a later iteration retries it as V3.
+        {
+            std::lock_guard<std::mutex> wlock(work_mutex_);
+            if (current_work_.work_id == current_work_id)
+                dp_sequence_next_ = seq_inout;
+        }
+        std::lock_guard<std::mutex> lock(dp_mutex_);
+        dp_queue_.push_front(dp);
+        return false;
+    }
+
+    seq_inout = new_next;
+    return true;
+}
+
 void JLPPoolClient::requeue_unauth_batch(
         uint64_t current_work_id,
         uint32_t seq_start,
@@ -2021,13 +2221,45 @@ void JLPPoolClient::requeue_unauth_batch(
     // the DPs BACK onto the front of dp_queue_ in reverse order so
     // their order on the wire is preserved. They'll be re-drained on
     // the next iteration after AUTH_OK.
+    //
+    // CRITICAL: only re-queue when the chunk is STILL the one the batch
+    // was drafted under. If a WORK_ASN landed during the pre-AUTH stall
+    // and moved us to a different chunk, these DPs were computed against
+    // the OLD pubkey/range. Re-pushing them lets the next drain re-tag
+    // them with the NEW current_work_id (drain stamps work_id from the
+    // freshly-sampled assignment, not from the DP), producing DPs whose
+    // x/d attest a chunk they never walked. The server's work_id
+    // attestation flags that as cheating. So on a chunk change we DROP
+    // the batch and count it instead of re-queuing.
+    bool work_unchanged;
     {
         std::lock_guard<std::mutex> wlock(work_mutex_);
-        if (current_work_.work_id == current_work_id) {
+        work_unchanged = (current_work_.work_id == current_work_id);
+        if (work_unchanged) {
             // Undo the optimistic advance done by the caller.
             dp_sequence_next_ = seq_start;
         }
+        // On a chunk change the caller's optimistic advance is moot: a
+        // WORK_ASN already reset dp_sequence_next_ to 0 for the new chunk
+        // (apply_work_asn_assignment), so we must NOT touch it here.
     }
+
+    if (!work_unchanged) {
+        // Chunk changed mid-stall: discard the old-target batch.
+        const uint64_t total =
+            requeue_stale_drop_count_.fetch_add(batch.size(),
+                                                std::memory_order_relaxed)
+            + batch.size();
+        std::cerr << "[Pool] sender: WORK_ASN changed the chunk during a "
+                  << "pre-AUTH stall; dropping " << batch.size()
+                  << " DP(s) computed against the superseded work_id="
+                  << current_work_id
+                  << " rather than re-tagging them (would trip the server's "
+                  << "work_id attestation). stale_dropped_total=" << total
+                  << std::endl;
+        return;
+    }
+
     {
         std::lock_guard<std::mutex> lock(dp_mutex_);
         // Push back in reverse so the original head ends up at the
@@ -2080,14 +2312,28 @@ void JLPPoolClient::perform_final_drain_pass(
             expected_type = kang_type_to_dp_type(current_work_.kangaroo_type);
         }
         drain_dp_queue_into_batch(wid, seq, expected_type, batch);
-        if (batch.empty()) break;
-        advance_dp_sequence_if_unchanged(
-            wid, seq + static_cast<uint32_t>(batch.size()));
-        if (!send_dp_batch(wid, seq, batch, payload, last_send)) {
+        if (!batch.empty()) {
+            advance_dp_sequence_if_unchanged(
+                wid, seq + static_cast<uint32_t>(batch.size()));
+            if (!send_dp_batch(wid, seq, batch, payload, last_send)) {
+                batch.clear();
+                break;  // Network failed mid-drain; abandon
+            }
             batch.clear();
-            break;  // Network failed mid-drain; abandon
+            continue;  // re-sample seq (advanced) and drain the next run
         }
-        batch.clear();
+        // batch empty: either the queue is drained, or (V3 active) the front is
+        // a committable DP the V2 drain stopped at. Emit committable DPs as V3;
+        // if one is sent we loop to re-drain, otherwise the queue is truly
+        // empty (or AUTH/conn slipped) and we exit.
+        if (v3_commit_emit_active()) {
+            uint32_t v3_seq = seq;
+            if (emit_front_committable_dp_v3(wid, expected_type, v3_seq,
+                                             payload, last_send)) {
+                continue;
+            }
+        }
+        break;
     }
     // Notify any waiter (disconnect) that the queue is now empty (or
     // we couldn't drain further).
@@ -2159,6 +2405,7 @@ void JLPPoolClient::handle_server_message(const JLPHeader& header,
         case JLPMessageType::SOLUTION:   handle_solution(header, payload);            break;
         case JLPMessageType::PING:       handle_ping(header, payload);                break;
         case JLPMessageType::MAINTENANCE: handle_maintenance(header, payload);        break;
+        case JLPMessageType::CHALLENGE:  handle_challenge(header, payload);           break;
         case JLPMessageType::MSG_ERROR:  handle_msg_error(header, payload, s);        break;
         default:                         handle_default_unknown(header, payload);     break;
     }
@@ -2438,11 +2685,12 @@ void JLPPoolClient::handle_auth_ok(const JLPHeader& /*header*/,
     // the payout BTC address (= JLP "worker" identifier).
     ::collider::log::milestone("auth_ok", worker_name_);
 
-    // v1.5.4: parse the AUTH_OK update advert (324-byte AuthOkPayload).
-    // A legacy server sends a zero-payload AUTH_OK; treat anything
-    // shorter than the advert struct as "no advert" and clear the cached
-    // value. A longer-than-expected payload reads the leading 324 bytes
-    // (additive growth is reserved via the struct's reserved[] field).
+    // v1.5.4/v1.5.5: parse the AUTH_OK update advert (388-byte AuthOkPayload,
+    // grown from 324 with the trailing 64-byte manifest_sig). A legacy server
+    // sends a zero-payload AUTH_OK; treat anything shorter than the advert
+    // struct as "no advert" and clear the cached value. A longer-than-expected
+    // payload reads the leading sizeof(AuthOkPayload) bytes (additive growth is
+    // reserved via the struct's reserved[] field).
     UpdateAdvert advert;  // present=false by default
     if (payload.size() >= sizeof(jlp_wire::AuthOkPayload)) {
         jlp_wire::AuthOkPayload p;
@@ -2464,6 +2712,8 @@ void JLPPoolClient::handle_auth_ok(const JLPHeader& /*header*/,
         advert.download_url     = read_cstr(p.download_url,
                                             sizeof(p.download_url));
         std::memcpy(advert.sha256.data(), p.sha256, advert.sha256.size());
+        std::memcpy(advert.manifest_sig.data(), p.manifest_sig,
+                    advert.manifest_sig.size());
         advert.update_available   = (p.flags & 0x01) != 0;
         advert.maintenance_active = (p.flags & 0x02) != 0;
     }
@@ -2540,6 +2790,35 @@ void JLPPoolClient::handle_maintenance(const JLPHeader& /*header*/,
     if (cb_copy) {
         cb_copy(active, retry, message);
     }
+}
+
+void JLPPoolClient::handle_challenge(const JLPHeader& /*header*/,
+                                     const std::vector<uint8_t>& payload) {
+    // The server (v1.5.4 checkpoint-replay anti-cheat) asks us to reveal K
+    // random segments of the walk we committed with a recent DP_BATCH_V3. Build
+    // the CHALLENGE_RSP from the retained checkpoint distances and send it.
+    //
+    // If we have no retained commitment for the challenged work_id, we cannot
+    // answer. That is the HONEST state today: the live GPU walk does not yet
+    // surface per-DP checkpoint chains (see rckangaroo_wrapper.cu
+    // COLLIDER_CHECKPOINT_CAPTURE -- pending hardware validation), so the
+    // client stays on DP_BATCH_V2 and never commits, and the server -- per its
+    // own policy -- only challenges protocol_version>=4 workers that actually
+    // sent a commitment. We log and drop rather than send a malformed reply.
+    std::vector<uint8_t> rsp;
+    if (!checkpoint_session_.answer_challenge(payload, rsp)) {
+        std::cerr << "[Pool] CHALLENGE received but no matching checkpoint "
+                     "commitment to answer (no V3 walk retained for this "
+                     "work_id); ignoring." << std::endl;
+        return;
+    }
+    if (!send_message(JLPMessageType::CHALLENGE_RSP, rsp.data(), rsp.size())) {
+        std::cerr << "[Pool] failed to send CHALLENGE_RSP" << std::endl;
+        return;
+    }
+    ::collider::log::milestone(
+        "checkpoint_challenge_answered",
+        "segments_payload_bytes=" + std::to_string(rsp.size()));
 }
 
 void JLPPoolClient::handle_auth_fail(const JLPHeader& /*header*/,

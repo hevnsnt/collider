@@ -867,42 +867,54 @@ int apply_worker(int& i, int argc, char* argv[], Arguments& args,
                  CLIFlags& cli, std::string& err_msg) {
     const char* v = take_value(i, argc, argv, "--worker", err_msg);
     if (!v) return -1;
-    // Pentest CLIENT-LIE-3 (Info) + CLIENT-CHEAT-2 (defense-in-depth)
-    // worker-name format check (2026-05-23 deep audit). Mirrors the
-    // server-side strict validator added under SRV-LIE-14. A typo'd
-    // BTC address permanently misroutes payouts; refusing at parse
-    // time saves the operator from a silent payout-to-the-wrong-place
-    // surprise. Accept [A-Za-z0-9_.-]{1,64}; escape via
-    // --worker-unsafe-allow-any for tests.
-    std::string name = v;
-    bool unsafe = false;
-    for (int j = 1; j < argc; ++j) {
-        if (std::string(argv[j]) == "--worker-unsafe-allow-any") {
-            unsafe = true;
-            break;
-        }
+    // The worker-name format check (Pentest CLIENT-LIE-3 / CLIENT-CHEAT-2,
+    // 2026-05-23 deep audit; mirrors the server-side SRV-LIE-14 validator) is
+    // deferred to validate_worker_name() after the whole argv is parsed. That
+    // way the --worker-unsafe-allow-any escape hatch is a normally-registered
+    // flag consumed in argument order, not a global argv sweep, so it can only
+    // disable the validator when the operator genuinely passes it as a
+    // top-level flag (never when it merely appears as another flag's value).
+    args.pool_worker = v;
+    cli.pool_worker_set = true;
+    return 0;
+}
+
+int apply_worker_unsafe_allow_any(int&, int, char* [], Arguments& args,
+                                  CLIFlags&, std::string&) {
+    // Test escape hatch: skip the strict --worker validator. Registered as a
+    // real boolean flag so it is honored only when supplied top-level and in
+    // argument order. Validation itself runs post-parse in validate_worker_name.
+    args.worker_unsafe_allow_any = true;
+    return 0;
+}
+
+// Post-parse strict --worker name/format check. A typo'd BTC address
+// permanently misroutes payouts; refusing here (after the full argv is parsed)
+// saves the operator from a silent payout-to-the-wrong-place surprise. Runs
+// only when --worker was actually supplied; bypassed by the top-level
+// --worker-unsafe-allow-any flag. Accepts [A-Za-z0-9_.-]{1,64}.
+int validate_worker_name(const Arguments& args, const CLIFlags& cli,
+                         std::string& err_msg) {
+    if (!cli.pool_worker_set) return 0;
+    if (args.worker_unsafe_allow_any) return 0;
+    const std::string& name = args.pool_worker;
+    if (name.empty() || name.size() > 64) {
+        err_msg = "--worker must be 1..64 characters";
+        return -1;
     }
-    if (!unsafe) {
-        if (name.empty() || name.size() > 64) {
-            err_msg = "--worker must be 1..64 characters";
+    for (char c : name) {
+        const bool ok =
+            (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') ||
+            c == '_' || c == '.' || c == '-';
+        if (!ok) {
+            err_msg =
+                "--worker contains invalid character; allowed "
+                "[A-Za-z0-9_.-] only (use --worker-unsafe-allow-any "
+                "for tests)";
             return -1;
         }
-        for (char c : name) {
-            const bool ok =
-                (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                (c >= '0' && c <= '9') ||
-                c == '_' || c == '.' || c == '-';
-            if (!ok) {
-                err_msg =
-                    "--worker contains invalid character; allowed "
-                    "[A-Za-z0-9_.-] only (use --worker-unsafe-allow-any "
-                    "for tests)";
-                return -1;
-            }
-        }
     }
-    args.pool_worker = std::move(name);
-    cli.pool_worker_set = true;
     return 0;
 }
 
@@ -1112,6 +1124,8 @@ constexpr FlagSpec kFlagsRaw[] = {
     // Pool
     {"--pool",                  "-p", apply_pool,                  "pool"},
     {"--worker",                "-w", apply_worker,                "pool"},
+    {"--worker-unsafe-allow-any", nullptr,
+        apply_worker_unsafe_allow_any, "pool"},
     {"--pool-password",         nullptr, apply_pool_password,      "pool"},
     {"--pool-password-file",    nullptr, apply_pool_password_file, "pool"},
     {"--pool-api-key",          nullptr, apply_pool_api_key,       "pool"},
@@ -1218,6 +1232,11 @@ int parse_args_core(int argc, char* argv[], Arguments& args,
             return -1;
         }
     }
+
+    // Strict --worker name check runs post-parse so --worker-unsafe-allow-any
+    // is honored regardless of where it sits relative to --worker (and only
+    // when genuinely passed as a top-level flag).
+    if (validate_worker_name(args, cli, err_msg) != 0) return -1;
 
     return validate_mode_mutex(args, err_msg);
 }

@@ -372,6 +372,31 @@ The Free benchmark measures CPU and GPU SHA-256 throughput so operators can vali
 ./bench_gpu_pipeline --time 30 --gpu 0
 ```
 
+### Measured: RTX PRO 6000 Blackwell Max-Q (sm_120, 300W)
+
+Numbers from a 2026-06-05 run on a 300W Max-Q workstation card (driver 596.59,
+CUDA 13.2 runtime). The Max-Q variant is power-capped at 300W, which holds the
+SM clock near 1.8 GHz against a ~3.1 GHz ceiling; the full 600W RTX PRO 6000
+has roughly double the power headroom and scales above these figures.
+
+| Path                                                                         | Rate         |
+| ---------------------------------------------------------------------------- | ------------ |
+| Kangaroo pool solving (RCKangaroo, sustained real pool, 100% GPU, 300W cap)  | ~7.4 GKeys/s |
+| Kangaroo kernel only (event timed, no host or pool overhead)                 | ~7.6 GKeys/s |
+| Brain wallet fused pipeline, end to end (SHA-256, secp256k1, hash160, bloom) | ~25 MKeys/s  |
+| secp256k1 scalar multiply (isolated stage)                                   | ~54 MH/s     |
+| SHA-256 over passphrases (isolated stage)                                    | ~2.1 GH/s    |
+| hash160, SHA-256 plus RIPEMD-160 (isolated stage)                            | ~1.8 GH/s    |
+
+The kangaroo path lands close to a stock RTX 4090 (about 8 GKeys/s) even under
+the 300W cap, because it links RCKangaroo directly. The brain wallet fused
+pipeline is lower for the field-arithmetic reasons in "Performance expectations"
+below. Reproduce the brain-wallet stage table with `collider --benchmark`; for
+the kangaroo figure, run a live pool worker and read the sustained throughput.
+A measured caveat for this card: a left-over `CUDA_VISIBLE_DEVICES` from a prior
+multi-GPU rig makes a single-GPU box report zero devices and exit immediately;
+clear it (or set it to `0`) after any GPU swap.
+
 ---
 
 ## Status

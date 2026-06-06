@@ -896,6 +896,49 @@ void run_all() {
         EXPECT_EQ(a.config_file, std::string("alt.yml"),
                   "H.10f.config-via-short");
     }
+
+    // --- M8: --worker-unsafe-allow-any must be a real top-level flag, not a
+    //     global argv sweep. ---
+
+    // An invalid worker name (contains '!') is rejected at parse time.
+    {
+        Arguments a; CLIFlags c; std::string err;
+        EXPECT_EQ(parse_args_mirror({"--pool", "jlp://h:1", "--worker", "bad!name"},
+                                    a, c, err),
+                  -1, "M8.01.bad-worker-rejected");
+    }
+    // The escape hatch, passed legitimately as a top-level flag, allows it.
+    {
+        Arguments a; CLIFlags c; std::string err;
+        EXPECT_EQ(parse_args_mirror({"--pool", "jlp://h:1", "--worker", "bad!name",
+                                     "--worker-unsafe-allow-any"},
+                                    a, c, err),
+                  0, "M8.02.escape-hatch-allows");
+        EXPECT_TRUE(a.worker_unsafe_allow_any, "M8.02.flag-set");
+        EXPECT_EQ(a.pool_worker, std::string("bad!name"), "M8.02.worker-kept");
+    }
+    // Order independence: the escape hatch works even when it precedes --worker.
+    {
+        Arguments a; CLIFlags c; std::string err;
+        EXPECT_EQ(parse_args_mirror({"--worker-unsafe-allow-any", "--pool",
+                                     "jlp://h:1", "--worker", "bad!name"},
+                                    a, c, err),
+                  0, "M8.03.escape-hatch-before-worker");
+    }
+    // The string appearing only as ANOTHER flag's VALUE must NOT disable the
+    // validator. Here it is smuggled in as the --pool URL value, so it is
+    // consumed by --pool and never seen as a top-level flag. With an invalid
+    // --worker name and no genuine escape-hatch flag, parsing is rejected.
+    // (Under the old global-argv-sweep this token would have flipped the
+    // unsafe bit and silently accepted the bad worker name.)
+    {
+        Arguments a; CLIFlags c; std::string err;
+        EXPECT_EQ(parse_args_mirror({"--pool", "--worker-unsafe-allow-any",
+                                     "--worker", "bad!name"},
+                                    a, c, err),
+                  -1, "M8.04.value-smuggle-rejected");
+        EXPECT_TRUE(!a.worker_unsafe_allow_any, "M8.04.flag-not-set");
+    }
 }
 
 }  // namespace

@@ -134,7 +134,11 @@ void* kang_thr_proc(void* data)
 	return 0;
 }
 #endif
-void AddPointsToList(u32* data, int pnt_cnt, u64 ops_cnt)
+//theCollider: signature gained a leading opaque context pointer so the
+//library call site (GpuKang.cpp) can thread an accumulator through. The
+//upstream standalone path keeps its own file-scope globals and ignores the
+//context, so the parameter is intentionally unused here.
+void AddPointsToList(void* /*ctx*/, u32* data, int pnt_cnt, u64 ops_cnt)
 {
 	csAddPoints.Enter();
 	if (PntIndex + pnt_cnt >= MAX_CNT_LIST)
@@ -701,17 +705,37 @@ int main(int argc, char* argv[])
 		char s[100];
 		pk_found.GetHexStr(s);
 		printf("\r\nPRIVATE KEY: %s\r\n\r\n", s);
-		FILE* fp = fopen("RESULTS.TXT", "a");
-		if (fp)
+		//theCollider: bounded retry instead of an unbounded busy-spin. The
+		//original code looped "while (1) Sleep(100)" forever when RESULTS.TXT
+		//could not be opened (read-only dir, full disk, locked file), which
+		//hung the process indefinitely with no way out but a kill. We retry a
+		//few times with a short backoff (transient locks usually clear), and
+		//if it still fails we log the key to stdout one last time and return
+		//non-fatally. The key has already been printed above, so the operator
+		//does not lose it.
+		const int kResultsSaveAttempts = 5;
+		bool saved = false;
+		for (int attempt = 0; attempt < kResultsSaveAttempts; attempt++)
 		{
-			fprintf(fp, "PRIVATE KEY: %s\n", s);
-			fclose(fp);
+			FILE* fp = fopen("RESULTS.TXT", "a");
+			if (fp)
+			{
+				fprintf(fp, "PRIVATE KEY: %s\n", s);
+				fclose(fp);
+				saved = true;
+				break;
+			}
+			printf("WARNING: Cannot save the key to RESULTS.TXT (attempt %d/%d), retrying...\r\n",
+				attempt + 1, kResultsSaveAttempts);
+			Sleep(200);
 		}
-		else //we cannot save the key, show error and wait forever so the key is displayed
+		if (!saved)
 		{
-			printf("WARNING: Cannot save the key to RESULTS.TXT!\r\n");
-			while (1)
-				Sleep(100);
+			//Give up writing the file but do NOT hang. The key is shown again
+			//so it is the last thing on screen for the operator to copy.
+			printf("ERROR: Could not save the key to RESULTS.TXT after %d attempts.\r\n"
+				"Record this key now -- it is NOT being written to disk:\r\n"
+				"PRIVATE KEY: %s\r\n", kResultsSaveAttempts, s);
 		}
 	}
 	else

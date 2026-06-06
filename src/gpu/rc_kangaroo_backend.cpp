@@ -11,11 +11,13 @@
 #include "rc_kangaroo_backend.hpp"
 #include "../core/byte_codec.hpp"
 
+#include <array>
 #include <cstdio>
 #include <cstring>
 #include <iostream>
 #include <ostream>
 #include <sstream>
+#include <vector>
 
 namespace collider {
 namespace kangaroo {
@@ -113,11 +115,16 @@ void RCKangarooBackend::solve(BackendCallbacks cb) {
 
     const uint32_t dp_bits_u32 = rc_.dp_bits;
 
-    rc_.dp_callback = [cb, dp_bits_u32](const uint8_t* x_be,
-                                         const uint8_t* d_be,
-                                         uint8_t type) {
+    rc_.dp_callback = [cb, dp_bits_u32](
+            const uint8_t* x_be,
+            const uint8_t* d_be,
+            uint8_t type,
+            const std::vector<std::array<uint8_t, 32>>* ckpt_distances,
+            const std::vector<uint8_t>* ckpt_l1s2) {
         if (cb.on_dp) {
-            cb.on_dp(x_be, d_be, type, dp_bits_u32);
+            // v1.5.5 (task #9): forward the committable checkpoint chain (or
+            // nullptr) straight through; this adapter does not interpret it.
+            cb.on_dp(x_be, d_be, type, dp_bits_u32, ckpt_distances, ckpt_l1s2);
         }
     };
 

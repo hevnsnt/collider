@@ -52,6 +52,7 @@
 #endif
 
 #include "pool/jlp_pool_client.hpp"
+#include "pool/jlp_wire_generated.hpp"  // jlp_wire::PROTOCOL_VERSION
 #include "pool/pool_client.hpp"
 #include "pool/pool_config.hpp"  // MAX_AUTH_FAIL_ATTEMPTS moved here in v1.4.2 Pool-B3
 
@@ -86,10 +87,13 @@ constexpr uint8_t TYPE_AUTH_FAIL = 0x03;
 // v1.4.2 B.5: mock server must send flags = PROTOCOL_VERSION just like
 // the real server, otherwise the client (correctly) rejects with protocol
 // version mismatch.
-// v1.5 (protocol_version=3): bumped from 2 to 3. The reconnect /
-// supervisor / dedup tests below are protocol-version agnostic; the
-// bump here is mock-server hygiene, not a behavior change.
-constexpr uint8_t MOCK_PROTOCOL_VERSION = 3;
+// The reconnect / supervisor / dedup tests below are protocol-version
+// agnostic; this just keeps the mock honest. Track the client's compiled
+// PROTOCOL_VERSION (from jlp_wire_generated.hpp) instead of a hardcoded
+// literal so a future wire bump cannot silently strand these tests at an
+// old version (which is exactly what happened at the v3 -> v4 bump).
+constexpr uint8_t MOCK_PROTOCOL_VERSION =
+    static_cast<uint8_t>(collider::pool::jlp_wire::PROTOCOL_VERSION);
 std::vector<uint8_t> build_frame(uint8_t type, const void* payload, uint16_t len) {
     std::vector<uint8_t> out;
     out.reserve(8 + len);

@@ -186,6 +186,21 @@ PRO_PATHS=(
     "src/runtime/bip_gpu_dispatcher.hpp"
     "src/runtime/bip_scanner_runner.cpp"
     "src/runtime/bip_scanner_runner.hpp"
+    # v1.5.5 release-prep audit: these are Pro-only sources (CMake gates
+    # them under if(COLLIDER_PRO)) with NO free-shipped includer, so they
+    # were shipping to the public repo as dead, compile-excluded source.
+    # warpwallet_runner = WarpWallet brain-wallet KDF; bloom_loader =
+    # funded-address bloom loader used only by the brain-wallet runner;
+    # bip_addr_kind = BIP-scanner address-kind helper (no .hpp). The free
+    # build never references any of them (verified: only v2_orchestrator,
+    # bip_scanner_runner, brain_wallet_runner include them, all excluded).
+    # bench_pipeline is intentionally NOT here: puzzle_solver.cpp (free)
+    # includes bench_pipeline.hpp for the free GPU benchmark.
+    "src/runtime/warpwallet_runner.cpp"
+    "src/runtime/warpwallet_runner.hpp"
+    "src/runtime/bloom_loader.cpp"
+    "src/runtime/bloom_loader.hpp"
+    "src/runtime/bip_addr_kind.cpp"
 
     # BIP scanner test corpus. Each test links collider_core which in
     # the free build does NOT have the BIP runtime, so leaving these
@@ -231,6 +246,21 @@ PRO_PATHS=(
     "tests/test_scan_state_atomics.cpp"
     "tests/test_sparkline.cpp"
     "tests/test_tui_panels.cpp"
+    # v1.5.5 candidate-generation strategies (corpus/PRINCE/OMEN/transforms/
+    # keyboard) live under src/generators/ (excluded) and the wordlist
+    # generator engine under src/ui/tui/ (excluded). Their tests #include
+    # those Pro-only headers, so they must be excluded too or the
+    # EXISTS-guarded test targets trip C1083 in the free build.
+    "tests/test_corpus_ngram_source.cpp"
+    "tests/test_omen_source.cpp"
+    "tests/test_prince_source.cpp"
+    "tests/test_brainwallet_transforms.cpp"
+    "tests/test_keyboard_walk_source.cpp"
+    "tests/test_wordlist_generator.cpp"
+    # gen_candidates materializes the Pro strategies to a wordlist file; it
+    # #includes src/generators/* (excluded). Its tool target is EXISTS-
+    # guarded, so leaving the source in free would break the build.
+    "src/tools/gen_candidates.cpp"
 
     # Brain-wallet rule files + scraper outputs at repo root
     "rules/"

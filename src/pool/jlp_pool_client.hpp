@@ -15,6 +15,7 @@
 
 #include "pool_client.hpp"
 #include "pool_config.hpp"
+#include "checkpoint_session.hpp"     // v1.5.4 checkpoint-replay session state
 #include "../core/secure_buffer.hpp"  // SecureString for the pool password
 #include <thread>
 #include <mutex>
@@ -88,9 +89,28 @@ enum class JLPMessageType : uint8_t {
     DP_SUBMIT_V2 = 0x23,
     DP_BATCH_V2  = 0x24,
 
+    // Distinguished points v3 (v1.5.4 checkpoint-replay anti-cheat). Superset
+    // of v2: each DP additionally carries a 32-byte Merkle root over the
+    // walk's checkpoint distances + a u32 committed-segment count, so the
+    // server can later CHALLENGE the worker to reveal random segments and
+    // replay them. Wire layout matches collision-protocol/src/jlp_protocol.py
+    // DistinguishedPointV3 (114 bytes). Only emitted when the negotiated
+    // server speaks protocol_version >= 4 AND the backend actually produced a
+    // checkpoint commitment; otherwise the client stays on DP_BATCH_V2.
+    DP_BATCH_V3  = 0x26,
+
     // Statistics
     STATS_REQ = 0x30,
     STATS_RSP = 0x31,
+
+    // Checkpoint-replay challenge (v1.5.4, protocol_version=4). The server
+    // sends CHALLENGE(work_id, nonce, [segment indices]); the worker replies
+    // CHALLENGE_RSP revealing the endpoint checkpoint distances + Merkle
+    // proofs for each requested segment. Wire codecs match
+    // collision-protocol/src/jlp_protocol.py encode_challenge /
+    // decode_challenge / encode_challenge_rsp.
+    CHALLENGE     = 0x32,
+    CHALLENGE_RSP = 0x33,
 
     // Solution
     SOLUTION  = 0x40,
@@ -253,6 +273,22 @@ struct JLPDistinguishedPointV2 {
 };
 static_assert(sizeof(JLPDistinguishedPointV2) == 78,
               "JLPDistinguishedPointV2 must be 78 bytes on the wire");
+
+// v1.5.4 checkpoint-replay DP. Superset of v2 with the walk commitment.
+// Field order + sizes match collision-protocol/src/jlp_protocol.py
+// DistinguishedPointV3 struct.pack('<QI32s32sBB32sI') == 114 bytes.
+struct JLPDistinguishedPointV3 {
+    uint64_t work_id;        // 8  - chunk id from WorkAssignment (LE)
+    uint32_t sequence;       // 4  - monotonic per-chunk counter (LE)
+    uint8_t  x[32];          // 32 - X coordinate
+    uint8_t  d[32];          // 32 - Distance
+    uint8_t  type;           // 1  - Tame (0) or Wild (1)
+    uint8_t  dp_bits;        // 1  - leading-zero bits used
+    uint8_t  ckpt_root[32];  // 32 - Merkle root over checkpoint distances
+    uint32_t n_segments;     // 4  - committed segment count (= checkpoints - 1)
+};
+static_assert(sizeof(JLPDistinguishedPointV3) == 114,
+              "JLPDistinguishedPointV3 must be 114 bytes on the wire");
 #pragma pack(pop)
 
 // Connection / authentication state machine.
@@ -394,6 +430,9 @@ public:
         std::string min_version;
         std::string download_url;
         std::array<uint8_t, 32> sha256{};
+        // v1.5.5 (C3): Ed25519 detached signature over the canonical update
+        // manifest. All-zero means "unsigned"; the client refuses to update.
+        std::array<uint8_t, 64> manifest_sig{};
         bool update_available = false;     // AuthOkPayload flags bit0
         bool maintenance_active = false;   // AuthOkPayload flags bit1 (advisory)
     };
@@ -596,6 +635,16 @@ private:
     // drain_dp_queue_into_batch.
     std::atomic<uint64_t> dropped_type_mismatch_{0};
 
+    // Count of DPs the sender drained but could not ship (AUTH not yet OK)
+    // AND could not re-queue because a WORK_ASN had already moved us onto a
+    // different chunk while the batch was in flight. Re-queuing them would
+    // re-tag stale-target DPs (x/d computed against the OLD pubkey) with the
+    // NEW current_work_id on the next drain, which the server's work_id
+    // attestation flags as cheating. They are dropped instead and counted
+    // here so the loss is operator-visible. Surfaced via
+    // get_requeue_stale_drop_count.
+    std::atomic<uint64_t> requeue_stale_drop_count_{0};
+
     // Receiver thread
     std::thread receiver_thread_;
     void receiver_loop();
@@ -614,6 +663,17 @@ private:
     // silently loses work; pushing them to a side queue would re-order
     // against fresh DPs.
     std::deque<DistinguishedPoint> dp_queue_;
+    // v1.5.4 checkpoint-replay session: retains the most recently committed
+    // walk's checkpoint distances so an incoming CHALLENGE can be answered,
+    // and owns the DP_BATCH_V3 / CHALLENGE_RSP wire helpers. Internally
+    // mutex-guarded (committed from the sender thread, challenged from the
+    // receiver thread).
+    pool::CheckpointSession checkpoint_session_;
+    // Set true once the backend reports a hardware-validated checkpoint
+    // capture is built + armed AND the negotiated protocol is v4. Gates the
+    // sender's V3 emit; default false keeps the client on V2 (no fabricated
+    // commitment is ever sent). See checkpoint_capture_available().
+    std::atomic<bool> checkpoint_capture_available_{false};
     // Mutable so const accessors (snapshot_dp_queue) can lock without
     // const_cast. The mutex itself is conceptually metadata, not state.
     mutable std::mutex dp_mutex_;
@@ -678,10 +738,70 @@ private:
                        const std::vector<JLPDistinguishedPointV2>& batch,
                        std::vector<uint8_t>& payload,
                        std::chrono::steady_clock::time_point& last_send);
+
+    // v1.5.4 checkpoint-replay emit path. Encodes a DP_BATCH_V3 frame (each DP
+    // carrying its walk's Merkle commitment) and retains the committed walk in
+    // checkpoint_session_ so a later CHALLENGE can be answered. The bookkeeping
+    // (sequence mirror, stats, session-log heartbeat) mirrors send_dp_batch.
+    // Only called when checkpoint_capture_available() is true; until the GPU
+    // checkpoint capture is hardware-validated the sender uses send_dp_batch
+    // (V2) and this path is reached only by the round-trip test.
+    bool send_dp_batch_v3(uint64_t current_work_id,
+                          uint32_t seq_start,
+                          const std::vector<JLPDistinguishedPointV3>& batch,
+                          const pool::CommittedWalk& committed_walk,
+                          std::vector<uint8_t>& payload,
+                          std::chrono::steady_clock::time_point& last_send);
+
+    // True when the GPU backend produces per-DP checkpoint chains so the
+    // client can legitimately emit DP_BATCH_V3 with a real commitment. This is
+    // a single gate so the client NEVER sends a fabricated commitment: it
+    // commits only what the walk actually produced, or it stays on V2.
+    //
+    // The GPU capture (RCGpuCore.cu / rckangaroo_wrapper.cu under
+    // COLLIDER_CHECKPOINT_CAPTURE) is hardware-validated (2026-06-04, RTX 3060,
+    // tests/test_checkpoint_capture.cu): the captured per-kangaroo checkpoint
+    // chain reproduces the canonical walk byte-for-byte. Availability is set at
+    // connection time from the backend's actual capability + the negotiated
+    // protocol version (must be PROTOCOL_VERSION_FULL/v4) and whether a
+    // committable (loop-escape-free) chain is on hand. Default false until the
+    // backend reports capture is built AND armed for the live run.
+    // checkpoint_capture_available() / set_checkpoint_capture_available() are
+    // declared in the public section below (set by PoolManager at connect time,
+    // read by tests). v3_commit_emit_active() (private) consumes the getter.
+    // True when the client may emit a real DP_BATCH_V3 commitment: the GPU
+    // backend is producing committable chains (checkpoint_capture_available)
+    // AND this connection negotiated protocol v4 (signalled by a loaded worker
+    // identity, the same gate send_hello uses to emit a v4 AUTH frame). Both
+    // must hold; otherwise the sender stays on DP_BATCH_V2. Single source of
+    // truth for the V3-vs-V2 selection, used by the drain + sender steps.
+    bool v3_commit_emit_active() const {
+        return checkpoint_capture_available() && worker_identity_ != nullptr;
+    }
+    // v1.5.5 (task #9): emit the single committable DP now at the FRONT of
+    // dp_queue_ as its own DP_BATCH_V3 frame, building the Merkle commitment
+    // over its checkpoint distances and retaining the walk so a later CHALLENGE
+    // can be answered. Called by the sender ONLY after the preceding V2 batch
+    // has been flushed (to preserve wire order) and ONLY when
+    // v3_commit_emit_active(). Returns true if a V3 frame was sent (and the DP
+    // popped), false if there was no committable DP at the front, AUTH/conn was
+    // not ready, or the send failed (in which case the DP is left queued for a
+    // later retry). seq_inout is advanced by 1 on a successful send.
+    bool emit_front_committable_dp_v3(
+        uint64_t current_work_id,
+        uint8_t expected_type,
+        uint32_t& seq_inout,
+        std::vector<uint8_t>& payload,
+        std::chrono::steady_clock::time_point& last_send);
     // Roll back the sequence advance and push the drained DPs back onto
     // the FRONT of dp_queue_ in reverse so wire order is preserved.
     // Called when we drained DPs but the connection wasn't AUTH_OK yet,
-    // so the batch must wait for the next iteration.
+    // so the batch must wait for the next iteration. ONLY re-queues when the
+    // chunk under work_mutex_ still matches current_work_id; if a WORK_ASN
+    // moved us to a different chunk during the stall, the batch is DROPPED
+    // (counted in requeue_stale_drop_count_) instead of re-queued, because
+    // re-tagging old-target DPs with the new work_id is a server-side
+    // cheating signal.
     void requeue_unauth_batch(uint64_t current_work_id,
                               uint32_t seq_start,
                               const std::vector<JLPDistinguishedPointV2>& batch);
@@ -707,11 +827,32 @@ public:
     uint64_t get_shutdown_drop_count() const {
         return shutdown_drop_count_.load(std::memory_order_relaxed);
     }
+    // Count of drained-but-unsendable DPs dropped (not re-queued) because a
+    // WORK_ASN changed the chunk during the pre-AUTH stall. See
+    // requeue_stale_drop_count_ for the rationale. Used by tests + operator
+    // diagnostics to confirm a chunk change correctly discards old-target DPs
+    // instead of re-tagging them with the new work_id.
+    uint64_t get_requeue_stale_drop_count() const {
+        return requeue_stale_drop_count_.load(std::memory_order_relaxed);
+    }
     // caller copies all queued DPs out so they can be
     // serialized to disk before the client is destroyed. Returns the
     // copy; original queue is left intact (caller decides whether to
     // discard).
     std::vector<DistinguishedPoint> snapshot_dp_queue() const;
+
+    // v1.5.5 checkpoint-replay (task #9). Capability gate for the DP_BATCH_V3
+    // emit path. PoolManager sets it true at connect time when this build has
+    // the GPU checkpoint capture AND a v4 worker identity is loaded; default
+    // false keeps the client on DP_BATCH_V2 so it never sends a fabricated
+    // commitment. Public so PoolManager (which owns the client lifecycle, not a
+    // friend) and the round-trip tests can drive it.
+    bool checkpoint_capture_available() const {
+        return checkpoint_capture_available_.load(std::memory_order_acquire);
+    }
+    void set_checkpoint_capture_available(bool v) {
+        checkpoint_capture_available_.store(v, std::memory_order_release);
+    }
 private:
 
     // Protocol helpers. send_message defaults header.flags to the
@@ -745,6 +886,14 @@ private:
     void handle_ping(const JLPHeader& header, const std::vector<uint8_t>& payload);
     void handle_maintenance(const JLPHeader& header,
                             const std::vector<uint8_t>& payload);
+    // v1.5.4 checkpoint-replay: the server asks us to reveal K random segments
+    // of our most recently committed walk. Builds the CHALLENGE_RSP from the
+    // retained checkpoint distances (checkpoint_session_) and sends it. A
+    // no-op (with a warning) if we have no retained commitment for the
+    // challenged work_id -- which is the honest state until GPU checkpoint
+    // capture is hardware-validated and the client emits V3.
+    void handle_challenge(const JLPHeader& header,
+                          const std::vector<uint8_t>& payload);
     void handle_default_unknown(const JLPHeader& header,
                                 const std::vector<uint8_t>& payload);
 

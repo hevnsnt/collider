@@ -1745,21 +1745,23 @@ bool test_stream_resync_fragmented() {
 }
 
 // ---------------------------------------------------------------------------
-// v1.5.4: AUTH_OK update advert parsing. The server completes AUTH then sends
-// an AUTH_OK whose payload is a 324-byte AuthOkPayload (latest_version,
-// download_url, nonzero sha256, flags=update_available). The client must
-// parse it and expose it via get_update_advert(). We do NOT trigger a real
-// self-update here: this unit context only inspects the parsed advert.
+// v1.5.4/v1.5.5: AUTH_OK update advert parsing. The server completes AUTH then
+// sends an AUTH_OK whose payload is a 388-byte AuthOkPayload (latest_version,
+// download_url, nonzero sha256, flags=update_available, manifest_sig). The
+// client must parse it and expose it via get_update_advert(). We do NOT
+// trigger a real self-update here: this unit context only inspects the parsed
+// advert, so the manifest_sig is a deterministic non-verifying pattern (the
+// signature gate is exercised by test_self_update_signing).
 // ---------------------------------------------------------------------------
 bool test_authok_advert_parsing() {
     MockJlpServer server;
     auto client = make_connected(server.port());
     if (!client) return fail("authok_advert", "connect failed");
 
-    // Build the 324-byte AuthOkPayload by hand (matches
+    // Build the 388-byte AuthOkPayload by hand (matches
     // jlp_wire_generated.hpp: latest[16] min[16] flags[1] reserved[3]
-    // url[256] sha256[32]).
-    uint8_t payload[324];
+    // url[256] sha256[32] manifest_sig[64]).
+    uint8_t payload[388];
     std::memset(payload, 0, sizeof(payload));
     const char* latest = "1.5.9";
     const char* minv   = "1.5.0";
@@ -1770,6 +1772,9 @@ bool test_authok_advert_parsing() {
     std::memcpy(payload + 36, url, std::strlen(url));
     // Nonzero sha256 (deterministic pattern).
     for (int i = 0; i < 32; ++i) payload[36 + 256 + i] = static_cast<uint8_t>(0xA0 + i);
+    // Nonzero manifest_sig (deterministic pattern); parsing-only, not a valid
+    // Ed25519 signature.
+    for (int i = 0; i < 64; ++i) payload[36 + 256 + 32 + i] = static_cast<uint8_t>(0x10 + i);
 
     std::atomic<bool> ok{false};
     std::thread t([&] { ok = client->authenticate("worker", ""); });
@@ -1811,6 +1816,14 @@ bool test_authok_advert_parsing() {
         }
     }
     if (!sha_ok) return fail("authok_advert", "sha256 mismatch");
+    bool sig_ok = true;
+    for (int i = 0; i < 64; ++i) {
+        if (advert.manifest_sig[static_cast<size_t>(i)] != static_cast<uint8_t>(0x10 + i)) {
+            sig_ok = false;
+            break;
+        }
+    }
+    if (!sig_ok) return fail("authok_advert", "manifest_sig mismatch");
 
     client.reset();
     return true;

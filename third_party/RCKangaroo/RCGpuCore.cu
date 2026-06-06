@@ -46,6 +46,96 @@
 // GPU.
 __device__ __constant__ __align__(16) u64 jmp2_table[8 * JMP_CNT];
 
+// v1.5.5 walk-step validation (task #7): optional ground-truth trace of a
+// single kangaroo (global index 0 = block 0, thread 0, group 0). When
+// g_dbg_on is set by the host, KernelA records, for the FIRST g_dbg_cap
+// steps that kangaroo takes from its birth point, the post-step affine
+// (x, y) limbs and the flagged jmp_ind (index | INV_FLAG | JMP2_FLAG |
+// DP_FLAG). The server's checkpoint_replay.walk_step is then cross-checked
+// against this to prove the CPU model matches the real silicon before
+// challenge_mode is ever enabled.
+//
+// Compiled ONLY when COLLIDER_WALKSTEP_TRACE is defined (a validation
+// build). Release builds exclude it entirely, so the shipped kernel
+// carries no debug globals or capture branch. Re-enable with
+// -DCOLLIDER_WALKSTEP_TRACE to re-run scripts/validate_walkstep_trace.py.
+#ifdef COLLIDER_WALKSTEP_TRACE
+#define DBG_CAP STEP_CNT
+__device__ u32 g_dbg_on = 0;
+__device__ u32 g_dbg_n  = 0;          // steps captured so far (<= DBG_CAP)
+__device__ u64 g_dbg_birth_x[4];
+__device__ u64 g_dbg_birth_y[4];
+__device__ u64 g_dbg_x[DBG_CAP * 4];
+__device__ u64 g_dbg_y[DBG_CAP * 4];
+__device__ u32 g_dbg_jmp[DBG_CAP];
+#endif // COLLIDER_WALKSTEP_TRACE
+
+#ifdef COLLIDER_CHECKPOINT_CAPTURE
+// v1.5.5 per-kangaroo checkpoint capture (task #9).
+//
+// The checkpoint-replay anti-cheat needs, for the kangaroo that lands a DP,
+// the ORDERED sequence of its walk DISTANCE every CHECKPOINT_INTERVAL jumps
+// plus the loop-state (L1S2) bit at each of those points. The DP record only
+// carries the final distance; the chain of intermediate checkpoint distances
+// lets the pool server challenge a random segment and replay it forward.
+//
+// The distance per kangaroo is the signed 192-bit value KernelB accumulates
+// into Kparams.Kangs[kang*12 + 8..10] (jmp1/jmp2 add/sub). We capture it from
+// INSIDE the KernelB DO_ITER loop -- the exact point the canonical CPU walk
+// (src/core/checkpoint_walk.hpp) reproduces -- so the captured chain is what
+// the server replays. A per-kangaroo global jump counter (g_ckpt_jumps) is
+// persisted in device memory across the STEP_CNT-sized kernel launches so the
+// 65536-jump checkpoint cadence is honored regardless of launch boundaries.
+//
+// Plumbing mirrors COLLIDER_WALKSTEP_TRACE: gated __device__ buffers the host
+// arms with cudaMemcpyToSymbol and reads with cudaMemcpyFromSymbol. The ring
+// is per (designated) kangaroo so the validation harness can drive a tiny
+// solve, read one kangaroo's ordered checkpoints, and replay them against the
+// CPU oracle.
+//
+// Capacity: CHK_MAX_KANG kangaroos x CHK_MAX_CP checkpoints. The host
+// designates a contiguous window [g_ckpt_base, g_ckpt_base+CHK_MAX_KANG) of
+// global kangaroo indices to capture (default base 0). Each captured leaf is
+// the 192-bit distance (3 u64) + the L1S2 bit + a loop-escape flag so the
+// host can tell a true capture mismatch from an (expected) jmp3 loop-escape
+// segment.
+#define CHK_INTERVAL    65536u   // == checkpoint_walk::kCheckpointInterval
+#define CHK_MAX_KANG    256u     // kangaroos whose chain we retain on device
+#define CHK_MAX_CP      64u      // checkpoints retained per kangaroo (incl birth)
+
+__device__ u32 g_ckpt_on   = 0;          // master enable
+__device__ u32 g_ckpt_base = 0;          // first global kang index captured
+// Per-kangaroo running jump count (persisted across launches).
+__device__ u64 g_ckpt_jumps[CHK_MAX_KANG];
+// Per-kangaroo count of checkpoints written so far (incl. birth at index 0).
+__device__ u32 g_ckpt_cnt[CHK_MAX_KANG];
+// Per-kangaroo loop-escape (jmp3 / KernelC) event count since birth. A
+// non-zero value on any segment means the canonical jmp1/jmp2 walk cannot
+// reproduce that segment; the host uses it to interpret a replay mismatch.
+__device__ u32 g_ckpt_loopesc[CHK_MAX_KANG];
+// Ring of checkpoint distances: [kang][cp][3 u64 little-endian signed 192b].
+__device__ u64 g_ckpt_dist[CHK_MAX_KANG * CHK_MAX_CP * 3];
+// Ring of L1S2 bit at each checkpoint (0/1).
+__device__ u8  g_ckpt_l1s2[CHK_MAX_KANG * CHK_MAX_CP];
+
+// Record one checkpoint sample for global kangaroo `gkang` if it falls in the
+// captured window and the per-kangaroo ring is not full. `d` is the signed
+// 192-bit distance (3 u64), `l1s2_bit` the loop-state bit for the NEXT step.
+__device__ __forceinline__ void chk_record(u32 gkang, const u64* d, u32 l1s2_bit)
+{
+    if (!g_ckpt_on) return;
+    u32 base = g_ckpt_base;
+    if (gkang < base || gkang >= base + CHK_MAX_KANG) return;
+    u32 slot = gkang - base;
+    u32 cp = g_ckpt_cnt[slot];
+    if (cp >= CHK_MAX_CP) return;
+    u64* dst = g_ckpt_dist + (slot * CHK_MAX_CP + cp) * 3;
+    dst[0] = d[0]; dst[1] = d[1]; dst[2] = d[2];
+    g_ckpt_l1s2[slot * CHK_MAX_CP + cp] = (u8)(l1s2_bit & 1u);
+    g_ckpt_cnt[slot] = cp + 1;
+}
+#endif // COLLIDER_CHECKPOINT_CAPTURE
+
 
 #define BLOCK_CNT	gridDim.x
 #define BLOCK_X		blockIdx.x
@@ -217,6 +307,29 @@ __global__ void KernelA(const TKparams Kparams)
 			lds_jlist[8 * THREAD_X + (group % 8)] = jmp_ind;
 			if ((group % 8) == 0)
 				st_cs_v4_b32(&jlist[(group / 8) * 32 + (THREAD_X % 32)], *(int4*)&lds_jlist[8 * THREAD_X]); //skip L2 cache
+
+#ifdef COLLIDER_WALKSTEP_TRACE
+			// v1.5.5 walk-step trace capture (task #7): record kangaroo
+			// (0,0,0) only. x0/y0 are the pre-step (birth at i==0) point;
+			// x/y are the post-step point; jmp_ind carries the full
+			// index | INV_FLAG | JMP2_FLAG | DP_FLAG used this step.
+			if (g_dbg_on && BLOCK_X == 0 && THREAD_X == 0 && group == 0)
+			{
+				u32 i = g_dbg_n;
+				if (i < DBG_CAP)
+				{
+					if (i == 0)
+					{
+#pragma unroll
+						for (int q = 0; q < 4; q++) { g_dbg_birth_x[q] = x0[q]; g_dbg_birth_y[q] = y0[q]; }
+					}
+#pragma unroll
+					for (int q = 0; q < 4; q++) { g_dbg_x[i * 4 + q] = x[q]; g_dbg_y[i * 4 + q] = y[q]; }
+					g_dbg_jmp[i] = jmp_ind;
+					g_dbg_n = i + 1;
+				}
+			}
+#endif // COLLIDER_WALKSTEP_TRACE
 
 			if (step_ind + MD_LEN >= STEP_CNT) //store last kangs to be able to find loop exit point
 			{
@@ -466,6 +579,28 @@ __global__ void KernelA(const TKparams Kparams)
 			if (((group + jlast_add) % 8) == 0)
 				st_cs_v4_b32(&jlist[(group / 8) * 32 + (THREAD_X % 32)], *(int4*)&lds_jlist[8 * THREAD_X]); //skip L2 cache
 
+#ifdef COLLIDER_WALKSTEP_TRACE
+			// v1.5.5 walk-step trace capture (task #7), OLD_GPU KernelA
+			// (the variant compiled for __CUDA_ARCH__ < 890, i.e. pre-RTX-40xx).
+			// Mirrors the new-GPU capture: kangaroo (0,0,0) only.
+			if (g_dbg_on && BLOCK_X == 0 && THREAD_X == 0 && group == 0)
+			{
+				u32 i = g_dbg_n;
+				if (i < DBG_CAP)
+				{
+					if (i == 0)
+					{
+#pragma unroll
+						for (int q = 0; q < 4; q++) { g_dbg_birth_x[q] = x0[q]; g_dbg_birth_y[q] = y0[q]; }
+					}
+#pragma unroll
+					for (int q = 0; q < 4; q++) { g_dbg_x[i * 4 + q] = x[q]; g_dbg_y[i * 4 + q] = y[q]; }
+					g_dbg_jmp[i] = jmp_ind;
+					g_dbg_n = i + 1;
+				}
+			}
+#endif // COLLIDER_WALKSTEP_TRACE
+
 			if (step_ind + MD_LEN >= STEP_CNT) //store last kangs to be able to find loop exit point
 			{
 				int n = step_ind + MD_LEN - STEP_CNT;
@@ -568,10 +703,43 @@ __device__ __forceinline__ void BuildDP(const TKparams& Kparams, int kang_ind, u
 	else
 		dp_type = 3 * kang_ind / Kparams.KangCnt; //kang type (BOTH)
 	DPs[14] = dp_type;
+#ifdef COLLIDER_CHECKPOINT_CAPTURE
+	// Tag the DP with the producing kangaroo's global index in the otherwise
+	// unused 64-byte slot (u32 index 15 == byte offset 60). The wrapper uses
+	// this to pair a DP with the per-kangaroo checkpoint chain captured for
+	// that index, so the client can emit a real DP_BATCH_V3 commitment. This
+	// is gated to the capture build and never read by the v2 path; it does
+	// NOT touch x, d, type, or any walk state, so the walk math and the v2 DP
+	// contract are byte-for-byte unchanged.
+	DPs[15] = kang_ind;
+#endif
 }
 
 __device__ __forceinline__ bool ProcessJumpDistance(u32 step_ind, u32 d_cur, u64* d, u32 kang_ind, u64* jmp1_d, u64* jmp2_d, const TKparams& Kparams, u64* table, u32* cur_ind, u8 iter)
 {
+#ifdef COLLIDER_CHECKPOINT_CAPTURE
+	// Capture a checkpoint BEFORE this jump mutates `d`. At this point `d`
+	// holds the distance after exactly g_ckpt_jumps[slot] jumps and `d_cur`
+	// carries the JMP2_FLAG (== loop-state bit) for the jump we are ABOUT to
+	// apply, i.e. the l1s2 bit ENTERING the next step. That pair
+	// (d_after_m_jumps, l1s2_entering_step_m+1) is exactly what
+	// checkpoint_walk::generate_checkpoints records at checkpoint m, so the
+	// captured chain is byte-for-byte what the server replays. The birth
+	// checkpoint (m == 0) is captured here on the very first jump.
+	if (g_ckpt_on)
+	{
+		u32 base = g_ckpt_base;
+		if (kang_ind >= base && kang_ind < base + CHK_MAX_KANG)
+		{
+			u32 slot = kang_ind - base;
+			u64 jumps = g_ckpt_jumps[slot];
+			if ((jumps % CHK_INTERVAL) == 0)
+				chk_record(kang_ind, d, (d_cur & JMP2_FLAG) ? 1u : 0u);
+			g_ckpt_jumps[slot] = jumps + 1;
+		}
+	}
+#endif // COLLIDER_CHECKPOINT_CAPTURE
+
 	u64* jmp_d = (d_cur & JMP2_FLAG) ? jmp2_d : jmp1_d;
 
 	__align__(16) u64 jmp[3];
@@ -615,6 +783,21 @@ __device__ __forceinline__ bool ProcessJumpDistance(u32 step_ind, u32 d_cur, u64
 	if (!LoopSize)
 		LoopSize = MD_LEN;
 	atomicAdd(Kparams.dbg_buf + LoopSize, 1); //dbg
+
+#ifdef COLLIDER_CHECKPOINT_CAPTURE
+	// A loop was detected for this kangaroo: KernelC will apply a jmp3
+	// loop-escape jump, which mutates the distance OFF the jmp1/jmp2 path the
+	// canonical walk (and the server replay) model. Flag the captured
+	// kangaroo so the host can distinguish a true capture mismatch from an
+	// (expected) loop-escape segment. This does NOT change the walk; it only
+	// counts the event for the gated validation build.
+	if (g_ckpt_on)
+	{
+		u32 cbase = g_ckpt_base;
+		if (kang_ind >= cbase && kang_ind < cbase + CHK_MAX_KANG)
+			atomicAdd(&g_ckpt_loopesc[kang_ind - cbase], 1u);
+	}
+#endif // COLLIDER_CHECKPOINT_CAPTURE
 
 	//calc index in LastPnts
 	u32 ind_LastPnts = MD_LEN - 1 - ((STEP_CNT - 1 - step_ind) % LoopSize);
@@ -993,6 +1176,109 @@ void CallGpuKernelGen(TKparams Kparams)
 {
 	KernelGen << < Kparams.BlockCnt, Kparams.BlockSize, 0 >> > (Kparams);
 }
+
+#ifdef COLLIDER_CHECKPOINT_CAPTURE
+// v1.5.5 per-kangaroo checkpoint capture (task #9) host helpers. extern "C"
+// so the wrapper / validation harness can arm and drain capture without
+// touching the __device__ symbols directly. Compiled only when
+// COLLIDER_CHECKPOINT_CAPTURE is defined.
+
+// Arm capture for the window [base, base + CHK_MAX_KANG) of global kangaroo
+// indices. Resets all per-kangaroo counters and rings so a fresh run starts
+// from each captured kangaroo's birth.
+extern "C" void ckpt_enable_capture(unsigned int base)
+{
+	u32 one = 1, b = base;
+	static u64 zeros_jumps[CHK_MAX_KANG];
+	static u32 zeros_cnt[CHK_MAX_KANG];
+	static u32 zeros_loop[CHK_MAX_KANG];
+	for (u32 i = 0; i < CHK_MAX_KANG; i++) { zeros_jumps[i] = 0; zeros_cnt[i] = 0; zeros_loop[i] = 0; }
+	cudaMemcpyToSymbol(g_ckpt_jumps, zeros_jumps, sizeof(zeros_jumps));
+	cudaMemcpyToSymbol(g_ckpt_cnt, zeros_cnt, sizeof(zeros_cnt));
+	cudaMemcpyToSymbol(g_ckpt_loopesc, zeros_loop, sizeof(zeros_loop));
+	cudaMemcpyToSymbol(g_ckpt_base, &b, sizeof(u32));
+	cudaMemcpyToSymbol(g_ckpt_on, &one, sizeof(u32));
+}
+
+extern "C" void ckpt_disable_capture()
+{
+	u32 zero = 0;
+	cudaMemcpyToSymbol(g_ckpt_on, &zero, sizeof(u32));
+}
+
+// Constants for the host so it can size buffers without re-deriving them.
+extern "C" unsigned int ckpt_interval()      { return CHK_INTERVAL; }
+extern "C" unsigned int ckpt_max_kang()       { return CHK_MAX_KANG; }
+extern "C" unsigned int ckpt_max_cp()         { return CHK_MAX_CP; }
+
+// Read back the captured chain for one captured slot (0-based within the
+// window). `dist_out` receives cnt*3 u64 (signed 192-bit little-endian
+// distances), `l1s2_out` cnt bytes, `loopesc_out` the loop-escape event count
+// for that kangaroo. Returns the number of checkpoints captured (incl. birth).
+extern "C" unsigned int ckpt_readback_slot(unsigned int slot,
+                                           unsigned long long* dist_out,
+                                           unsigned char* l1s2_out,
+                                           unsigned int* loopesc_out)
+{
+	if (slot >= CHK_MAX_KANG) return 0;
+	u32 cnt = 0;
+	cudaMemcpyFromSymbol(&cnt, g_ckpt_cnt, sizeof(u32),
+	                     (size_t)slot * sizeof(u32));
+	if (cnt > CHK_MAX_CP) cnt = CHK_MAX_CP;
+	if (loopesc_out)
+		cudaMemcpyFromSymbol(loopesc_out, g_ckpt_loopesc, sizeof(u32),
+		                     (size_t)slot * sizeof(u32));
+	if (cnt)
+	{
+		cudaMemcpyFromSymbol(dist_out, g_ckpt_dist,
+		                     (size_t)cnt * 3 * sizeof(u64),
+		                     (size_t)slot * CHK_MAX_CP * 3 * sizeof(u64));
+		cudaMemcpyFromSymbol(l1s2_out, g_ckpt_l1s2,
+		                     (size_t)cnt * sizeof(u8),
+		                     (size_t)slot * CHK_MAX_CP * sizeof(u8));
+	}
+	return cnt;
+}
+#endif // COLLIDER_CHECKPOINT_CAPTURE
+
+#ifdef COLLIDER_WALKSTEP_TRACE
+// v1.5.5 walk-step validation (task #7) host helpers. Toggle / read the
+// single-kangaroo debug trace captured by KernelA. extern "C" so the test
+// harness can call them without touching the __device__ symbols directly.
+// Compiled only in a -DCOLLIDER_WALKSTEP_TRACE validation build.
+extern "C" void dbg_enable_capture()
+{
+	u32 one = 1, zero = 0;
+	cudaMemcpyToSymbol(g_dbg_n, &zero, sizeof(u32));
+	cudaMemcpyToSymbol(g_dbg_on, &one, sizeof(u32));
+}
+
+extern "C" void dbg_disable_capture()
+{
+	u32 zero = 0;
+	cudaMemcpyToSymbol(g_dbg_on, &zero, sizeof(u32));
+}
+
+// Copies up to DBG_CAP captured steps into caller buffers. birth_x/birth_y
+// are 4 u64 each; xs/ys are 4*DBG_CAP u64 each; jmps is DBG_CAP u32.
+// Returns the number of steps actually captured.
+extern "C" u32 dbg_readback(u64* birth_x, u64* birth_y,
+                            u64* xs, u64* ys, u32* jmps)
+{
+	u32 n = 0;
+	cudaMemcpyFromSymbol(&n, g_dbg_n, sizeof(u32));
+	if (n > DBG_CAP) n = DBG_CAP;
+	cudaMemcpyFromSymbol(birth_x, g_dbg_birth_x, 4 * sizeof(u64));
+	cudaMemcpyFromSymbol(birth_y, g_dbg_birth_y, 4 * sizeof(u64));
+	if (n)
+	{
+		cudaMemcpyFromSymbol(xs, g_dbg_x, (size_t)n * 4 * sizeof(u64));
+		cudaMemcpyFromSymbol(ys, g_dbg_y, (size_t)n * 4 * sizeof(u64));
+		cudaMemcpyFromSymbol(jmps, g_dbg_jmp, (size_t)n * sizeof(u32));
+	}
+	return n;
+}
+#endif // COLLIDER_WALKSTEP_TRACE
 
 cudaError_t cuSetGpuParams(TKparams Kparams, u64* _jmp2_table)
 {

@@ -43,10 +43,49 @@
 
 #include <cuda_runtime.h>
 
+#include <climits>
 #include <cstdio>
 
 namespace collider {
 namespace gpu {
+
+// Safe blocks-from-items computation shared across .cu translation units.
+//
+// History: several kernel launch sites computed
+// `const int blocks = (count + threads - 1) / threads;`. Once count
+// exceeds INT_MAX this signed-int expression overflows (UB on MSVC) and
+// produces a garbage or negative grid dimension; CUDA then either rejects
+// the launch with a confusing error or, worse, launches an under-sized
+// grid that silently skips the tail of the input. fused_pipeline.cu grew
+// a TU-local guard (fused_compute_grid_blocks) for its own launches; the
+// h160 bloom kernels (h160_bloom_filter.cu) never got it. This is the
+// shared, header-only version so every TU computes the grid identically:
+// 64-bit unsigned math plus an explicit INT_MAX refusal at the grid-X
+// bound.
+inline cudaError_t compute_grid_blocks(unsigned long long total_items,
+                                       int threads,
+                                       int* blocks_out) {
+    if (threads <= 0 || blocks_out == nullptr) {
+        std::fprintf(stderr,
+            "[!] compute_grid_blocks: invalid threads=%d or null out\n",
+            threads);
+        return cudaErrorInvalidValue;
+    }
+    unsigned long long blocks =
+        (total_items + (unsigned long long)threads - 1ull) /
+        (unsigned long long)threads;
+    if (blocks == 0ull) blocks = 1ull;
+    if (blocks > (unsigned long long)INT_MAX) {
+        std::fprintf(stderr,
+            "[!] compute_grid_blocks: launch refused, blocks=%llu exceeds "
+            "INT_MAX (grid-X bound). total_items=%llu threads=%d. "
+            "Split host-side.\n",
+            blocks, total_items, threads);
+        return cudaErrorInvalidConfiguration;
+    }
+    *blocks_out = (int)blocks;
+    return cudaSuccess;
+}
 
 // Pre-launch context-state probe. Returns cudaSuccess if the device's
 // last-error slot is clean (safe to launch); otherwise returns the

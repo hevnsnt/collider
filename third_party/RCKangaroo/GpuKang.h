@@ -109,6 +109,16 @@ public:
 	// the solve loop similarly runs until external Stop().
 	int Mode = KANG_MODE_BOTH;
 
+	// theCollider: opaque context pointer threaded into AddPointsToList.
+	// Execute() passes this verbatim as the first argument to
+	// AddPointsToList(void*, ...) so the DP sink no longer has to reach
+	// blindly into file-scope globals to find its accumulator. The
+	// upstream standalone (RCKangaroo.cpp) leaves this null and ignores
+	// the argument; theCollider's wrapper sets it to the single owned
+	// RckSingletonState before launching the worker threads. Owned by the
+	// caller; RCGpuKang only forwards it.
+	void* PointSinkCtx = nullptr;
+
 	int CalcKangCnt();
 	bool Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP* _EcJumps1, EcJMP* _EcJumps2, EcJMP* _EcJumps3);
 	void Stop();

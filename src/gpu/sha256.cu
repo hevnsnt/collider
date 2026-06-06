@@ -9,6 +9,7 @@
 #include <cstdint>
 
 #include "hash_rounds.cuh"
+#include "cuda_helpers.hpp"  // R3: collider::gpu::compute_grid_blocks
 
 namespace collider {
 namespace gpu {
@@ -294,7 +295,13 @@ cudaError_t sha256_batch(
     cudaStream_t stream
 ) {
     const int threads_per_block = 256;
-    const int blocks = (count + threads_per_block - 1) / threads_per_block;
+    // R3: 64-bit-safe grid sizing (count is user-input-driven).
+    int blocks = 0;
+    {
+        cudaError_t grid_err = collider::gpu::compute_grid_blocks(
+            static_cast<unsigned long long>(count), threads_per_block, &blocks);
+        if (grid_err != cudaSuccess) return grid_err;
+    }
 
     sha256_batch_kernel<<<blocks, threads_per_block, 0, stream>>>(
         d_passphrases,
@@ -317,7 +324,13 @@ cudaError_t sha256_pubkey33_batch(
     cudaStream_t stream
 ) {
     const int threads_per_block = 256;
-    const int blocks = (count + threads_per_block - 1) / threads_per_block;
+    // R3: 64-bit-safe grid sizing (count is user-input-driven).
+    int blocks = 0;
+    {
+        cudaError_t grid_err = collider::gpu::compute_grid_blocks(
+            static_cast<unsigned long long>(count), threads_per_block, &blocks);
+        if (grid_err != cudaSuccess) return grid_err;
+    }
 
     sha256_pubkey33_kernel<<<blocks, threads_per_block, 0, stream>>>(
         d_pubkeys,
@@ -338,7 +351,13 @@ cudaError_t sha256_pubkey65_batch(
     cudaStream_t stream
 ) {
     const int threads_per_block = 256;
-    const int blocks = (count + threads_per_block - 1) / threads_per_block;
+    // R3: 64-bit-safe grid sizing (count is user-input-driven).
+    int blocks = 0;
+    {
+        cudaError_t grid_err = collider::gpu::compute_grid_blocks(
+            static_cast<unsigned long long>(count), threads_per_block, &blocks);
+        if (grid_err != cudaSuccess) return grid_err;
+    }
 
     sha256_pubkey65_kernel<<<blocks, threads_per_block, 0, stream>>>(
         d_pubkeys,

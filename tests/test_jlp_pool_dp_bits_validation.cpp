@@ -46,6 +46,7 @@
 #endif
 
 #include "pool/jlp_pool_client.hpp"
+#include "pool/jlp_wire_generated.hpp"  // jlp_wire::PROTOCOL_VERSION
 #include "pool/pool_client.hpp"
 
 #include <atomic>
@@ -77,12 +78,14 @@ struct WSAGuard {
 
 constexpr uint8_t TYPE_AUTH_OK   = 0x02;
 constexpr uint8_t TYPE_WORK_ASN  = 0x11;
-// v1.5 (protocol_version=3): the client now strictly requires flags=3 in
-// every header (set by jlp_wire::PROTOCOL_VERSION). Mocks below send v3
-// frames so the handshake reaches AUTH_OK and the dp_bits validation
-// path is exercisable. The dp_bits tests themselves are protocol-version
-// agnostic; the bump here is mock-server hygiene, not a behavior change.
-constexpr uint8_t MOCK_PROTOCOL_VERSION = 3;
+// The client strictly requires the header flags byte to equal its
+// compiled jlp_wire::PROTOCOL_VERSION, so the mock must echo that exact
+// value or the handshake never reaches AUTH_OK. Track the real constant
+// instead of a hardcoded literal so a future wire bump cannot silently
+// strand these tests at an old version (the v3 -> v4 bump did exactly
+// that). The dp_bits tests themselves are protocol-version agnostic.
+constexpr uint8_t MOCK_PROTOCOL_VERSION =
+    static_cast<uint8_t>(collider::pool::jlp_wire::PROTOCOL_VERSION);
 
 std::vector<uint8_t> build_frame(uint8_t type, const void* payload, uint16_t len) {
     std::vector<uint8_t> out;

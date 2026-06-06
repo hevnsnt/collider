@@ -105,9 +105,17 @@ public:
     std::function<void(const bloom::BloomHit&)> bloom_hit_callback;
 #endif
 
-    // DP callback for pool mode: (x[32], d[32], type) -> called for each new DP
-    // Used to submit DPs to pool server
-    std::function<void(const uint8_t*, const uint8_t*, uint8_t)> dp_callback;
+    // DP callback for pool mode: called for each new DP. Used to submit DPs to
+    // the pool server.
+    //   (x[32], d[32], type, ckpt_distances*, ckpt_l1s2*)
+    // v1.5.5 (task #9): the trailing two pointers carry the COMMITTABLE
+    // checkpoint chain for the kangaroo that produced this DP (ordered 32-byte
+    // big-endian distances mod n + per-checkpoint L1S2 bits). nullptr means the
+    // DP has no committable chain (non-capture build, or a loop-escape /
+    // non-replayable walk) and the pool client must emit DP_BATCH_V2.
+    std::function<void(const uint8_t*, const uint8_t*, uint8_t,
+                       const std::vector<std::array<uint8_t, 32>>*,
+                       const std::vector<uint8_t>*)> dp_callback;
 
     RCKangarooManager();
     ~RCKangarooManager();
@@ -216,6 +224,37 @@ public:
     bool request_save_on_stop();
     bool save_herd_state(const std::string& path);
     bool load_herd_state(const std::string& path);
+
+    // ---- v1.5.5 checkpoint-replay capture (task #9) ----
+    //
+    // True iff this build compiled the per-kangaroo checkpoint capture
+    // (COLLIDER_CHECKPOINT_CAPTURE). When false, the rest of these are no-ops
+    // / empty and the pool client must stay on DP_BATCH_V2.
+    static bool checkpoint_capture_built();
+    // Window of global kangaroo indices the device retains chains for, and the
+    // checkpoint cadence (jumps per checkpoint). 0 when capture not built.
+    static uint32_t checkpoint_window_size();
+    static uint32_t checkpoint_interval();
+
+#ifdef COLLIDER_CHECKPOINT_CAPTURE
+    // Arm/disarm the device capture for the window [base, base+window_size).
+    // The DP record's kangaroo-index tag (set by BuildDP) tells the host which
+    // captured slot a DP belongs to. Arm before solve() launches workers.
+    void enable_checkpoint_capture(uint32_t base = 0);
+    void disable_checkpoint_capture();
+
+    // Read back the ordered checkpoint chain (distances reduced mod n, encoded
+    // 32-byte big-endian, ready for checkpoint_commit::build_root) for captured
+    // `slot`. Returns true only for a COMMITTABLE walk: >= 2 checkpoints (one
+    // full segment), birth L1S2 == 0, and ZERO jmp3 loop-escapes (so every
+    // segment replays under the server's pure jmp1/jmp2 walk). A loop-escape
+    // walk returns false and MUST NOT be committed. `l1s2_out` carries the
+    // per-checkpoint loop-state bit revealed in a CHALLENGE_RSP.
+    bool read_checkpoint_chain(
+        uint32_t slot,
+        std::vector<std::array<uint8_t, 32>>& out,
+        std::vector<uint8_t>& l1s2_out) const;
+#endif
 
 private:
     struct Impl;

@@ -984,6 +984,95 @@ inline std::array<uint8_t, 20> compute_hash160(const uint8_t* privkey_bytes) {
 }
 
 /**
+ * Compute the compressed public key (33 bytes: 02/03 parity prefix || X)
+ * and the uncompressed public key (65 bytes: 0x04 || X || Y) from a
+ * 32-byte big-endian private key in a single EC multiply.
+ *
+ * The brain-wallet GPU kernel emits matches under three address
+ * derivations (compressed P2PKH, uncompressed P2PKH, P2SH-P2WPKH). The
+ * host hit handler must re-derive the SAME hash160 the kernel matched on
+ * before it can verify the hit against the UVRF. compute_hash160() above
+ * only yields the compressed P2PKH hash160, so uncompressed / P2SH hits
+ * were silently misverified and dropped. These helpers give the host the
+ * other two derivations. Both reuse one ec_mul (the dominant cost) and
+ * differ only in the trailing SHA256 -> RIPEMD160 chain.
+ *
+ * @param privkey_bytes 32-byte big-endian private key
+ * @param out_compressed   filled with the 33-byte compressed pubkey
+ * @param out_uncompressed filled with the 65-byte uncompressed pubkey
+ */
+inline void compute_pubkeys(const uint8_t* privkey_bytes,
+                            std::array<uint8_t, 33>& out_compressed,
+                            std::array<uint8_t, 65>& out_uncompressed) {
+    uint256_t k = uint256_t::from_be_bytes(privkey_bytes);
+
+    ECPoint P;
+    ec_mul(P, k);
+
+    uint256_t pub_x, pub_y;
+    ec_to_affine(pub_x, pub_y, P);
+
+    // Compressed: 02/03 parity prefix || X (32 BE).
+    out_compressed[0] = pub_y.is_odd() ? 0x03 : 0x02;
+    for (int word = 0; word < 4; word++) {
+        const uint64_t v = pub_x.d[3 - word];
+        for (int b = 0; b < 8; b++) {
+            out_compressed[1 + word * 8 + b] =
+                static_cast<uint8_t>((v >> (56 - b * 8)) & 0xff);
+        }
+    }
+
+    // Uncompressed: 0x04 || X (32 BE) || Y (32 BE).
+    out_uncompressed[0] = 0x04;
+    for (int word = 0; word < 4; word++) {
+        const uint64_t vx = pub_x.d[3 - word];
+        const uint64_t vy = pub_y.d[3 - word];
+        for (int b = 0; b < 8; b++) {
+            out_uncompressed[1 + word * 8 + b] =
+                static_cast<uint8_t>((vx >> (56 - b * 8)) & 0xff);
+            out_uncompressed[33 + word * 8 + b] =
+                static_cast<uint8_t>((vy >> (56 - b * 8)) & 0xff);
+        }
+    }
+}
+
+/**
+ * Compute the uncompressed-P2PKH Hash160 from a private key:
+ *   hash160 = RIPEMD160(SHA256(0x04 || X || Y))
+ * Mirrors fused_multiaddr_extra_check addr_type 0 on the GPU.
+ */
+inline std::array<uint8_t, 20> compute_hash160_uncompressed(
+    const uint8_t* privkey_bytes) {
+    std::array<uint8_t, 33> compressed{};
+    std::array<uint8_t, 65> uncompressed{};
+    compute_pubkeys(privkey_bytes, compressed, uncompressed);
+
+    auto sha_hash = SHA256::hash(uncompressed.data(), 65);
+    return RIPEMD160::hash(sha_hash.data(), 32);
+}
+
+/**
+ * Compute the P2SH-P2WPKH (BIP-49) Hash160 from a private key:
+ *   redeem    = 0x00 0x14 || hash160(compressed_pubkey)
+ *   scripthash= RIPEMD160(SHA256(redeem))
+ * Mirrors fused_multiaddr_extra_check addr_type 2 on the GPU.
+ */
+inline std::array<uint8_t, 20> compute_hash160_p2sh_p2wpkh(
+    const uint8_t* privkey_bytes) {
+    // The redeem-script hash160 wraps the COMPRESSED-pubkey hash160, which
+    // is exactly what compute_hash160() returns.
+    auto inner = compute_hash160(privkey_bytes);
+
+    uint8_t redeem[22];
+    redeem[0] = 0x00;
+    redeem[1] = 0x14;  // OP_PUSHBYTES_20
+    std::memcpy(redeem + 2, inner.data(), 20);
+
+    auto sha_hash = SHA256::hash(redeem, 22);
+    return RIPEMD160::hash(sha_hash.data(), 32);
+}
+
+/**
  * Convert hex string to byte array
  */
 inline std::array<uint8_t, 20> hex_to_hash160(const std::string& hex) {

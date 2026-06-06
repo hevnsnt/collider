@@ -216,7 +216,10 @@ void MetalKangarooBackend::solve(BackendCallbacks cb) {
         total_ops += static_cast<uint64_t>(cfg_.num_kangaroos)
                    * cfg_.steps_per_round;
         for (const auto& dp : dps) {
-            cb.on_dp(dp.x_be, dp.d_be, dp.type, dp.dp_bits);
+            // v1.5.5 (task #9): Metal never captures a checkpoint chain, so the
+            // trailing committable-chain pointers are always nullptr and the
+            // pool client emits DP_BATCH_V2 for Metal-produced DPs.
+            cb.on_dp(dp.x_be, dp.d_be, dp.type, dp.dp_bits, nullptr, nullptr);
             ++total_dp;
         }
 

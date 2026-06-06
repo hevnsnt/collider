@@ -329,6 +329,7 @@ void PoolManager::wire_client_callbacks(JLPPoolClient* jlp) {
             has_work_ = true;
         }
         current_dp_bits_.store(work.dp_bits, std::memory_order_release);
+        current_work_id_.store(work.work_id, std::memory_order_release);
         std::cout << "[PoolManager] Received new work: " << work.puzzle_name
                   << " (DP bits: " << work.dp_bits << ")" << std::endl;
     });
@@ -687,11 +688,31 @@ bool PoolManager::get_work(WorkAssignment& work) {
 }
 
 void PoolManager::submit_dp(const uint8_t* x, const uint8_t* d, uint8_t type, uint32_t dp_bits) {
+    submit_dp(x, d, type, dp_bits, nullptr, nullptr);
+}
+
+void PoolManager::submit_dp(const uint8_t* x, const uint8_t* d, uint8_t type,
+                            uint32_t dp_bits,
+                            const std::vector<std::array<uint8_t, 32>>* ckpt_distances,
+                            const std::vector<uint8_t>* ckpt_l1s2) {
     DistinguishedPoint dp;
     memcpy(dp.x, x, 32);
     memcpy(dp.d, d, 32);
     dp.type = type;
     dp.dp_bits = dp_bits;
+    // v1.5.5 (task #9): copy the COMMITTABLE checkpoint chain onto the queued
+    // DP so the JLP sender can emit a real DP_BATCH_V3 commitment for it. Both
+    // pointers are null (or the chain has < 2 checkpoints) for the overwhelming
+    // majority of DPs -- those whose producing kangaroo is outside the capture
+    // window, hit a loop-escape, or whose backend never captures -- and such
+    // DPs keep ckpt_distances empty and ship as V2. The pointers are only valid
+    // for the duration of this call (the GPU readback buffers live on the
+    // harvest stack), so we copy here rather than alias.
+    if (ckpt_distances && ckpt_l1s2 && ckpt_distances->size() >= 2 &&
+        ckpt_distances->size() == ckpt_l1s2->size()) {
+        dp.ckpt_distances = *ckpt_distances;
+        dp.ckpt_l1s2 = *ckpt_l1s2;
+    }
     submit_dp(dp);
 }
 
@@ -704,12 +725,20 @@ void PoolManager::submit_dp(const DistinguishedPoint& dp) {
         // client's queue. If the buffer is also full, the DP is truly
         // dropped (operator-visible via dropped_count_); the cap is
         // generous enough that only multi-minute outages can hit it.
-        // Stale-work_id concern is moot: the buffered DP carries its
-        // work_id, and the server-side replay-defence rejects stale
-        // ones cheaply at AUTH-time.
+        //
+        // We tag each DP with the work_id it was computed under. Stale
+        // work_ids are NOT harmless: the server treats a DP whose work_id
+        // does not match the worker's active assignment as a stale-work_id
+        // strike, and 20 strikes force-close the connection. If the buffer
+        // is replayed blindly after the server reassigned a different chunk
+        // (e.g. after a server restart), every replayed DP strikes out and
+        // the worker hot-loops reconnecting. The drain therefore replays
+        // only DPs whose work_id still matches the active assignment.
+        const uint64_t cap_work_id =
+            current_work_id_.load(std::memory_order_acquire);
         std::lock_guard<std::mutex> lock(reconnect_buf_mutex_);
         if (reconnect_buffer_.size() < kReconnectBufferCap) {
-            reconnect_buffer_.push_back(dp);
+            reconnect_buffer_.push_back(BufferedDP{dp, cap_work_id});
             reconnect_buffered_total_.fetch_add(1,
                                                 std::memory_order_relaxed);
             return;
@@ -1127,6 +1156,8 @@ void PoolManager::supervisor_loop() {
             }
             current_dp_bits_.store(fresh_work.dp_bits,
                                    std::memory_order_release);
+            current_work_id_.store(fresh_work.work_id,
+                                   std::memory_order_release);
         }
 
         connected_.store(true);
@@ -1149,15 +1180,26 @@ void PoolManager::supervisor_loop() {
         // for the duration of the (potentially large) replay; new DPs
         // arriving during the drain go straight to client_->submit_dp
         // because connected_ is already true at this point.
-        std::deque<DistinguishedPoint> to_replay;
+        std::deque<BufferedDP> to_replay;
         {
             std::lock_guard<std::mutex> lock(reconnect_buf_mutex_);
             to_replay.swap(reconnect_buffer_);
         }
+        // The active assignment after the fresh WORK_REQ above. Only DPs
+        // computed under this exact work_id can be accepted; replaying a DP
+        // tagged with a superseded work_id earns a stale-work_id strike and
+        // (after 20) a force-close, so we purge those instead of resubmitting.
+        const uint64_t active_work_id =
+            current_work_id_.load(std::memory_order_acquire);
         uint64_t replayed_ok = 0;
         uint64_t replayed_drop = 0;
-        for (const auto& dp : to_replay) {
-            if (client_->submit_dp(dp)) {
+        uint64_t purged_stale = 0;
+        for (const auto& entry : to_replay) {
+            if (entry.work_id != active_work_id) {
+                ++purged_stale;
+                continue;
+            }
+            if (client_->submit_dp(entry.dp)) {
                 ++replayed_ok;
             } else {
                 ++replayed_drop;
@@ -1173,6 +1215,12 @@ void PoolManager::supervisor_loop() {
             dropped_count_.fetch_add(replayed_drop,
                                      std::memory_order_relaxed);
         }
+        if (purged_stale > 0) {
+            reconnect_purged_total_.fetch_add(purged_stale,
+                                              std::memory_order_relaxed);
+            dropped_count_.fetch_add(purged_stale,
+                                     std::memory_order_relaxed);
+        }
         if (!to_replay.empty()) {
             std::cout << "[PoolManager] Replayed "
                       << replayed_ok << " buffered DP(s) post-reconnect"
@@ -1180,6 +1228,11 @@ void PoolManager::supervisor_loop() {
                               ? std::string(" (") +
                                     std::to_string(replayed_drop) +
                                     " could not be requeued)"
+                              : std::string{})
+                      << (purged_stale > 0
+                              ? std::string(" (purged ") +
+                                    std::to_string(purged_stale) +
+                                    " DP(s) tied to a superseded work_id)"
                               : std::string{})
                       << std::endl;
         }
@@ -1334,6 +1387,17 @@ void PoolManager::apply_worker_identity(JLPPoolClient* jlp) {
                   << "(worker=" << config_.worker_name << ")\n";
     }
     jlp->set_worker_identity(worker_identity_);
+
+    // v1.5.5 checkpoint-replay (task #9): enable DP_BATCH_V3 emit only when a
+    // worker identity is loaded (= this connection negotiates protocol v4, the
+    // same gate send_hello uses for the signed AUTH frame) AND the active GPU
+    // backend compiled the per-kangaroo checkpoint capture. The client ANDs
+    // this with its own per-DP "has a committable chain" test, so it never
+    // sends a fabricated commitment. On a v3 session this method returns early
+    // above and the freshly-created client keeps its default (capture
+    // unavailable -> V2). Re-applied on every reconnect-created client.
+    jlp->set_checkpoint_capture_available(checkpoint_capture_built_ &&
+                                          worker_identity_ != nullptr);
 }
 
 } // namespace pool
