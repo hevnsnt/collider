@@ -19,8 +19,11 @@ namespace pool {
 
 // Maximum backoff between reconnect attempts. The exponential backoff
 // in JLPPoolClient and the supervisor in PoolManager must agree on
-// this cap or one will pause longer than the other.
-inline constexpr std::uint32_t MAX_RECONNECT_BACKOFF_MS = 60'000;
+// this cap or one will pause longer than the other. Capped at 5 minutes:
+// the supervisor never gives up on connection failures, so during a long
+// pool outage (maintenance, restart) the worker keeps probing every 5 min
+// and reconnects on its own when service is restored -- no manual restart.
+inline constexpr std::uint32_t MAX_RECONNECT_BACKOFF_MS = 300'000;
 
 // Cap on consecutive AUTH_FAIL responses before the reconnect supervisor
 // in PoolManager gives up. v1.4.2 Pool-B3: moved here from JLPPoolClient

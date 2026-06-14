@@ -8,6 +8,18 @@ This changelog covers both the Free and **(PRO VERSION ONLY)** editions. Pro-onl
 
 ---
 
+## [1.5.6] - 2026-06-14: Self-healing reconnect + macOS Pro build
+
+### Changed
+
+- **Pool workers reconnect forever instead of giving up.** The reconnect supervisor no longer stops after 16 consecutive connection failures (which forced a manual worker restart after any pool outage). Connection failures now retry indefinitely with the backoff capped at 5 minutes (was 60s), so a worker self-heals after maintenance, a server restart, or network loss with no operator intervention. Terminal give-ups are unchanged: an IP ban or repeated AUTH_FAILs still stop the loop. The v1.5.4 maintenance-aware reconnect path (server `MAINTENANCE` message) is preserved.
+
+### Fixed
+
+- **(PRO) macOS (Metal) build of the GPU brain-wallet / BIP / BSGS pipeline.** CUDA-only code paths (members, `cudaStream_t` uses, a stale stub signature, and the `bsgs_solve` GPU entry point) leaked into the non-CUDA Metal build, breaking compilation and linking of `brain_wallet_gpu.cpp`, `bip_scanner_runner.cpp`, and `puzzle_solver_bsgs.cpp`. These are now guarded behind `COLLIDER_USE_CUDA` with compiling no-op / fall-back stubs on Metal (BSGS falls back to Kangaroo). The CUDA/Windows build is unaffected; `collider_pro` now compiles and links on Apple Silicon.
+
+---
+
 ## [1.5.0] - 2026-05-21: Theft-Resistance Architecture (Mainnet)
 
 Pool architecture rewrite that closes the v1.4.x worker self-solve theft window. In v1.4.x a pool worker who found the cross-collision computed the puzzle's private key locally and could sweep the funds before the pool ever saw the solution. In v1.5 the algorithm itself denies any single worker the data needed to compute the key: each worker runs ONLY tame kangaroos OR ONLY wild kangaroos, the host-side collision detection is disabled in pool mode, and the pool server is the sole place where cross-type DPs aggregate. The server detects the collision, computes the key, broadcasts a hot-wallet sweep transaction, waits for cross-provider attestation that the sweep has propagated, and only then notifies workers that the puzzle is solved.

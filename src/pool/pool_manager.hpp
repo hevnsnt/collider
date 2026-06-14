@@ -307,8 +307,11 @@ private:
     mutable std::mutex      maintenance_mutex_;
     std::string             maintenance_message_;
 
-    static constexpr uint32_t kMaxReconnectAttempts = 16;
     static constexpr uint32_t kInitialBackoffMs     = 1000;
+    // The supervisor never gives up on connection failures (the worker must
+    // reconnect on its own after any outage), so there is no max-attempts
+    // cap. It still gives up on terminal conditions: an IP ban or
+    // MAX_AUTH_FAIL_ATTEMPTS consecutive AUTH_FAILs (bad credentials).
     // The cap on reconnect backoff lives in pool_config.hpp as
     // MAX_RECONNECT_BACKOFF_MS, shared with JLPPoolClient so the two
     // reconnect paths can never disagree on the upper bound.

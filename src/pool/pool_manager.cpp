@@ -837,9 +837,11 @@ void PoolManager::dp_callback_hook(void* user_data, const uint8_t* x, const uint
 // silently killed the worker.
 // This thread polls is_connected() and, when it sees the receiver has
 // exited, drives a full reconnect: disconnect() + connect() + authenticate()
-// with jittered exponential backoff. After kMaxReconnectAttempts
-// consecutive failures, supervisor_gave_up_ is set and the host loop
-// can react. The receiver thread inside the client is a fresh thread
+// with jittered exponential backoff (capped at 5 min). Connection
+// failures retry forever so the worker self-heals after any outage;
+// supervisor_gave_up_ is only set on terminal conditions (IP ban or
+// repeated AUTH_FAILs), which the host loop can react to. The receiver
+// thread inside the client is a fresh thread
 // per connect() because connect() calls replace_thread().
 // ---------------------------------------------------------------------------
 
@@ -996,17 +998,12 @@ void PoolManager::supervisor_loop() {
             }
         }
 
-        // Drive a full reconnect.
-        if (consecutive_failures >= kMaxReconnectAttempts) {
-            std::cerr << "[PoolManager] Reconnect supervisor: "
-                      << kMaxReconnectAttempts
-                      << " consecutive attempts failed; giving up. "
-                      << "The pool client will remain disconnected; "
-                      << "host code can re-call connect() to retry."
-                      << std::endl;
-            supervisor_gave_up_.store(true, std::memory_order_release);
-            return;
-        }
+        // Drive a full reconnect. There is no max-attempts cap: the worker
+        // must recover on its own from any outage (maintenance, pool restart,
+        // network loss) without a manual restart, so connection failures
+        // retry forever with the backoff capped at MAX_RECONNECT_BACKOFF_MS
+        // (5 min). The loop still exits on terminal conditions handled
+        // elsewhere: an IP ban or repeated AUTH_FAILs.
 
         // Jitter: pick uniform delay in [backoff/2, backoff]. Skipped when
         // we already waited the maintenance retry window above (otherwise
@@ -1015,8 +1012,8 @@ void PoolManager::supervisor_loop() {
             std::uniform_int_distribution<uint32_t> jitter(backoff_ms / 2, backoff_ms);
             const uint32_t delay = jitter(rng);
             std::cerr << "[PoolManager] Reconnect attempt " << (consecutive_failures + 1)
-                      << "/" << kMaxReconnectAttempts
-                      << " in " << (delay / 1000.0) << "s..." << std::endl;
+                      << " in " << (delay / 1000.0)
+                      << "s (retrying until the pool is back)..." << std::endl;
             // Sleep with periodic wake-on-stop so shutdown is responsive.
             for (uint32_t slept = 0; slept < delay && !supervisor_stop_.load(std::memory_order_acquire);
                  slept += 100)

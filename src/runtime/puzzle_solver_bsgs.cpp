@@ -107,6 +107,12 @@ inline void be_low64_set(uint8_t be[32], uint64_t v) {
     }
 }
 
+// The multi-GPU BSGS dispatch below calls the CUDA-only bsgs_solve
+// driver (bsgs_solver_gpu.cu), which is excluded from non-CUDA (Metal)
+// builds. Guard the whole helper so the Metal object file carries no
+// reference to the undefined symbol. run_bsgs_solve() above already
+// short-circuits to FallThrough on non-CUDA, so this is never reached.
+#if defined(COLLIDER_USE_CUDA)
 // Per-worker progress bridge for the multi-GPU dispatch. Captures
 // (a) the shared cancel flag so any worker's first-find stops the
 // others, (b) the TUI app pointer so the dashboard's chunk-progress
@@ -243,10 +249,21 @@ bool mg_progress_thunk(uint64_t giant_steps_done, void* user) {
     }
     return agg;
 }
+#endif  // COLLIDER_USE_CUDA
 
 }  // namespace
 
 PuzzleStepResult run_bsgs_solve(PuzzleIterContext& ctx) {
+#if !defined(COLLIDER_USE_CUDA)
+    // BSGS is a CUDA-only GPU solver: its driver (bsgs_solve) lives in
+    // bsgs_solver_gpu.cu, which is excluded from non-CUDA (Metal) builds.
+    // Rather than reference an undefined symbol, fall through so the outer
+    // loop keeps running its current phase (Kangaroo) on this backend.
+    (void)ctx;
+    std::cerr << "[!] BSGS GPU solve not available on this backend "
+                 "(CUDA-only); falling back to Kangaroo.\n";
+    return PuzzleStepResult::FallThrough;
+#else
     Arguments& args = ctx.args;
     const PuzzleInfo* puzzle = ctx.puzzle;
     PuzzleTarget& tgt = ctx.tgt;
@@ -449,6 +466,7 @@ PuzzleStepResult run_bsgs_solve(PuzzleIterContext& ctx) {
             return PuzzleStepResult::StoppedExitOrContinue;
     }
     return PuzzleStepResult::FatalError;
+#endif  // COLLIDER_USE_CUDA
 }
 
 }  // namespace collider::runtime::detail
