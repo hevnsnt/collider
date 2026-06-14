@@ -81,7 +81,7 @@ jobs:
   # Windows x64 with CUDA
   # ============================================================================
   build-windows:
-    runs-on: windows-latest
+    runs-on: windows-2022
 
     steps:
       - name: Checkout code
@@ -96,6 +96,19 @@ jobs:
           method: "network"
           sub-packages: '["nvcc", "cudart", "visual_studio_integration"]'
 
+      # Put the MSVC toolchain (cl.exe) on PATH. The Ninja generator below
+      # uses it directly; the previous "Visual Studio 17 2022" generator
+      # failed at project() with "could not find any instance of Visual
+      # Studio" on the hosted image. Mirrors the proven ci.yml windows job.
+      - name: Setup MSVC x64 environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install Ninja
+        run: choco install ninja -y
+        shell: pwsh
+
       - name: Install vcpkg dependencies
         run: |
           vcpkg install --triplet x64-windows --no-print-usage
@@ -103,7 +116,7 @@ jobs:
 
       - name: Configure CMake
         run: |
-          cmake -B build -G "Visual Studio 17 2022" -A x64 `
+          cmake -B build -G Ninja `
             -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} `
             -DCOLLIDER_PRO=OFF `
             -DCOLLIDER_USE_CUDA=ON `
@@ -112,22 +125,22 @@ jobs:
             -DCOLLIDER_BUILD_TOOLS=OFF `
             -DCMAKE_TOOLCHAIN_FILE="C:/vcpkg/scripts/buildsystems/vcpkg.cmake" `
             -DVCPKG_TARGET_TRIPLET=x64-windows `
-            -DCUDA_ARCHITECTURES="75;86;89;120"
+            -DCMAKE_CUDA_ARCHITECTURES="75;86;89;120"
         shell: pwsh
 
       - name: Build
-        run: cmake --build build --config ${{env.BUILD_TYPE}} --target collider --parallel 4
+        run: cmake --build build --target collider --parallel 4
 
       - name: Verify binary
         run: |
-          Get-Item build\Release\collider.exe | Format-List Name, Length
+          Get-Item build\collider.exe | Format-List Name, Length
         shell: pwsh
 
       - name: Upload Windows binary
         uses: actions/upload-artifact@v4
         with:
           name: collider-windows-x64
-          path: build/Release/collider.exe
+          path: build/collider.exe
           retention-days: 30
 
   # ============================================================================
